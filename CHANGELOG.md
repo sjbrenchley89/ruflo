@@ -5,6 +5,15 @@ All notable changes to the Ruflo project (formerly Claude Flow) are documented h
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.7.0-alpha.72] - 2026-05-24
+
+### Maintenance
+
+- **fix(dep)**: Restore `@noble/ed25519` minimum version pin to `^3.1.0` (regressed to `^2.1.0` due to merge order between alpha.71 PRs)
+- **fix(docs)**: Correct `CLAUDE.md` heading from `v3.5` to `v3.6` to match the version banner already present in the file
+
+---
+
 ## [3.5.0] - 2026-02-27
 
 ### Ruflo v3.5 — First Major Stable Release
