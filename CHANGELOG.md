@@ -9,8 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Maintenance
 
-- **fix(dep)**: Restore `@noble/ed25519` minimum version pin to `^3.1.0` (regressed to `^2.1.0` due to merge order between alpha.71 PRs)
-- **fix(docs)**: Correct `CLAUDE.md` heading from `v3.5` to `v3.6` to match the version banner already present in the file
+- **chore(version)**: Bump package version to `3.7.0-alpha.72`
+- **note**: `@noble/ed25519` stays at `^2.1.0` — the codebase uses the sync v2 API; migrating to the async-only v3 API requires a dedicated compat PR
 
 ---
 
