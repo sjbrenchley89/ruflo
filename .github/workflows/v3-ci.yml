@@ -218,6 +218,15 @@ jobs:
         working-directory: v3
         run: pnpm install --frozen-lockfile
 
+      - name: Build workspace packages
+        # Workspace packages (hooks, memory, shared, etc.) declare their types
+        # via dist/index.d.ts. Without a build step tsc cannot resolve those
+        # declarations and typecheck always fails with "cannot find module".
+        # --no-bail keeps building past unrelated failures; || true prevents
+        # build errors from blocking the type check itself.
+        working-directory: v3
+        run: pnpm --recursive --no-bail run build || true
+
       - name: Type check
         working-directory: v3
         run: pnpm typecheck
