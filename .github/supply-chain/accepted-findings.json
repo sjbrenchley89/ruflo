@@ -22,6 +22,16 @@
   "cve": [
     {
       "package": "v3/@claude-flow/browser",
+      "depName": "vitest",
+      "severity": "critical",
+      "via": ["@vitest/mocker", "vite", "vite-node"],
+      "tracking": "GHSA-5xrq-8626-4rwp — vitest < 4.1.0 Vitest UI server arbitrary file read/exec (CVSS 9.8). This is a devDependency — vitest is used only for running tests, never shipped to production. The Vitest UI server (--ui flag) is never invoked in CI or production pipelines; the vulnerability only materialises when a developer explicitly starts the UI server locally. npm audit flags this because v3/ is an npm workspace and the audit traverses sibling packages (aidefence, codex) that still pin vitest@4.0.16 — the browser package itself has 4.1.8 in the pnpm lockfile but npm audit resolves it workspace-wide. Workspace-wide upgrade from ^4.0.16 → ^4.1.0 deferred to a dedicated PR to avoid cascading lockfile churn across all workspace packages.",
+      "trackingIssue": "https://github.com/advisories/GHSA-5xrq-8626-4rwp",
+      "expiresAt": "2026-12-01",
+      "rationale": "devDependency with no production exposure. The vulnerable code path (Vitest UI server) is never activated in automated test runs (no --ui flag). Real-world impact is zero in CI and production. Schedule a workspace-wide vitest upgrade to >=4.1.0 to permanently remove this finding."
+    },
+    {
+      "package": "v3/@claude-flow/browser",
       "depName": "agentic-flow",
       "severity": "high",
       "via": ["@xenova/transformers"],
