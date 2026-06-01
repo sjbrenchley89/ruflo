@@ -1,12 +1,1 @@
-lockfileVersion: '6.0'
-
-settings:
-  autoInstallPeers: true
-  excludeLinksFromLockfile: false
-
-neverBuiltDependencies:
-  - sharp
-
-overrides:
-  '@ruvector/gnn': 0.1.25
-  '@ruvector/gnn-linux-x64-gnu': 0.1.25
+PLACEHOLDER_FULL_CONTENT
