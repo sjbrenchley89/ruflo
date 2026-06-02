@@ -5,6 +5,18 @@ All notable changes to the Ruflo project (formerly Claude Flow) are documented h
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.7.0-alpha.74] - 2026-06-01
+
+### Fixed
+- CI: add `pnpm --recursive --no-bail run build || true` before typecheck in the Type Check V3 job so workspace type declarations exist before `tsc` runs (PR #17)
+
+### Changed
+- Bump version `3.7.0-alpha.73` → `3.7.0-alpha.74` across all three packages (`claude-flow`, `ruflo`, `@claude-flow/cli`)
+- Sync stale `v3/@claude-flow/cli` dependency pins: `@claude-flow/mcp` → `^3.0.0-alpha.9`, `@claude-flow/shared` → `^3.0.0-alpha.8`, `semver` → `^7.8.1`, `@claude-flow/codex` → `^3.0.0-alpha.12`, `@claude-flow/plugin-gastown-bridge` → `^0.1.4`
+- Updated `package-lock.json` and `ruflo/package-lock.json` after dependency install (PR #16)
+
+---
+
 ## [3.7.0-alpha.73] - 2026-05-25
 
 ### Fixed
@@ -245,3 +257,4 @@ This release marks the official rebranding from **Claude Flow** to **Ruflo** and
 | **Ruflo v3.5** | **v3.5.0** | **2026-02-27** | **First stable release, rebranding** |
 | **Ruflo v3.6** | **v3.6.10** | **2026-04-29** | **Agent federation, comms-first coordination** |
 | **Ruflo v3.7-alpha.73** | **v3.7.0-alpha.73** | **2026-05-25** | **Version alignment, CLAUDE.md fix** |
+| **Ruflo v3.7-alpha.74** | **v3.7.0-alpha.74** | **2026-06-01** | **CI typecheck fix, dep sync** |
