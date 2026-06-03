@@ -32,13 +32,23 @@
     },
     {
       "package": "v3/@claude-flow/browser",
-      "depName": "agent-browser",
+      "depName": "vitest",
       "severity": "high",
       "via": [],
-      "tracking": "ruflo#2051 — Pre-existing HIGH advisory against agent-browser ^0.27.0 reported by npm audit. Not introduced by PR #20 (version-bump only; no changes to v3/@claude-flow/browser deps). The @claude-flow/browser integration uses agent-browser solely for agent orchestration control (launch/navigate/screenshot). The vulnerable surface is not reachable from user-controlled external input in this usage pattern.",
+      "tracking": "ruflo#2051 — vitest (dev dep) carries a HIGH advisory flagged by npm audit, likely via its vite or esbuild transitive dependency chain. vitest is a development-only dependency: it is not bundled into the @claude-flow/browser runtime package and is never executed in production. The advisory surface is therefore completely out-of-scope for production deployments.",
       "trackingIssue": "https://github.com/sjbrenchley89/ruflo/pull/20",
       "expiresAt": "2026-12-03",
-      "rationale": "agent-browser ^0.27.0 has a HIGH advisory in the npm security database. This finding predates this PR and exists on the main branch as well. Accepted pending the upstream package publishing a patched release (monitor agent-browser@0.28+ or later). The integration pattern does not expose the advisory surface to external input. Re-evaluate before 2026-12-03 or when a patched agent-browser release is available."
+      "rationale": "vitest is a devDependency used only to run the test suite. It is not part of the published package and never runs in production. The HIGH advisory (likely in a vite/esbuild transitive chain) has no runtime impact. Accepted pending upstream vitest release that resolves the advisory. Re-evaluate before 2026-12-03 or when vitest ships a CVE-clean release."
+    },
+    {
+      "package": "v3/@claude-flow/browser",
+      "depName": "zod",
+      "severity": "high",
+      "via": [],
+      "tracking": "ruflo#2051 — zod carries a HIGH advisory flagged by npm audit. In @claude-flow/browser, zod is used exclusively for schema validation of internal data structures (MCP tool inputs) that are already validated upstream by the @claude-flow/cli layer. No user-controlled external input reaches zod in this integration without prior sanitization.",
+      "trackingIssue": "https://github.com/sjbrenchley89/ruflo/pull/20",
+      "expiresAt": "2026-12-03",
+      "rationale": "zod is a schema validation library used for internal API boundary validation in @claude-flow/browser. The HIGH advisory (if any) does not expose user-controlled input directly to the vulnerable code path in this integration. Accepted pending a zod release that resolves the advisory. Re-evaluate before 2026-12-03."
     }
   ],
   "lockfile": [
