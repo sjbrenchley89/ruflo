@@ -22,6 +22,16 @@
   "cve": [
     {
       "package": "v3/@claude-flow/browser",
+      "depName": "vitest",
+      "severity": "critical",
+      "via": ["GHSA-5xrq-8626-4rwp"],
+      "tracking": "Stale v3/package-lock.json workspace entries — the npm workspace lockfile for v3/ has vitest@1.6.1 (aidefence, codex) and vitest@2.1.9 (browser), all below the GHSA-5xrq-8626-4rwp threshold of <4.1.0. The v3/ workspace uses workspace:* (pnpm-specific protocol) which prevents npm from regenerating the lockfile. The canonical lockfile is v3/pnpm-lock.yaml (pnpm) and carries the correct version. Individual package.json files already declare vitest ^4.0.16 which resolves to 4.1.6+ in fresh installs. The vulnerability exploits the Vitest UI server (vitest --ui) when it is actively listening on a port — this mode is never started in CI or production; tests always run via vitest run (headless).",
+      "trackingIssue": "https://github.com/advisories/GHSA-5xrq-8626-4rwp",
+      "expiresAt": "2026-12-03",
+      "rationale": "Dev-only test runner. GHSA-5xrq-8626-4rwp (CVSS 9.8) requires the Vitest UI server to be running and network-accessible. This server is opt-in (vitest --ui flag) and is never invoked in CI or production. The stale npm workspace lockfile cannot be regenerated in-place because workspace:* protocol entries (used by plugin-iot-cognitum and plugin-agent-federation for @claude-flow/shared) are pnpm-specific and npm rejects them. Real fix: regenerate v3/package-lock.json after removing workspace:* references or switching those deps to version pins. Re-triage if vitest --ui is ever added to a CI step."
+    },
+    {
+      "package": "v3/@claude-flow/browser",
       "depName": "agentic-flow",
       "severity": "high",
       "via": ["@xenova/transformers"],
