@@ -103,13 +103,89 @@ done
 
 PACKAGE="ruflo@${VERSION}"
 
-# Progress animation
-SPINNER_CHARS="⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
-SPINNER_INDEX=0
+# Progress display
+# Braille spinner frames kept as an array so multibyte UTF-8 glyphs are sliced
+# safely regardless of the active locale (substring expansion on a packed
+# string can split mid-character and print garbage).
+SPINNER_FRAMES=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
 
-spinner() {
-    printf "\r${CYAN}${SPINNER_CHARS:SPINNER_INDEX++:1}${NC} $1"
-    SPINNER_INDEX=$((SPINNER_INDEX % 10))
+# Step counter for overall progress ("[2/5]"). Populated by compute_total_steps.
+TOTAL_STEPS=0
+CURRENT_STEP=0
+
+compute_total_steps() {
+    # Always run: requirements, install, verify.
+    TOTAL_STEPS=3
+    [ "$SETUP_MCP" = "1" ] && TOTAL_STEPS=$((TOTAL_STEPS + 1))
+    [ "$RUN_DOCTOR" = "1" ] && TOTAL_STEPS=$((TOTAL_STEPS + 1))
+    [ "$RUN_INIT" = "1" ] && TOTAL_STEPS=$((TOTAL_STEPS + 1))
+    CURRENT_STEP=0
+}
+
+# Restore the cursor if the user interrupts mid-spinner.
+_restore_cursor() {
+    [ -t 1 ] && printf '\033[?25h' >&2 || true
+}
+trap _restore_cursor EXIT INT TERM
+
+# Run a command while showing an animated progress spinner with elapsed time.
+# Usage: run_with_spinner "Message" command [args...]
+# - On a TTY: animates a spinner, then prints success/failure with duration.
+# - Off a TTY (CI logs, redirected output): prints plain start/finish lines.
+# Command output is captured and only shown (tail) if the command fails.
+run_with_spinner() {
+    local message="$1"
+    shift
+
+    local log_file
+    log_file="$(mktemp 2>/dev/null || echo "/tmp/ruflo-install.$$.log")"
+
+    local start_ts
+    start_ts=$(date +%s)
+
+    # Non-interactive: no animation, just bookend messages.
+    if [ ! -t 1 ]; then
+        print_substep "$message..."
+        local status=0
+        "$@" >"$log_file" 2>&1 || status=$?
+        local total=$(( $(date +%s) - start_ts ))
+        if [ "$status" -eq 0 ]; then
+            print_success "$message (${total}s)"
+        else
+            print_error "$message failed after ${total}s"
+            tail -n 20 "$log_file" >&2 2>/dev/null || true
+        fi
+        rm -f "$log_file"
+        return "$status"
+    fi
+
+    # Interactive: run in background and animate until it finishes.
+    "$@" >"$log_file" 2>&1 &
+    local cmd_pid=$!
+
+    local i=0
+    printf '\033[?25l'  # hide cursor
+    while kill -0 "$cmd_pid" 2>/dev/null; do
+        local frame="${SPINNER_FRAMES[i]}"
+        local elapsed=$(( $(date +%s) - start_ts ))
+        printf "\r  ${CYAN}%s${NC} %s ${DIM}(%ds)${NC}\033[K" "$frame" "$message" "$elapsed"
+        i=$(( (i + 1) % ${#SPINNER_FRAMES[@]} ))
+        sleep 0.1
+    done
+
+    local status=0
+    wait "$cmd_pid" || status=$?
+    printf '\r\033[K\033[?25h'  # clear line, show cursor
+
+    local total=$(( $(date +%s) - start_ts ))
+    if [ "$status" -eq 0 ]; then
+        print_success "$message ${DIM}(${total}s)${NC}"
+    else
+        print_error "$message failed after ${total}s"
+        tail -n 20 "$log_file" >&2 2>/dev/null || true
+    fi
+    rm -f "$log_file"
+    return "$status"
 }
 
 print_banner() {
@@ -121,6 +197,16 @@ print_banner() {
 }
 
 print_step() {
+    CURRENT_STEP=$((CURRENT_STEP + 1))
+    if [ "$TOTAL_STEPS" -gt 0 ]; then
+        echo -e "${GREEN}▸${NC} ${DIM}[${CURRENT_STEP}/${TOTAL_STEPS}]${NC} $1"
+    else
+        echo -e "${GREEN}▸${NC} $1"
+    fi
+}
+
+# Section header that does NOT advance the step counter.
+print_header() {
     echo -e "${GREEN}▸${NC} $1"
 }
 
@@ -203,7 +289,7 @@ check_requirements() {
 }
 
 show_install_options() {
-    print_step "Installation options:"
+    print_header "Installation options:"
     print_substep "Package: ${BOLD}${PACKAGE}${NC}"
     if [ "$GLOBAL" = "1" ]; then
         print_substep "Mode: ${BOLD}Global${NC} (npm install -g)"
@@ -219,36 +305,24 @@ show_install_options() {
 }
 
 install_package() {
-    local START_TIME=$(date +%s)
-
     if [ "$GLOBAL" = "1" ]; then
         print_step "Installing globally..."
-
         if [ "$MINIMAL" = "1" ]; then
-            npm install -g "$PACKAGE" --omit=optional 2>&1 | while read -r line; do
-                if [[ "$line" == *"added"* ]]; then
-                    print_substep "$line"
-                fi
-            done
+            run_with_spinner "Installing ${PACKAGE} (global, minimal)" \
+                npm install -g "$PACKAGE" --omit=optional || return 1
         else
-            npm install -g "$PACKAGE" 2>&1 | while read -r line; do
-                if [[ "$line" == *"added"* ]]; then
-                    print_substep "$line"
-                fi
-            done
+            run_with_spinner "Installing ${PACKAGE} (global)" \
+                npm install -g "$PACKAGE" || return 1
         fi
     else
         print_step "Installing for npx usage..."
-        # Actually run npx to pre-install the package
-        npx -y "$PACKAGE" --version >/dev/null 2>&1 || true
-        print_substep "Package installed for npx"
+        # Pre-warm the npx cache so the first real invocation is instant.
+        run_with_spinner "Caching ${PACKAGE} for npx" \
+            npx -y "$PACKAGE" --version || \
+            print_warning "Pre-cache step did not complete — npx will fetch on first run"
     fi
 
-    local END_TIME=$(date +%s)
-    local DURATION=$((END_TIME - START_TIME))
-
     echo ""
-    print_success "Installed in ${BOLD}${DURATION}s${NC}"
 }
 
 verify_installation() {
@@ -381,6 +455,7 @@ run_init() {
 
 # Main
 main() {
+    compute_total_steps
     print_banner
     check_requirements
     show_install_options
