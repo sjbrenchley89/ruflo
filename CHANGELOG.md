@@ -15,17 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - Bump version `3.7.0-alpha.74` → `3.7.0-alpha.75` across all three packages (`claude-flow`, `ruflo`, `@claude-flow/cli`)
-- Sync `v3/@claude-flow/cli` dependency pins that drifted from root `package.json`
 
-| Package | Before | After |
-|---------|--------|-------|
-| `@claude-flow/mcp` | `^3.0.0-alpha.8` | `^3.0.0-alpha.9` |
-| `@claude-flow/shared` | `^3.0.0-alpha.7` | `^3.0.0-alpha.8` |
-| `semver` | `^7.6.0` | `^7.8.1` |
-| `@claude-flow/codex` (optional) | `^3.0.0-alpha.8` | `^3.0.0-alpha.12` |
-| `@claude-flow/plugin-gastown-bridge` (optional) | `^0.1.3` | `^0.1.4` |
-
-> **Note**: `v3/pnpm-lock.yaml` regeneration via `pnpm install` is deferred to a follow-up PR to avoid `ERR_PNPM_OUTDATED_LOCKFILE` in CI jobs that use the pnpm workspace.
+> **Note on v3/cli dep sync**: Specifier updates (`@claude-flow/mcp` → alpha.9, `@claude-flow/shared` → alpha.8, `semver` → 7.8.1, `@claude-flow/codex` → alpha.12, `@claude-flow/plugin-gastown-bridge` → 0.1.4) are deferred pending `pnpm install` lockfile regeneration. Updating specifiers without regenerating `v3/pnpm-lock.yaml` causes `ERR_PNPM_OUTDATED_LOCKFILE` across all CI jobs.
 
 ---
 
@@ -281,4 +272,4 @@ This release marks the official rebranding from **Claude Flow** to **Ruflo** and
 | **Ruflo v3.6** | **v3.6.10** | **2026-04-29** | **Agent federation, comms-first coordination** |
 | **Ruflo v3.7-alpha.73** | **v3.7.0-alpha.73** | **2026-05-25** | **Version alignment, CLAUDE.md fix** |
 | **Ruflo v3.7-alpha.74** | **v3.7.0-alpha.74** | **2026-06-03** | **Dep sync, CI fix, lockfile update** |
-| **Ruflo v3.7-alpha.75** | **v3.7.0-alpha.75** | **2026-06-04** | **Curl installer live progress, v3/cli dep sync** |
+| **Ruflo v3.7-alpha.75** | **v3.7.0-alpha.75** | **2026-06-04** | **Curl installer live progress display** |
