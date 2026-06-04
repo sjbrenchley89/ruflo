@@ -170,6 +170,9 @@ function runCveAudit(packageDir, accepted) {
     }
   }
   if (directHighCritical.length > 0) {
+    for (const f of directHighCritical) {
+      log(`    UNACCEPTED: ${f.depName} (${f.severity}) — add to accepted-findings.json to suppress`);
+    }
     results.cve.push(...directHighCritical);
   }
   log(`  [cve] ${packageDir}: ${directHighCritical.length} HIGH/CRITICAL unaccepted, ${acceptedCount} accepted`);
