@@ -5,15 +5,17 @@ All notable changes to the Ruflo project (formerly Claude Flow) are documented h
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [3.7.0-alpha.74] - 2026-06-03
+## [3.7.0-alpha.75] - 2026-06-04
 
-### Fixed
-- CI: Add build step to `Type Check V3` job before typecheck (PR #17) — workspace packages expose types only through compiled `dist/index.d.ts`; running `pnpm typecheck` without a prior build caused unresolvable module errors on every run
+### Added
+- `run_with_spinner` in `scripts/install.sh` — animates a braille spinner with live elapsed-time counter during `npm install -g ruflo`; hides cursor and restores it via an `EXIT/INT/TERM` trap (PR #21)
+- TTY-aware progress: animated spinner on interactive terminals; plain start/finish lines when stdout is not a terminal (CI logs, piped output)
+- `[N/M]` step counter via `compute_total_steps`, scaling to the steps actually enabled by `--setup-mcp`, `--doctor`, and `--init` flags
+- Safe glyph handling: spinner frames stored as an array so braille characters are never sliced mid-character under non-UTF-8 locales
 
 ### Changed
-- Update `package-lock.json` and `ruflo/package-lock.json` after `npm install` (PR #16)
-- Bump version `3.7.0-alpha.73` → `3.7.0-alpha.74` across all three packages (`claude-flow`, `ruflo`, `@claude-flow/cli`)
-- Sync stale `v3/@claude-flow/cli` dependency pins to match root `package.json` (drifted across PRs #7–#15)
+- Bump version `3.7.0-alpha.74` → `3.7.0-alpha.75` across all three packages (`claude-flow`, `ruflo`, `@claude-flow/cli`)
+- Sync `v3/@claude-flow/cli` dependency pins that drifted from root `package.json`
 
 | Package | Before | After |
 |---------|--------|-------|
@@ -22,6 +24,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 | `semver` | `^7.6.0` | `^7.8.1` |
 | `@claude-flow/codex` (optional) | `^3.0.0-alpha.8` | `^3.0.0-alpha.12` |
 | `@claude-flow/plugin-gastown-bridge` (optional) | `^0.1.3` | `^0.1.4` |
+
+> **Note**: `v3/pnpm-lock.yaml` regeneration via `pnpm install` is deferred to a follow-up PR to avoid `ERR_PNPM_OUTDATED_LOCKFILE` in CI jobs that use the pnpm workspace.
+
+---
+
+## [3.7.0-alpha.74] - 2026-06-03
+
+### Fixed
+- CI: Add build step to `Type Check V3` job before typecheck (PR #17) — workspace packages expose types only through compiled `dist/index.d.ts`; running `pnpm typecheck` without a prior build caused unresolvable module errors on every run
+
+### Changed
+- Update `package-lock.json` and `ruflo/package-lock.json` after `npm install` (PR #16)
+- Bump version `3.7.0-alpha.73` → `3.7.0-alpha.74` across all three packages (`claude-flow`, `ruflo`, `@claude-flow/cli`)
 
 ---
 
@@ -266,3 +281,4 @@ This release marks the official rebranding from **Claude Flow** to **Ruflo** and
 | **Ruflo v3.6** | **v3.6.10** | **2026-04-29** | **Agent federation, comms-first coordination** |
 | **Ruflo v3.7-alpha.73** | **v3.7.0-alpha.73** | **2026-05-25** | **Version alignment, CLAUDE.md fix** |
 | **Ruflo v3.7-alpha.74** | **v3.7.0-alpha.74** | **2026-06-03** | **Dep sync, CI fix, lockfile update** |
+| **Ruflo v3.7-alpha.75** | **v3.7.0-alpha.75** | **2026-06-04** | **Curl installer live progress, v3/cli dep sync** |
