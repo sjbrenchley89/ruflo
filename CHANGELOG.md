@@ -9,16 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - Bump version `3.7.0-alpha.74` → `3.7.0-alpha.77` across all three packages (`claude-flow`, `ruflo`, `@claude-flow/cli`)
-- Sync stale `v3/@claude-flow/cli` dependency pins to match root `package.json` (drift persisted since alpha.74 CHANGELOG entry)
 - Add `CHANGELOG.md` entry for `3.7.0-alpha.77` dated 2026-06-10
-
-| Package | Before | After |
-|---------|--------|-------|
-| `@claude-flow/mcp` | `^3.0.0-alpha.8` | `^3.0.0-alpha.9` |
-| `@claude-flow/shared` | `^3.0.0-alpha.7` | `^3.0.0-alpha.8` |
-| `semver` | `^7.6.0` | `^7.8.1` |
-| `@claude-flow/codex` (optional) | `^3.0.0-alpha.8` | `^3.0.0-alpha.12` |
-| `@claude-flow/plugin-gastown-bridge` (optional) | `^0.1.3` | `^0.1.4` |
+- Add milestone row to CHANGELOG summary table
 
 Supersedes PR #26 (`claude/focused-rubin-rif82a`).
 
@@ -285,4 +277,4 @@ This release marks the official rebranding from **Claude Flow** to **Ruflo** and
 | **Ruflo v3.6** | **v3.6.10** | **2026-04-29** | **Agent federation, comms-first coordination** |
 | **Ruflo v3.7-alpha.73** | **v3.7.0-alpha.73** | **2026-05-25** | **Version alignment, CLAUDE.md fix** |
 | **Ruflo v3.7-alpha.74** | **v3.7.0-alpha.74** | **2026-06-03** | **Dep sync, CI fix, lockfile update** |
-| **Ruflo v3.7-alpha.77** | **v3.7.0-alpha.77** | **2026-06-10** | **Dep sync (cli), version alignment** |
+| **Ruflo v3.7-alpha.77** | **v3.7.0-alpha.77** | **2026-06-10** | **Version bump across all three packages** |
