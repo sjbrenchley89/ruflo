@@ -5,6 +5,24 @@ All notable changes to the Ruflo project (formerly Claude Flow) are documented h
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.7.0-alpha.80] - 2026-06-13
+
+### Changed
+- Bump version `3.7.0-alpha.74` → `3.7.0-alpha.80` across all three packages (`claude-flow`, `ruflo`, `@claude-flow/cli`)
+- Sync stale `v3/@claude-flow/cli` dependency pins to match root `package.json`
+
+| Package | Before | After |
+|---------|--------|-------|
+| `@claude-flow/mcp` | `^3.0.0-alpha.8` | `^3.0.0-alpha.9` |
+| `@claude-flow/shared` | `^3.0.0-alpha.7` | `^3.0.0-alpha.8` |
+| `semver` | `^7.6.0` | `^7.8.1` |
+| `@claude-flow/codex` (optional) | `^3.0.0-alpha.8` | `^3.0.0-alpha.12` |
+| `@claude-flow/plugin-gastown-bridge` (optional) | `^0.1.3` | `^0.1.4` |
+
+Supersedes PR #29 (`claude/focused-rubin-261puo`).
+
+---
+
 ## [3.7.0-alpha.74] - 2026-06-03
 
 ### Fixed
