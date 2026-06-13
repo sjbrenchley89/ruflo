@@ -104,13 +104,13 @@ importers:
         specifier: ^3.7.0-alpha.5
         version: link:../cli-core
       '@claude-flow/mcp':
-        specifier: ^3.0.0-alpha.8
+        specifier: ^3.0.0-alpha.9
         version: link:../mcp
       '@claude-flow/neural':
         specifier: ^3.0.0-alpha.9
         version: link:../neural
       '@claude-flow/shared':
-        specifier: ^3.0.0-alpha.7
+        specifier: ^3.0.0-alpha.8
         version: link:../shared
       '@noble/ed25519':
         specifier: ^2.1.0
@@ -119,8 +119,8 @@ importers:
         specifier: ^0.1.0
         version: 0.1.0
       semver:
-        specifier: ^7.6.0
-        version: 7.7.3
+        specifier: ^7.8.1
+        version: 7.8.4
       yaml:
         specifier: ^2.8.0
         version: 2.8.2
@@ -129,8 +129,8 @@ importers:
         specifier: ^3.0.2
         version: link:../aidefence
       '@claude-flow/codex':
-        specifier: ^3.0.0-alpha.8
-        version: link:../codex
+        specifier: ^3.0.0-alpha.12
+        version: 3.0.0-alpha.12(@claude-flow/cli@3.6.30)(@types/node@20.19.27)
       '@claude-flow/embeddings':
         specifier: ^3.0.0-alpha.18
         version: 3.0.0-alpha.45(@claude-flow/shared@@claude-flow+shared)(@ruvector/attention@0.1.32)(@ruvector/diskann@0.1.0)(@ruvector/rabitq-wasm@0.1.0)(agentic-flow@3.0.0-alpha.2)
@@ -141,8 +141,8 @@ importers:
         specifier: ^3.0.0-alpha.17
         version: link:../memory
       '@claude-flow/plugin-gastown-bridge':
-        specifier: ^0.1.3
-        version: 0.1.3(@claude-flow/memory@@claude-flow+memory)
+        specifier: ^0.1.4
+        version: 0.1.4(@claude-flow/memory@@claude-flow+memory)
       '@claude-flow/security':
         specifier: ^3.0.0-alpha.8
         version: link:../security
@@ -169,7 +169,7 @@ importers:
         version: 0.1.0
       '@ruvector/sona':
         specifier: ^0.1.6
-        version: 0.1.6
+        version: 0.1.7
       agentdb:
         specifier: ^3.0.0-alpha.14
         version: 3.0.0-alpha.14(@types/node@20.19.27)(zod@3.25.76)
@@ -759,18 +759,18 @@ packages:
     hasBin: true
     requiresBuild: true
     dependencies:
-      '@claude-flow/mcp': 3.0.0-alpha.8
-      '@claude-flow/shared': 3.0.0-alpha.7
+      '@claude-flow/mcp': 3.0.0-alpha.9
+      '@claude-flow/shared': 3.0.0-alpha.8
       '@noble/ed25519': 2.3.0
       '@ruvector/rabitq-wasm': 0.1.0
       semver: 7.7.4
     optionalDependencies:
       '@claude-flow/aidefence': 3.0.2(agentdb@3.0.0-alpha.14)
-      '@claude-flow/codex': 3.0.0-alpha.9(@claude-flow/cli@3.6.30)(@types/node@20.19.27)
-      '@claude-flow/embeddings': 3.0.0-alpha.45(@claude-flow/shared@3.0.0-alpha.7)(@ruvector/attention@0.1.32)(@ruvector/diskann@0.1.0)(@ruvector/rabitq-wasm@0.1.0)(agentic-flow@3.0.0-alpha.2)
+      '@claude-flow/codex': 3.0.0-alpha.12(@claude-flow/cli@3.6.30)(@types/node@20.19.27)
+      '@claude-flow/embeddings': 3.0.0-alpha.45(@claude-flow/shared@3.0.0-alpha.8)(@ruvector/attention@0.1.32)(@ruvector/diskann@0.1.0)(@ruvector/rabitq-wasm@0.1.0)(agentic-flow@3.0.0-alpha.2)
       '@claude-flow/guidance': 3.0.0-alpha.2(@types/node@20.19.27)(zod@3.25.76)
       '@claude-flow/memory': 3.0.0-alpha.17(@types/node@20.19.27)(zod@3.25.76)
-      '@claude-flow/plugin-gastown-bridge': 0.1.3(@claude-flow/memory@3.0.0-alpha.17)
+      '@claude-flow/plugin-gastown-bridge': 0.1.4(@claude-flow/memory@3.0.0-alpha.17)
       '@claude-flow/security': 3.0.0-alpha.8
       '@ruvector/attention': 0.1.32
       '@ruvector/attention-darwin-arm64': 0.1.32
@@ -779,7 +779,7 @@ packages:
       '@ruvector/router': 0.1.30
       '@ruvector/ruvllm-wasm': 2.0.2
       '@ruvector/rvagent-wasm': 0.1.0
-      '@ruvector/sona': 0.1.6
+      '@ruvector/sona': 0.1.7
       agentdb: 3.0.0-alpha.14(@types/node@20.19.27)(zod@3.25.76)
       agentic-flow: 3.0.0-alpha.2
     transitivePeerDependencies:
@@ -804,8 +804,8 @@ packages:
       - zod
     dev: false
 
-  /@claude-flow/codex@3.0.0-alpha.9(@claude-flow/cli@3.6.30)(@types/node@20.19.27):
-    resolution: {integrity: sha512-6xkeNbzo38l6Kx6hayLQe/olCBK7wq9AYTAtFKBuloU03oYP4tmb5aTMBAcp9ZSsbugCIf3SRBJZiD/1hogK4A==}
+  /@claude-flow/codex@3.0.0-alpha.12(@claude-flow/cli@3.6.30)(@types/node@20.19.27):
+    resolution: {integrity: sha512-8ouFWhK42nwtn166bdfgcAFqNS/ZcWdqEmUkmIZee1kUwvYIAgOM5LpmPPe0UyFhTwjDv9ztEizhBBRwYbQ+4w==}
     engines: {node: '>=18'}
     hasBin: true
     requiresBuild: true
@@ -828,7 +828,7 @@ packages:
     dev: false
     optional: true
 
-  /@claude-flow/embeddings@3.0.0-alpha.45(@claude-flow/shared@3.0.0-alpha.7)(@ruvector/attention@0.1.32)(@ruvector/diskann@0.1.0)(@ruvector/rabitq-wasm@0.1.0)(agentic-flow@3.0.0-alpha.2):
+  /@claude-flow/embeddings@3.0.0-alpha.45(@claude-flow/shared@3.0.0-alpha.8)(@ruvector/attention@0.1.32)(@ruvector/diskann@0.1.0)(@ruvector/rabitq-wasm@0.1.0)(agentic-flow@3.0.0-alpha.2):
     resolution: {integrity: sha512-OcFFh7H22ZnApdzqWXPNvUgz6XYYjhaDFyYRufmKPfRYsh8TmWOF5xUV3i9MCRqz38EugJqKQ8mbs35DC+Dgjg==}
     engines: {node: '>=20.0.0'}
     requiresBuild: true
@@ -857,7 +857,7 @@ packages:
       ruvector-onnx-embeddings-wasm:
         optional: true
     dependencies:
-      '@claude-flow/shared': 3.0.0-alpha.7
+      '@claude-flow/shared': 3.0.0-alpha.8
       '@ruvector/attention': 0.1.32
       '@ruvector/diskann': 0.1.0
       '@ruvector/rabitq-wasm': 0.1.0
@@ -919,9 +919,9 @@ packages:
     engines: {node: '>=20.0.0'}
     requiresBuild: true
     dependencies:
-      '@claude-flow/hooks': 3.0.0-alpha.7(@claude-flow/shared@3.0.0-alpha.7)(@types/node@20.19.27)
+      '@claude-flow/hooks': 3.0.0-alpha.7(@claude-flow/shared@3.0.0-alpha.8)(@types/node@20.19.27)
       '@claude-flow/memory': 3.0.0-alpha.17(@types/node@20.19.27)(zod@3.25.76)
-      '@claude-flow/shared': 3.0.0-alpha.7
+      '@claude-flow/shared': 3.0.0-alpha.8
     transitivePeerDependencies:
       - '@cfworker/json-schema'
       - '@types/node'
@@ -933,7 +933,7 @@ packages:
     dev: false
     optional: true
 
-  /@claude-flow/hooks@3.0.0-alpha.7(@claude-flow/shared@3.0.0-alpha.7)(@types/node@20.19.27):
+  /@claude-flow/hooks@3.0.0-alpha.7(@claude-flow/shared@3.0.0-alpha.8)(@types/node@20.19.27):
     resolution: {integrity: sha512-/1RKlhVvHUIMG268vwuzm2cQkqCfyZ9IbpKFYbJjILqwHEDEdOoqwJFnyGhWzZVt3qyu2sSirUunr2estnNHEg==}
     engines: {node: '>=20.0.0'}
     hasBin: true
@@ -943,7 +943,7 @@ packages:
     dependencies:
       '@claude-flow/memory': 3.0.0-alpha.17(@types/node@20.19.27)(zod@3.25.76)
       '@claude-flow/neural': 3.0.0-alpha.9(@types/node@20.19.27)(zod@3.25.76)
-      '@claude-flow/shared': 3.0.0-alpha.7
+      '@claude-flow/shared': 3.0.0-alpha.8
       zod: 3.25.76
     optionalDependencies:
       better-sqlite3: 11.10.0
@@ -957,8 +957,8 @@ packages:
     dev: false
     optional: true
 
-  /@claude-flow/mcp@3.0.0-alpha.8:
-    resolution: {integrity: sha512-lP1t8GMWDl9RxnwMZrjMukZkyglhge7Znhj1PbUiUQ94kHcN+dAxUkA75HM1n7BONbIDcE/CS8qN2ril5KgzNg==}
+  /@claude-flow/mcp@3.0.0-alpha.9:
+    resolution: {integrity: sha512-bbDxG9vqfOVbc3/KBSI+Fsr3tUSrCCCeYLk12dCx0c6Xa0SaF1hkO3OXI2J6xiK7vlXgVmaAToncunC1Mx2dXw==}
     dependencies:
       ajv: 8.18.0
       cors: 2.8.6
@@ -1011,8 +1011,8 @@ packages:
     dev: false
     optional: true
 
-  /@claude-flow/plugin-gastown-bridge@0.1.3(@claude-flow/memory@3.0.0-alpha.17):
-    resolution: {integrity: sha512-ZHqtgiZOIa0lHelPZ8AWeiW99a84t5PmMY2U90Jp5Iqd/m/P2VIAY0CmHAWEPo1oomTu0NulJFtoblto8K9U9w==}
+  /@claude-flow/plugin-gastown-bridge@0.1.4(@claude-flow/memory@3.0.0-alpha.17):
+    resolution: {integrity: sha512-MSxrTGkQoSlt6rcgg7p3/oayuvDH8uD2411ysrzitHThwCapW1f/SWNaN3gF0MHC6TIduuk611r2tXAtesJdrA==}
     engines: {node: '>=20.0.0'}
     requiresBuild: true
     peerDependencies:
@@ -1028,8 +1028,8 @@ packages:
     dev: false
     optional: true
 
-  /@claude-flow/plugin-gastown-bridge@0.1.3(@claude-flow/memory@@claude-flow+memory):
-    resolution: {integrity: sha512-ZHqtgiZOIa0lHelPZ8AWeiW99a84t5PmMY2U90Jp5Iqd/m/P2VIAY0CmHAWEPo1oomTu0NulJFtoblto8K9U9w==}
+  /@claude-flow/plugin-gastown-bridge@0.1.4(@claude-flow/memory@@claude-flow+memory):
+    resolution: {integrity: sha512-MSxrTGkQoSlt6rcgg7p3/oayuvDH8uD2411ysrzitHThwCapW1f/SWNaN3gF0MHC6TIduuk611r2tXAtesJdrA==}
     engines: {node: '>=20.0.0'}
     requiresBuild: true
     peerDependencies:
@@ -1054,8 +1054,8 @@ packages:
     dev: false
     optional: true
 
-  /@claude-flow/shared@3.0.0-alpha.7:
-    resolution: {integrity: sha512-5iehTHguBFjlyZqy+fRoKfZVL/nFeE93A94nUUKJvu8y7AmhfpVqtQAZbmKztwQGJ5rv7iBb3Kwl1MUo3K5QkA==}
+  /@claude-flow/shared@3.0.0-alpha.8:
+    resolution: {integrity: sha512-v5zzFnvJI2tfkaDNqRO7R1M4/PxFYa73hHXCKRN2Ec4MPKpTcAS9qhgAEAI/6hL4F66gW+2udUdQJzjwZGcXMg==}
     dependencies:
       sql.js: 1.14.1
     dev: false
@@ -1851,7 +1851,7 @@ packages:
     dependencies:
       '@types/node': 20.19.27
       chardet: 2.1.1
-      iconv-lite: 0.7.1
+      iconv-lite: 0.7.2
 
   /@inquirer/figures@1.0.15:
     resolution: {integrity: sha512-t2IEY+unGHOzAaVM5Xx6DEWKeXlDDcNPeDyUpsRc6CUhBfU3VQOEl+Vssh7VNp1dR8MdUJBWhuObjXCsVpjN5g==}
@@ -2036,7 +2036,7 @@ packages:
     requiresBuild: true
     dependencies:
       '@gar/promisify': 1.1.3
-      semver: 7.7.4
+      semver: 7.8.4
     dev: false
     optional: true
 
@@ -2930,7 +2930,7 @@ packages:
     dependencies:
       '@opentelemetry/api': 1.9.0
       '@opentelemetry/instrumentation': 0.52.1(@opentelemetry/api@1.9.0)
-      semver: 7.7.4
+      semver: 7.8.4
     transitivePeerDependencies:
       - supports-color
     dev: false
@@ -2945,7 +2945,7 @@ packages:
     dependencies:
       '@opentelemetry/api': 1.9.1
       '@opentelemetry/instrumentation': 0.52.1(@opentelemetry/api@1.9.1)
-      semver: 7.7.4
+      semver: 7.8.4
     transitivePeerDependencies:
       - supports-color
     dev: false
@@ -3174,7 +3174,7 @@ packages:
       '@opentelemetry/core': 1.25.1(@opentelemetry/api@1.9.0)
       '@opentelemetry/instrumentation': 0.52.1(@opentelemetry/api@1.9.0)
       '@opentelemetry/semantic-conventions': 1.25.1
-      semver: 7.7.4
+      semver: 7.8.4
     transitivePeerDependencies:
       - supports-color
     dev: false
@@ -3191,7 +3191,7 @@ packages:
       '@opentelemetry/core': 1.25.1(@opentelemetry/api@1.9.1)
       '@opentelemetry/instrumentation': 0.52.1(@opentelemetry/api@1.9.1)
       '@opentelemetry/semantic-conventions': 1.25.1
-      semver: 7.7.4
+      semver: 7.8.4
     transitivePeerDependencies:
       - supports-color
     dev: false
@@ -3867,7 +3867,7 @@ packages:
       '@types/shimmer': 1.2.0
       import-in-the-middle: 1.15.0
       require-in-the-middle: 7.5.2
-      semver: 7.7.4
+      semver: 7.8.4
       shimmer: 1.2.1
     transitivePeerDependencies:
       - supports-color
@@ -3886,7 +3886,7 @@ packages:
       '@types/shimmer': 1.2.0
       import-in-the-middle: 1.15.0
       require-in-the-middle: 7.5.2
-      semver: 7.7.4
+      semver: 7.8.4
       shimmer: 1.2.1
     transitivePeerDependencies:
       - supports-color
@@ -4471,7 +4471,7 @@ packages:
       '@opentelemetry/propagator-b3': 1.25.1(@opentelemetry/api@1.9.0)
       '@opentelemetry/propagator-jaeger': 1.25.1(@opentelemetry/api@1.9.0)
       '@opentelemetry/sdk-trace-base': 1.25.1(@opentelemetry/api@1.9.0)
-      semver: 7.7.4
+      semver: 7.8.4
     dev: false
     optional: true
 
@@ -4488,7 +4488,7 @@ packages:
       '@opentelemetry/propagator-b3': 1.25.1(@opentelemetry/api@1.9.1)
       '@opentelemetry/propagator-jaeger': 1.25.1(@opentelemetry/api@1.9.1)
       '@opentelemetry/sdk-trace-base': 1.25.1(@opentelemetry/api@1.9.1)
-      semver: 7.7.4
+      semver: 7.8.4
     optional: true
 
   /@opentelemetry/semantic-conventions@1.25.1:
@@ -5441,13 +5441,6 @@ packages:
       '@ruvector/rvf-wasm': 0.1.6
     optional: true
 
-  /@ruvector/sona-darwin-arm64@0.1.4:
-    resolution: {integrity: sha512-XLXGnlcrrVM00cTsq7VyGhWu2Fvr4zJQD1bktthR3j0r4Y1PXwnw1QPHVtdcKzKmZ5WKPDGxsgRNPUKAIT/PRA==}
-    cpu: [arm64]
-    os: [darwin]
-    requiresBuild: true
-    optional: true
-
   /@ruvector/sona-darwin-arm64@0.1.5:
     resolution: {integrity: sha512-+bXB7+WdbkiNbcw0Xh5VENNILgDVpuma7fyx8NwGylWaYRe1niM03k/rezdM3zbpf4qGSqp6fVKIIDU8/H9lHw==}
     cpu: [arm64]
@@ -5456,9 +5449,9 @@ packages:
     dev: false
     optional: true
 
-  /@ruvector/sona-darwin-x64@0.1.4:
-    resolution: {integrity: sha512-8bUvmQHn/N7zcD5Zf/u+lsggl6ql0NiuwPPYxitimJKAV+8oT7Zt4zE7kgnx8wqO2YCD4GPxw5laqhRz6IWwQQ==}
-    cpu: [x64]
+  /@ruvector/sona-darwin-arm64@0.1.7:
+    resolution: {integrity: sha512-7J1Mpakghe9iTZc2cTTMK6dtMQLhSQKxG9bN1LAakp0Gn/r6N7qmbJEJWGx4vZcsYoQKPbl9ijIDKLgEu92qAQ==}
+    cpu: [arm64]
     os: [darwin]
     requiresBuild: true
     optional: true
@@ -5471,10 +5464,10 @@ packages:
     dev: false
     optional: true
 
-  /@ruvector/sona-linux-arm64-gnu@0.1.4:
-    resolution: {integrity: sha512-QyGIK++wbdRDTF2oio1Ikq1QjS5KKUKJx4Z/rRjxJu29TGXigEdJmwTnPDtsKKzVwXahrEi1mI4Ri/ALMJID9w==}
-    cpu: [arm64]
-    os: [linux]
+  /@ruvector/sona-darwin-x64@0.1.7:
+    resolution: {integrity: sha512-elFfUL9fYd+6uP7R64KEiq+8adpyrIKv2f8WVUU42OXQ1K0KWMrLYWW5NzPVcS/KHv1t0eUwc06HnqWgA8KXaQ==}
+    cpu: [x64]
+    os: [darwin]
     requiresBuild: true
     optional: true
 
@@ -5486,9 +5479,9 @@ packages:
     dev: false
     optional: true
 
-  /@ruvector/sona-linux-x64-gnu@0.1.4:
-    resolution: {integrity: sha512-lh4HYZUag0yiFpooFxAF6TTx/SVDnh/OPD1yY6G2KH9UaIPgLzw0l/dGv4DaVtv6qjeQMMrxrI8y6vFHUOBvuw==}
-    cpu: [x64]
+  /@ruvector/sona-linux-arm64-gnu@0.1.7:
+    resolution: {integrity: sha512-ihpsAPnggDQ6vPi1It8d+bUcwCngYGL3DmC3kyIZ0hWUzuxRx45abmgPqVCtc58hllNXaY/nJ9guiQFF2JNcDg==}
+    cpu: [arm64]
     os: [linux]
     requiresBuild: true
     optional: true
@@ -5501,8 +5494,8 @@ packages:
     dev: false
     optional: true
 
-  /@ruvector/sona-linux-x64-musl@0.1.4:
-    resolution: {integrity: sha512-+g+5px2k4lztba8wqxuoNnOU1tFWEdCJHMXqU0Tqn5rq06YoGCGpzoDI55jo1OKtCgCbPLBVT8KiUHIKxT1L/g==}
+  /@ruvector/sona-linux-x64-gnu@0.1.7:
+    resolution: {integrity: sha512-IqCNJw1fyjkSZkSf2sB/IMKfCxLv5+9aAUo6lEpfnR60vP33pbCxLzcZDVDcIpcaTSbe3DHcH5DYNu+C1v8yvQ==}
     cpu: [x64]
     os: [linux]
     requiresBuild: true
@@ -5516,10 +5509,10 @@ packages:
     dev: false
     optional: true
 
-  /@ruvector/sona-win32-arm64-msvc@0.1.4:
-    resolution: {integrity: sha512-xQkFe5x8SBcg+IM/I5EtDz7gQYdznG1GZnAqt9zKbY/xEOqPmJFlk9A8ab3w9QMBgXTCmlZKkWKDGQgqg3RQ5w==}
-    cpu: [arm64]
-    os: [win32]
+  /@ruvector/sona-linux-x64-musl@0.1.7:
+    resolution: {integrity: sha512-zMCvbcgl7h8GLLOLFqDx1ud+hHHhzSoHbLmvVOuW+U0ARbtwJTu4piyzvm4KuPnfTEn6jTgQsNU2wEUfh8dIjg==}
+    cpu: [x64]
+    os: [linux]
     requiresBuild: true
     optional: true
 
@@ -5531,9 +5524,9 @@ packages:
     dev: false
     optional: true
 
-  /@ruvector/sona-win32-x64-msvc@0.1.4:
-    resolution: {integrity: sha512-kox5tXvKiTtZaSw0fyo7fvAIp/VK5XAtnoN8C8BuERcqOgrcwY6CS8z5M1hEH1XUR9CHBNpiL6+wURsLXwq4/g==}
-    cpu: [x64]
+  /@ruvector/sona-win32-arm64-msvc@0.1.7:
+    resolution: {integrity: sha512-9VHEEImhrG6s56Jj4VfXbQ8HfJZ02K/3nYWHpgeJnIdSglkGIOJiplFLeCbvFrfBvFWTL9TmtXUrxpIRxNKkFQ==}
+    cpu: [arm64]
     os: [win32]
     requiresBuild: true
     optional: true
@@ -5544,6 +5537,13 @@ packages:
     os: [win32]
     requiresBuild: true
     dev: false
+    optional: true
+
+  /@ruvector/sona-win32-x64-msvc@0.1.7:
+    resolution: {integrity: sha512-bVLG2GKAyb1uhm+p7ngLAR3Z6ocl0lukd0OLbJ8K6Cf4Cdz9RQgEytajyucyoaPr9tV3LkAhM41Ibiwks4eVoA==}
+    cpu: [x64]
+    os: [win32]
+    requiresBuild: true
     optional: true
 
   /@ruvector/sona@0.1.5:
@@ -5559,17 +5559,17 @@ packages:
       '@ruvector/sona-win32-x64-msvc': 0.1.5
     dev: false
 
-  /@ruvector/sona@0.1.6:
-    resolution: {integrity: sha512-LW40r28yQxXz3vt1fOLRWVV5nln4rzw6a/Yy11EJJdeEN9q4wZG1Glwf9leTp4SjQjuIJ5hklNW8OVMwgyzd5w==}
+  /@ruvector/sona@0.1.7:
+    resolution: {integrity: sha512-TR112g0QoiwavKGk+bogNm++F7LDZ4ko47pR1L/b0kuWfNi8FiW8CVLI/7GSIAJPS3VEfI86Cm7HYiEedc/dTQ==}
     engines: {node: '>= 16'}
     optionalDependencies:
-      '@ruvector/sona-darwin-arm64': 0.1.4
-      '@ruvector/sona-darwin-x64': 0.1.4
-      '@ruvector/sona-linux-arm64-gnu': 0.1.4
-      '@ruvector/sona-linux-x64-gnu': 0.1.4
-      '@ruvector/sona-linux-x64-musl': 0.1.4
-      '@ruvector/sona-win32-arm64-msvc': 0.1.4
-      '@ruvector/sona-win32-x64-msvc': 0.1.4
+      '@ruvector/sona-darwin-arm64': 0.1.7
+      '@ruvector/sona-darwin-x64': 0.1.7
+      '@ruvector/sona-linux-arm64-gnu': 0.1.7
+      '@ruvector/sona-linux-x64-gnu': 0.1.7
+      '@ruvector/sona-linux-x64-musl': 0.1.7
+      '@ruvector/sona-win32-arm64-msvc': 0.1.7
+      '@ruvector/sona-win32-x64-msvc': 0.1.7
 
   /@ruvector/tiny-dancer-darwin-arm64@0.1.15:
     resolution: {integrity: sha512-99vy9OLjppPj3kjusQnirgLvOnBt6Jrt2pij3Fvs5pzyp+zh04gb1np0tFR4JCxftKnuoKYqN7bCtQvgQbBBSg==}
@@ -5717,7 +5717,7 @@ packages:
       read-pkg: 10.0.0
       registry-auth-token: 5.1.0
       semantic-release: 25.0.2(typescript@5.9.3)
-      semver: 7.7.3
+      semver: 7.8.4
       tempy: 3.1.0
 
   /@semantic-release/release-notes-generator@14.1.0(semantic-release@25.0.2):
@@ -6545,7 +6545,7 @@ packages:
       '@ruvector/graph-node': 0.1.26
       '@ruvector/router': 0.1.30
       '@ruvector/ruvllm': 0.2.4
-      '@ruvector/sona': 0.1.6
+      '@ruvector/sona': 0.1.7
       ajv: 8.18.0
       chalk: 5.6.2
       cli-table3: 0.6.5
@@ -6614,7 +6614,7 @@ packages:
       '@ruvector/rvf-node': 0.1.8
       '@ruvector/rvf-solver': 0.1.8
       '@ruvector/rvf-wasm': 0.1.6
-      '@ruvector/sona': 0.1.6
+      '@ruvector/sona': 0.1.7
       '@xenova/transformers': 2.17.2
       argon2: 0.44.0
       better-sqlite3: 11.10.0
@@ -6786,7 +6786,7 @@ packages:
     optionalDependencies:
       '@rollup/rollup-darwin-arm64': 4.60.3
       '@ruvector/attention': 0.1.32
-      '@ruvector/sona': 0.1.6
+      '@ruvector/sona': 0.1.7
       agentdb: 3.0.0-alpha.14(@types/node@20.19.27)(zod@3.25.76)
       better-sqlite3: 11.10.0
       onnxruntime-node: 1.24.3
@@ -6841,7 +6841,7 @@ packages:
     optionalDependencies:
       '@rollup/rollup-darwin-arm64': 4.60.3
       '@ruvector/attention': 0.1.32
-      '@ruvector/sona': 0.1.6
+      '@ruvector/sona': 0.1.7
       '@xenova/transformers': 2.17.2
       agentdb: 3.0.0-alpha.14(@types/node@20.19.27)(zod@3.25.76)
       better-sqlite3: 11.10.0
@@ -6898,7 +6898,7 @@ packages:
       zod: 3.25.76
     optionalDependencies:
       '@ruvector/attention': 0.1.32
-      '@ruvector/sona': 0.1.6
+      '@ruvector/sona': 0.1.7
       agentdb: 2.0.0-alpha.3.7(@types/node@20.19.27)(express@5.2.1)(marked@11.2.0)
       better-sqlite3: 11.10.0
       onnxruntime-node: 1.24.3
@@ -7809,7 +7809,7 @@ packages:
       conventional-commits-filter: 5.0.0
       handlebars: 4.7.8
       meow: 13.2.0
-      semver: 7.7.4
+      semver: 7.8.4
 
   /conventional-commits-filter@5.0.0:
     resolution: {integrity: sha512-tQMagCOC59EVgNZcC5zl7XqO30Wki9i9J3acbUvkaosCT6JX3EeFwJD7Qqp4MCikRnzS18WXV3BLIQ66ytu6+Q==}
@@ -8968,7 +8968,7 @@ packages:
       es6-error: 4.1.1
       matcher: 3.0.0
       roarr: 2.15.4
-      semver: 7.7.4
+      semver: 7.8.4
       serialize-error: 7.0.1
 
   /globals@13.24.0:
@@ -9258,12 +9258,6 @@ packages:
       safer-buffer: 2.1.2
     dev: false
     optional: true
-
-  /iconv-lite@0.7.1:
-    resolution: {integrity: sha512-2Tth85cXwGFHfvRgZWszZSvdo+0Xsqmw8k8ZwxScfcBneNUraK+dxRxRm24nszx80Y0TVio8kKLt5sLE7ZCLlw==}
-    engines: {node: '>=0.10.0'}
-    dependencies:
-      safer-buffer: 2.1.2
 
   /iconv-lite@0.7.2:
     resolution: {integrity: sha512-im9DjEDQ55s9fL4EYzOAv0yMqmMBSZp6G0VvFyTMPKWxiSBHUj9NW/qqLmXUwXrrM7AvqSlTCfvqRb0cM8yYqw==}
@@ -9629,7 +9623,7 @@ packages:
       lodash.isstring: 4.0.1
       lodash.once: 4.1.1
       ms: 2.1.3
-      semver: 7.7.4
+      semver: 7.8.4
 
   /jwa@2.0.1:
     resolution: {integrity: sha512-hRF04fqJIP8Abbkq5NKGN0Bbr3JxlQ+qhZufXVr0DvujKy93ZCbXZMHDL4EOtodSbCWxOqR8MS1tXA5hwqCXDg==}
@@ -9823,7 +9817,7 @@ packages:
     resolution: {integrity: sha512-hXdUTZYIVOt1Ex//jAQi+wTZZpUpwBj/0QsOzqegb3rGMMeJiSEu5xLHnYfBrRV4RH2+OCSOO95Is/7x1WJ4bw==}
     engines: {node: '>=10'}
     dependencies:
-      semver: 7.7.3
+      semver: 7.8.4
     dev: true
 
   /make-fetch-happen@9.1.0:
@@ -10205,7 +10199,7 @@ packages:
     engines: {node: '>=10'}
     requiresBuild: true
     dependencies:
-      semver: 7.7.4
+      semver: 7.8.4
 
   /node-addon-api@6.1.0:
     resolution: {integrity: sha512-+eawOlIgy680F0kBzPUNFhMZGtJ1YmqM6l4+Crf4IkImjYrO/mqPwRMh352g23uIaQKFItcQ64I7KMaJxHgAVA==}
@@ -10285,7 +10279,7 @@ packages:
       nopt: 5.0.0
       npmlog: 6.0.2
       rimraf: 3.0.2
-      semver: 7.7.4
+      semver: 7.8.4
       tar: 6.2.1
       which: 2.0.2
     transitivePeerDependencies:
@@ -10313,7 +10307,7 @@ packages:
     engines: {node: ^16.14.0 || >=18.0.0}
     dependencies:
       hosted-git-info: 7.0.2
-      semver: 7.7.4
+      semver: 7.8.4
       validate-npm-package-license: 3.0.4
 
   /normalize-package-data@8.0.0:
@@ -10321,7 +10315,7 @@ packages:
     engines: {node: ^20.17.0 || >=22.9.0}
     dependencies:
       hosted-git-info: 9.0.2
-      semver: 7.7.4
+      semver: 7.8.4
       validate-npm-package-license: 3.0.4
 
   /normalize-url@8.1.1:
@@ -10568,7 +10562,7 @@ packages:
       log-symbols: 5.1.0
       stdin-discarder: 0.1.0
       string-width: 6.1.0
-      strip-ansi: 7.1.2
+      strip-ansi: 7.2.0
     dev: false
 
   /ora@9.0.0:
@@ -11410,7 +11404,7 @@ packages:
       '@ruvector/attention': 0.1.32
       '@ruvector/core': 0.1.30
       '@ruvector/gnn': 0.1.25
-      '@ruvector/sona': 0.1.6
+      '@ruvector/sona': 0.1.7
       chalk: 4.1.2
       commander: 11.1.0
       ora: 5.4.1
@@ -11430,7 +11424,7 @@ packages:
       '@ruvector/attention': 0.1.32
       '@ruvector/core': 0.1.30
       '@ruvector/gnn': 0.1.25
-      '@ruvector/sona': 0.1.6
+      '@ruvector/sona': 0.1.7
       '@xenova/transformers': 2.17.2
       chalk: 4.1.2
       commander: 11.1.0
@@ -11509,7 +11503,7 @@ packages:
     engines: {node: '>=12'}
     deprecated: Deprecated as the semver package now supports this built-in.
     dependencies:
-      semver: 7.7.3
+      semver: 7.8.4
 
   /semver-regex@4.0.5:
     resolution: {integrity: sha512-hunMQrEy1T6Jr2uEVjrAIqjwWcQTgOAcIM52C8MY1EZSD3DDNft04XzvYKPqjED65bNVVko0YI38nYeEHCX3yw==}
@@ -11522,6 +11516,12 @@ packages:
 
   /semver@7.7.4:
     resolution: {integrity: sha512-vFKC2IEtQnVhpT78h1Yp8wzwrf8CM+MzKMHGJZfBtzhZNycRFnXsHk6E5TxIkkMsgNS7mdX3AGB7x2QM2di4lA==}
+    engines: {node: '>=10'}
+    hasBin: true
+    dev: false
+
+  /semver@7.8.4:
+    resolution: {integrity: sha512-rUCObTnP32Q08R2uuIrt7r9PlEonuTmtuXYcW6s5kjdlj3xbnwe+21yXptAUYcMAABLkYYTtnmzb3w3EDZfueA==}
     engines: {node: '>=10'}
     hasBin: true
 
@@ -11613,7 +11613,7 @@ packages:
       detect-libc: 2.1.2
       node-addon-api: 6.1.0
       prebuild-install: 7.1.3
-      semver: 7.7.4
+      semver: 7.8.4
       simple-get: 4.0.1
       tar-fs: 3.1.1
       tunnel-agent: 0.6.0
@@ -11628,7 +11628,7 @@ packages:
     dependencies:
       '@img/colour': 1.1.0
       detect-libc: 2.1.2
-      semver: 7.7.4
+      semver: 7.8.4
     optionalDependencies:
       '@img/sharp-darwin-arm64': 0.34.5
       '@img/sharp-darwin-x64': 0.34.5
@@ -11972,13 +11972,6 @@ packages:
     engines: {node: '>=8'}
     dependencies:
       ansi-regex: 5.0.1
-
-  /strip-ansi@7.1.2:
-    resolution: {integrity: sha512-gmBGslpoQJtgnMAvOVqGZpEz9dyoKTCzy2nfz/n8aIFhN/jCE/rCmcxabB6jOOHV+0WNnylOxaxBQPSvcWklhA==}
-    engines: {node: '>=12'}
-    dependencies:
-      ansi-regex: 6.2.2
-    dev: false
 
   /strip-ansi@7.2.0:
     resolution: {integrity: sha512-yDPMNjp4WyfYBkHnjIRLfca1i6KMyGCtsVgoKe/z1+6vukgaENdgGBZt+ZmKPc4gavvEZ5OgHfHdrazhgNyG7w==}
