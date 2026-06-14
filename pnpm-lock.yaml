@@ -11,6 +11,15 @@ importers:
       '@claude-flow/cli-core':
         specifier: ^3.7.0-alpha.5
         version: 3.7.0-alpha.5
-      '@claude-flow/mcp':
-        specifier: ^3.0.0-alpha.9
-        version: 3.0.0-alpha.9(@anthropic-ai/sdk@0.52.0)(ajv@8.17.1)(debug@4.4.0)
+      '@claude-flow/codex':
+        specifier: ^3.7.0-alpha.5
+        version: 3.7.0-alpha.5
+      '@claude-flow/hooks':
+        specifier: ^3.7.0-alpha.5
+        version: 3.7.0-alpha.5
+      '@claude-flow/memory':
+        specifier: ^3.7.0-alpha.5
+        version: 3.7.0-alpha.5
+      '@claude-flow/security':
+        specifier: ^3.7.0-alpha.5
+        version: 3.7.0-alpha.5
