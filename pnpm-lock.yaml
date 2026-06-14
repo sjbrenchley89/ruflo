@@ -10,4 +10,3 @@ importers:
     dependencies:
       '@claude-flow/cli-core':
         specifier: ^3.7.0-alpha.5
-      
