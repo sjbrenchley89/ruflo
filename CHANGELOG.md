@@ -5,6 +5,17 @@ All notable changes to the Ruflo project (formerly Claude Flow) are documented h
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.7.0-alpha.86] - 2026-06-28
+
+### Changed
+- Bump version `3.7.0-alpha.85` → `3.7.0-alpha.86` across all three packages (`claude-flow`, `ruflo`, `@claude-flow/cli`)
+- Add `CHANGELOG.md` entry for `3.7.0-alpha.86` dated 2026-06-28
+- Daily maintenance update: packages confirmed operational
+
+Supersedes PR #44 (`claude/focused-rubin-9egkxk`).
+
+---
+
 ## [3.7.0-alpha.85] - 2026-06-27
 
 ### Changed
@@ -300,3 +311,4 @@ This release marks the official rebranding from **Claude Flow** to **Ruflo** and
 | **Ruflo v3.7-alpha.83** | **v3.7.0-alpha.83** | **2026-06-25** | **Daily maintenance update** |
 | **Ruflo v3.7-alpha.84** | **v3.7.0-alpha.84** | **2026-06-26** | **Daily maintenance update** |
 | **Ruflo v3.7-alpha.85** | **v3.7.0-alpha.85** | **2026-06-27** | **Daily maintenance update** |
+| **Ruflo v3.7-alpha.86** | **v3.7.0-alpha.86** | **2026-06-28** | **Daily maintenance update** |
