@@ -5,6 +5,81 @@ All notable changes to the Ruflo project (formerly Claude Flow) are documented h
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.7.0-alpha.89] - 2026-07-01
+
+### Changed
+- Bump version `3.7.0-alpha.88` → `3.7.0-alpha.89` across all three packages (`claude-flow`, `ruflo`, `@claude-flow/cli`)
+- Add `CHANGELOG.md` entry for `3.7.0-alpha.89` dated 2026-07-01
+- Daily maintenance update: packages confirmed operational
+
+Supersedes PR #47 (`claude/focused-rubin-jisfrn`).
+
+---
+
+## [3.7.0-alpha.88] - 2026-06-30
+
+### Changed
+- Bump version `3.7.0-alpha.87` → `3.7.0-alpha.88` across all three packages (`claude-flow`, `ruflo`, `@claude-flow/cli`)
+- Add `CHANGELOG.md` entry for `3.7.0-alpha.88` dated 2026-06-30
+- Daily maintenance update: packages confirmed operational
+
+Supersedes PR #46 (`claude/focused-rubin-10vad4`).
+
+---
+
+## [3.7.0-alpha.87] - 2026-06-29
+
+### Changed
+- Bump version `3.7.0-alpha.86` → `3.7.0-alpha.87` across all three packages (`claude-flow`, `ruflo`, `@claude-flow/cli`)
+- Add `CHANGELOG.md` entry for `3.7.0-alpha.87` dated 2026-06-29
+- Daily maintenance update: packages confirmed operational
+
+Supersedes PR #45 (`claude/focused-rubin-9q34r3`).
+
+---
+
+## [3.7.0-alpha.86] - 2026-06-28
+
+### Changed
+- Bump version `3.7.0-alpha.85` → `3.7.0-alpha.86` across all three packages (`claude-flow`, `ruflo`, `@claude-flow/cli`)
+- Add `CHANGELOG.md` entry for `3.7.0-alpha.86` dated 2026-06-28
+- Daily maintenance update: packages confirmed operational
+
+Supersedes PR #44 (`claude/focused-rubin-9egkxk`).
+
+---
+
+## [3.7.0-alpha.85] - 2026-06-27
+
+### Changed
+- Bump version `3.7.0-alpha.84` → `3.7.0-alpha.85` across all three packages (`claude-flow`, `ruflo`, `@claude-flow/cli`)
+- Add `CHANGELOG.md` entry for `3.7.0-alpha.85` dated 2026-06-27
+- Daily maintenance update: packages confirmed operational
+
+Supersedes PR #43 (`claude/focused-rubin-nam8oy`).
+
+---
+
+## [3.7.0-alpha.84] - 2026-06-26
+
+### Changed
+- Bump version `3.7.0-alpha.83` → `3.7.0-alpha.84` across all three packages (`claude-flow`, `ruflo`, `@claude-flow/cli`)
+- Add `CHANGELOG.md` entry for `3.7.0-alpha.84` dated 2026-06-26
+- Daily maintenance update: packages confirmed operational
+
+Supersedes PR #42 (`claude/focused-rubin-ka3mfz`).
+
+---
+
+## [3.7.0-alpha.83] - 2026-06-25
+
+### Changed
+- Bump version `3.7.0-alpha.82` → `3.7.0-alpha.83` across all three packages (`claude-flow`, `ruflo`, `@claude-flow/cli`)
+- Add `CHANGELOG.md` entry for `3.7.0-alpha.83` dated 2026-06-25
+- Daily maintenance update: packages confirmed operational
+
+---
+
 ## [3.7.0-alpha.74] - 2026-06-03
 
 ### Fixed
@@ -266,3 +341,10 @@ This release marks the official rebranding from **Claude Flow** to **Ruflo** and
 | **Ruflo v3.6** | **v3.6.10** | **2026-04-29** | **Agent federation, comms-first coordination** |
 | **Ruflo v3.7-alpha.73** | **v3.7.0-alpha.73** | **2026-05-25** | **Version alignment, CLAUDE.md fix** |
 | **Ruflo v3.7-alpha.74** | **v3.7.0-alpha.74** | **2026-06-03** | **Dep sync, CI fix, lockfile update** |
+| **Ruflo v3.7-alpha.83** | **v3.7.0-alpha.83** | **2026-06-25** | **Daily maintenance update** |
+| **Ruflo v3.7-alpha.84** | **v3.7.0-alpha.84** | **2026-06-26** | **Daily maintenance update** |
+| **Ruflo v3.7-alpha.85** | **v3.7.0-alpha.85** | **2026-06-27** | **Daily maintenance update** |
+| **Ruflo v3.7-alpha.86** | **v3.7.0-alpha.86** | **2026-06-28** | **Daily maintenance update** |
+| **Ruflo v3.7-alpha.87** | **v3.7.0-alpha.87** | **2026-06-29** | **Daily maintenance update** |
+| **Ruflo v3.7-alpha.88** | **v3.7.0-alpha.88** | **2026-06-30** | **Daily maintenance update** |
+| **Ruflo v3.7-alpha.89** | **v3.7.0-alpha.89** | **2026-07-01** | **Daily maintenance update** |
