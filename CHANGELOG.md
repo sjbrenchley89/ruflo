@@ -368,4 +368,3 @@ This release marks the official rebranding from **Claude Flow** to **Ruflo** and
 | **Ruflo v3.7-alpha.89** | **v3.7.0-alpha.89** | **2026-07-01** | **Daily maintenance update** |
 | **Ruflo v3.7-alpha.90** | **v3.7.0-alpha.90** | **2026-07-02** | **Daily maintenance update** |
 | **Ruflo v3.7-alpha.91** | **v3.7.0-alpha.91** | **2026-07-05** | **Daily maintenance update** |
-| **Ruflo v3.7-alpha.90** | **v3.7.0-alpha.90** | **2026-07-02** | **Daily maintenance update** |
