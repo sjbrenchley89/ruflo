@@ -5,6 +5,19 @@ All notable changes to the Ruflo project (formerly Claude Flow) are documented h
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.7.0-alpha.94] - 2026-07-08
+
+### Changed
+- Bump version `3.7.0-alpha.91` → `3.7.0-alpha.94` across all three packages (`claude-flow`, `ruflo`, `@claude-flow/cli`)
+- Add `CHANGELOG.md` entry for `3.7.0-alpha.94` dated 2026-07-08
+- Daily maintenance update: packages confirmed operational
+
+`alpha.92` and `alpha.93` are intentionally skipped — PR #51 (`claude/focused-rubin-rtytj9`) and PR #52 (`claude/focused-rubin-41x4uh`) claimed those versions but sat open/unmerged for 2+ days. This PR supersedes both; #51 and #52 have been closed.
+
+Note: `package-lock.json` / `ruflo/package-lock.json` top-level `name`/`version` metadata was left at `3.7.0-alpha.91` this round — the lockfiles are large enough that regenerating them wasn't practical for this automation run. This is cosmetic only (lockfile dependency resolution is unaffected); a future run should refresh it via `npm install`.
+
+---
+
 ## [3.7.0-alpha.91] - 2026-07-05
 
 ### Changed
@@ -368,3 +381,4 @@ This release marks the official rebranding from **Claude Flow** to **Ruflo** and
 | **Ruflo v3.7-alpha.89** | **v3.7.0-alpha.89** | **2026-07-01** | **Daily maintenance update** |
 | **Ruflo v3.7-alpha.90** | **v3.7.0-alpha.90** | **2026-07-02** | **Daily maintenance update** |
 | **Ruflo v3.7-alpha.91** | **v3.7.0-alpha.91** | **2026-07-05** | **Daily maintenance update** |
+| **Ruflo v3.7-alpha.94** | **v3.7.0-alpha.94** | **2026-07-08** | **Daily maintenance update** |
