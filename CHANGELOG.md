@@ -5,6 +5,17 @@ All notable changes to the Ruflo project (formerly Claude Flow) are documented h
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.7.0-alpha.102] - 2026-07-21
+
+### Changed
+- Bump version `3.7.0-alpha.101` → `3.7.0-alpha.102` across all three packages (`claude-flow`, `ruflo`, `@claude-flow/cli`) and both lockfiles
+- Daily maintenance update
+
+### Fixed
+- The `3.7.0-alpha.101` push to `main` (PR #61) had its "Publish to npm (alpha)" job skipped because an earlier required job — "Plugin package install-safety" — failed on a transient network timeout (`ETIMEDOUT`/`ENETUNREACH` fetching an `onnxruntime-node` GPU binary from `api.nuget.org`, unrelated to any code change). `3.7.0-alpha.101` was therefore never actually published. This bump re-triggers the pipeline so the release can complete.
+
+---
+
 ## [3.7.0-alpha.101] - 2026-07-20
 
 ### Changed
