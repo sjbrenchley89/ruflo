@@ -5,6 +5,21 @@ All notable changes to the Ruflo project (formerly Claude Flow) are documented h
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.7.0-alpha.102] - 2026-07-21
+
+### Changed
+- Bump version `3.7.0-alpha.101` → `3.7.0-alpha.102` across all three packages (`claude-flow`, `ruflo`, `@claude-flow/cli`) and both lockfiles
+- Daily maintenance update
+
+### Known issues (not fixed by this bump — flagged for follow-up)
+- **Corrected from an earlier draft of this entry:** the `3.7.0-alpha.101` push to `main` (PR #61) had its "Publish to npm (alpha)" job show as "skipped" — this is *not* caused by the transient network timeout in the unrelated "Plugin package install-safety" job (that failure is real, but a red herring here). The actual cause: in `.github/workflows/v3-ci.yml`, the `publish` job is gated with `if: github.ref == 'refs/heads/v3' && github.event_name == 'push'`, so it **never runs on pushes to `main`** at all, regardless of other job outcomes. This bump does not change that — merging this PR will not publish anything either.
+- Even on a `v3`-branch push, the publish job would still fail: it runs `pnpm publish:alpha` from `v3/`, but `v3/package.json` only defines `publish:dry` and `publish:v3alpha` — `publish:alpha` does not exist as a script.
+- Separately, `ruflo/package.json` depends on `"@claude-flow/cli": "^3.7.0-alpha.11"`, but `ruflo/package-lock.json` resolves that to the published `@claude-flow/cli@3.10.31` — an unrelated, much newer registry release, decoupled from this monorepo's own `v3/@claude-flow/cli` (currently `3.7.0-alpha.102`). A published `ruflo` package would run CLI code from a different release line than the one this bump claims to ship.
+
+These three issues (confirmed via automated PR review, then independently verified against the workflow file, `v3/package.json`, and the lockfile) mean the npm-publish pipeline has likely never actually run to completion via a `main` push. Deciding how to fix the branch gate / publish script / dependency pin is a release-process change left for explicit follow-up rather than bundled into this daily bump.
+
+---
+
 ## [3.7.0-alpha.101] - 2026-07-20
 
 ### Changed
