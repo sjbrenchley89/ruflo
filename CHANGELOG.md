@@ -5,6 +5,13 @@ All notable changes to the Ruflo project (formerly Claude Flow) are documented h
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.7.0-alpha.128] - 2026-08-16
+
+### Changed
+- Bump version `3.7.0-alpha.127` → `3.7.0-alpha.128` across all three packages (`claude-flow`, `ruflo`, `@claude-flow/cli`) and both lockfiles
+- Daily maintenance update: packages confirmed operational
+- Merged PR #87 (`alpha.127`) into `main` so it wasn't left to go stale
+
 ## [3.7.0-alpha.127] - 2026-08-15
 
 ### Changed
