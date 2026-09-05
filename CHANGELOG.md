@@ -5,6 +5,13 @@ All notable changes to the Ruflo project (formerly Claude Flow) are documented h
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.7.0-alpha.145] - 2026-09-05
+
+### Changed
+- Bump version `3.7.0-alpha.144` → `3.7.0-alpha.145` across all three packages (`claude-flow`, `ruflo`, `@claude-flow/cli`) and both lockfiles
+- Daily maintenance update: packages confirmed operational
+- Merged PR #107 (`alpha.144`) into `main` so it wasn't left to go stale — two CI jobs (`Supply-chain audit`, `Build & Package (macos-latest)`) had failed transiently (registry hiccup / Actions artifact-storage 403), confirmed as infra flakes by re-running them clean with no code changes
+
 ## [3.7.0-alpha.144] - 2026-09-03
 
 ### Changed
