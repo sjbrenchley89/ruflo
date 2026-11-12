@@ -7,7 +7,7 @@ import type {
 } from '@claude-flow/shared/src/plugin-interface.js';
 
 import * as ed from '@noble/ed25519';
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
@@ -25,7 +25,11 @@ import { RoutingService } from './domain/services/routing-service.js';
 import { AuditService, type ComplianceMode } from './domain/services/audit-service.js';
 import { PIIPipelineService } from './domain/services/pii-pipeline-service.js';
 import { TrustEvaluator } from './application/trust-evaluator.js';
-import { PolicyEngine, type FederationClaimType } from './application/policy-engine.js';
+import { PolicyEngine } from './application/policy-engine.js';
+import {
+  createFederationClaimChecker,
+  type FederationAuthorizationMode,
+} from './application/claim-checker.js';
 import { TrustLevel, getTrustLevelLabel } from './domain/entities/trust-level.js';
 import { type FederationMessageType } from './domain/entities/federation-envelope.js';
 
@@ -48,13 +52,27 @@ type LoadedTransport = AgentTransport & {
    * doesn't include it, so we cast at the call site. */
   listen?: (port: number, host?: string) => Promise<void>;
 };
-import { dispatchInbound, canonicalizeEnvelopeForVerify } from './application/inbound-dispatcher.js';
+import {
+  DEFAULT_ENVELOPE_SIGNATURE_MODE,
+  JCS_SIGNATURE_PROTOCOL,
+  acceptedSignatureVersionsFor,
+  canonicalizeEnvelopeForVerify,
+  dispatchInbound,
+  selectEnvelopeSignatureVersion,
+  type EnvelopeSignatureMode,
+} from './application/inbound-dispatcher.js';
 import { createMcpTools } from './mcp-tools.js';
 import { createCliCommands } from './cli-commands.js';
+import { FEDERATION_PLUGIN_VERSION } from './version.js';
+// A2A (Agent2Agent, Linux Foundation) Agent Card adapter — cards only.
+// Opt-in via config.a2aCard; serves /.well-known/agent-card.json on a
+// 127.0.0.1-default bind (ADR-166 posture preserved).
+import { toAgentCard } from './a2a/agent-card.js';
+import { startAgentCardServer, type AgentCardServerHandle } from './a2a/well-known.js';
 
 export class AgentFederationPlugin implements ClaudeFlowPlugin {
   readonly name = '@claude-flow/plugin-agent-federation';
-  readonly version = '1.0.0-alpha.1';
+  readonly version = FEDERATION_PLUGIN_VERSION;
   readonly description = 'Cross-installation agent federation with PII protection and AI defence';
   readonly author = 'Claude Flow Team';
   readonly dependencies = ['@claude-flow/security', '@claude-flow/aidefence'];
@@ -66,6 +84,9 @@ export class AgentFederationPlugin implements ClaudeFlowPlugin {
   // in-process behavior — preserves backward compat for tests that
   // don't supply a port).
   private transport: LoadedTransport | null = null;
+  // A2A Agent Card well-known endpoint (opt-in via config.a2aCard). Null
+  // when the HTTP surface is off — everything else works without it.
+  private agentCardServer: AgentCardServerHandle | null = null;
 
   async initialize(context: PluginContext): Promise<void> {
     this.context = context;
@@ -76,6 +97,12 @@ export class AgentFederationPlugin implements ClaudeFlowPlugin {
     const complianceMode = (config['complianceMode'] as ComplianceMode) ?? 'none';
     const staticPeers = (config['staticPeers'] as string[]) ?? [];
     const hashSalt = (config['hashSalt'] as string) ?? `salt-${nodeId}`;
+    const signatureMode =
+      (config['signatureMode'] as EnvelopeSignatureMode | undefined)
+      ?? DEFAULT_ENVELOPE_SIGNATURE_MODE;
+    if (!['legacy', 'prefer-jcs', 'require-jcs'].includes(signatureMode)) {
+      throw new TypeError(`Unsupported federation signature mode: ${String(signatureMode)}`);
+    }
 
     // ADR-095 G2: real Ed25519 keypair instead of empty publicKey + stub
     // signatures. Persist to .claude-flow/federation/key-<nodeId>.json so
@@ -115,9 +142,29 @@ export class AgentFederationPlugin implements ClaudeFlowPlugin {
       nodeId,
       publicKey: publicKeyHex,
       endpoint,
-      capabilities: ['send', 'receive', 'query-redacted', 'status', 'ping', 'discovery'],
+      capabilities: [
+        'send',
+        'receive',
+        'query-redacted',
+        'status',
+        'ping',
+        'discovery',
+        ...(signatureMode === 'legacy' ? [] : [JCS_SIGNATURE_PROTOCOL]),
+      ],
+      supportedProtocols: [
+        'websocket',
+        'http',
+        ...(signatureMode === 'legacy' ? [] : [JCS_SIGNATURE_PROTOCOL]),
+      ],
+      version: FEDERATION_PLUGIN_VERSION,
     };
 
+    // Operator-pinned peer keys: nodeId -> Ed25519 public key (hex). The only thing that can make a peer VERIFIED/ATTESTED.
+    const trustedPeerKeys = (config['trustedPeerKeys'] ?? {}) as Record<string, unknown>;
+    const pinnedKeyFor = (peerNodeId: string): string | undefined => {
+      const key = Object.hasOwn(trustedPeerKeys, peerNodeId) ? trustedPeerKeys[peerNodeId] : undefined;
+      return typeof key === 'string' && key.length > 0 ? key : undefined;
+    };
     const generateId = () => `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 
     // ADR-095 G2: real signing + verification using @noble/ed25519. The
@@ -156,6 +203,7 @@ export class AgentFederationPlugin implements ClaudeFlowPlugin {
     const discovery = new DiscoveryService(
       {
         signManifest: async (manifest) => signBytes(canonicalize(manifest as unknown as Record<string, unknown>)),
+        pinnedKeyFor,
         verifyManifest: async (manifest) => {
           const peerPub = (manifest as { publicKey?: string }).publicKey;
           const sig = (manifest as { signature?: string }).signature;
@@ -170,9 +218,10 @@ export class AgentFederationPlugin implements ClaudeFlowPlugin {
     );
 
     const handshake = new HandshakeService({
+      pinnedKeyFor,
       generateSessionId: generateId,
       generateSessionToken: () => `token-${generateId()}`,
-      generateNonce: () => `nonce-${Math.random().toString(36).slice(2)}`,
+      generateNonce: () => `nonce-${randomBytes(16).toString('hex')}`,
       signChallenge: async (nonce) => signBytes(nonce),
       verifySignature: async (nonce, signature, peerPublicKey) =>
         verifyBytes(nonce, signature, peerPublicKey),
@@ -216,9 +265,29 @@ export class AgentFederationPlugin implements ClaudeFlowPlugin {
       },
     });
 
-    const policyEngine = new PolicyEngine(
-      { checkClaim: () => true },
-    );
+    const authorizationMode =
+      (config['authorizationMode'] as FederationAuthorizationMode | undefined) ?? 'legacy';
+    const grantedClaims = Array.isArray(config['federationClaims'])
+      ? config['federationClaims'].filter((claim): claim is string => typeof claim === 'string')
+      : [];
+    const claimChecker = createFederationClaimChecker({
+      mode: authorizationMode,
+      grantedClaims,
+      onObservation: (claim, granted) => {
+        context.eventBus.emit('federation:policy-observation', {
+          claim,
+          granted,
+          mode: authorizationMode,
+        });
+      },
+    });
+    if (claimChecker.mode === 'legacy') {
+      context.logger.warn(
+        'Federation authorization is in ADR-325 legacy compatibility mode; ' +
+          'use observe before enabling enforce',
+      );
+    }
+    const policyEngine = new PolicyEngine({ checkClaim: claimChecker.checkClaim });
 
     const sessions: Map<string, import('./domain/entities/federation-session.js').FederationSession> = new Map();
 
@@ -272,7 +341,7 @@ export class AgentFederationPlugin implements ClaudeFlowPlugin {
 
     const routing = new RoutingService({
       generateEnvelopeId: generateId,
-      generateNonce: () => `nonce-${Math.random().toString(36).slice(2)}`,
+      generateNonce: () => `nonce-${randomBytes(16).toString('hex')}`,
       signEnvelope: (payload, token) => `hmac-${token.slice(0, 6)}-${payload.length}`,
       verifyEnvelope: () => true,
       scanPii: (text, trustLevel) => {
@@ -305,12 +374,18 @@ export class AgentFederationPlugin implements ClaudeFlowPlugin {
           return;
         }
         const address = resolveAddress(targetNodeId);
-        if (!address) {
+        const peer = discovery.getPeer(targetNodeId);
+        if (!address || !peer) {
           context.logger.warn(
             `Federation send aborted: peer ${targetNodeId} not in discovery registry`,
           );
           throw new Error(`PEER_UNKNOWN: ${targetNodeId}`);
         }
+        const signatureVersion = selectEnvelopeSignatureVersion(
+          signatureMode,
+          peer.capabilities.supportedProtocols,
+          envelope.messageType,
+        );
         // Build the AgentMessage WITHOUT signature first, canonicalize
         // the bytes, sign them, then attach the signature to metadata.
         // The receiver runs the same canonicalization and verifies
@@ -323,9 +398,10 @@ export class AgentFederationPlugin implements ClaudeFlowPlugin {
             sourceNodeId: envelope.sourceNodeId,
             targetNodeId: envelope.targetNodeId,
             sessionId: envelope.sessionId,
+            ...(signatureVersion === 'jcs-v1' ? { signatureVersion } : {}),
           },
         };
-        const canon = canonicalizeEnvelopeForVerify(baseMessage);
+        const canon = canonicalizeEnvelopeForVerify(baseMessage, signatureVersion);
         const signature = signBytes(canon);
         const signed: AgentMessage = {
           ...baseMessage,
@@ -336,6 +412,7 @@ export class AgentFederationPlugin implements ClaudeFlowPlugin {
           `Federation send → ${address} (envelope=${envelope.envelopeId}, type=${envelope.messageType}, signed)`,
         );
       },
+      getPeerTrustLevel: (targetNodeId) => discovery.getPeer(targetNodeId)?.trustLevel,
       getActiveSessions: () => Array.from(sessions.values()).filter(s => s.active),
       getLocalNodeId: () => nodeId,
     });
@@ -363,7 +440,12 @@ export class AgentFederationPlugin implements ClaudeFlowPlugin {
     // need to free a port.
     const listenPort = config['port'] as number | undefined;
     if (transport && typeof listenPort === 'number' && transport.listen) {
-      const listenHost = (config['host'] as string | undefined) ?? '0.0.0.0';
+      // Loopback unless the operator names an interface: the listener is plaintext.
+      // An empty host would bind every interface, so it counts as unset.
+      const listenHost = (config['host'] as string | undefined) || '127.0.0.1';
+      if (listenHost !== '127.0.0.1' && listenHost !== 'localhost' && listenHost !== '::1') {
+        context.logger.warn(`Federation listener on ${listenHost} is plaintext WebSocket; keep it on a private network (tailnet, WireGuard) or behind TLS`);
+      }
       try {
         await transport.listen(listenPort, listenHost);
         context.logger.info(`Federation listening on ${listenHost}:${listenPort}`);
@@ -397,6 +479,15 @@ export class AgentFederationPlugin implements ClaudeFlowPlugin {
           eventBus: context.eventBus,
           logger: context.logger,
           verifyEnvelope,
+          acceptedSignatureVersions: acceptedSignatureVersionsFor(signatureMode),
+          authorizationMode,
+          authorizeInbound: ({ messageType, peer, messageSizeBytes, sourceNodeId }) =>
+            policyEngine.evaluateMessage(
+              messageType as FederationMessageType,
+              peer.trustLevel,
+              messageSizeBytes,
+              sourceNodeId,
+            ),
         });
       });
       context.logger.debug('Federation inbound dispatcher subscribed (with Ed25519 sig verify)');
@@ -407,17 +498,74 @@ export class AgentFederationPlugin implements ClaudeFlowPlugin {
       );
     }
 
+    // A2A Agent Card well-known endpoint (opt-in, graceful). Enabled with
+    // config.a2aCard = true + config.a2aCardPort. Serves the local node's
+    // manifest as a spec-compliant A2A 1.0 card at
+    // /.well-known/agent-card.json. Binds 127.0.0.1 unless config.a2aCardHost
+    // is set AND config.a2aCardAllowNonLoopback is true (ADR-166: never
+    // loosen binding implicitly). A bind failure logs and degrades — the
+    // rest of federation is unaffected.
+    const a2aEnabled = config['a2aCard'] === true;
+    const a2aPort = config['a2aCardPort'] as number | undefined;
+    if (a2aEnabled && typeof a2aPort === 'number') {
+      try {
+        this.agentCardServer = await startAgentCardServer({
+          getCard: () => {
+            const manifest = discovery.getLocalManifest() ?? {
+              nodeId,
+              publicKey: publicKeyHex,
+              endpoint,
+              capabilities: {
+                agentTypes: coordConfig.capabilities,
+                maxConcurrentSessions: 10,
+                supportedProtocols: [
+                  'websocket',
+                  'http',
+                  ...(signatureMode === 'legacy' ? [] : [JCS_SIGNATURE_PROTOCOL]),
+                ],
+                complianceModes: complianceMode === 'none' ? [] : [complianceMode],
+              },
+              version: this.version,
+              signature: '',
+              timestamp: new Date().toISOString(),
+            };
+            return toAgentCard(manifest);
+          },
+          port: a2aPort,
+          host: (config['a2aCardHost'] as string | undefined) ?? '127.0.0.1',
+          allowNonLoopback: config['a2aCardAllowNonLoopback'] === true,
+        });
+        context.logger.info(`A2A agent card served at ${this.agentCardServer.url}`);
+      } catch (err) {
+        context.logger.warn(
+          `A2A agent card endpoint unavailable (${err instanceof Error ? err.message : err}); ` +
+            'federation continues without the A2A discovery surface',
+        );
+        this.agentCardServer = null;
+      }
+    }
+
     context.logger.info('Agent Federation plugin initialized');
   }
 
   async shutdown(): Promise<void> {
+    if (this.agentCardServer) {
+      try {
+        await this.agentCardServer.close();
+      } catch (err) {
+        this.context?.logger.warn(
+          `A2A agent card server close error: ${err instanceof Error ? err.message : err}`,
+        );
+      }
+      this.agentCardServer = null;
+    }
     if (this.coordinator) {
       await this.coordinator.shutdown();
       this.coordinator = null;
     }
     if (this.transport) {
       try {
-        await this.transport.close();
+        await this.transport.close?.();
       } catch (err) {
         this.context?.logger.warn(
           `Federation transport close error: ${err instanceof Error ? err.message : err}`,

@@ -6,10 +6,13 @@
 
 import { EventEmitter } from 'events';
 import express, { Express, Request, Response, NextFunction } from 'express';
-import { createServer, Server } from 'http';
+import { createServer, Server, type IncomingMessage } from 'http';
+import { assertSafeBind, bearerToken, refuseOpenRequest } from './guard.js';
 import { WebSocketServer, WebSocket } from 'ws';
 import cors from 'cors';
 import helmet from 'helmet';
+import { rateLimit } from 'express-rate-limit';
+import { createHash, randomUUID, timingSafeEqual } from 'crypto';
 import type {
   ITransport,
   TransportType,
@@ -32,8 +35,14 @@ export interface HttpTransportConfig {
   corsEnabled?: boolean;
   corsOrigins?: string[];
   auth?: AuthConfig;
+  /** Accept a non-loopback bind with no token (the operator's own risk). */
+  allowUnauthenticated?: boolean;
   maxRequestSize?: string;
   requestTimeout?: number;
+  rateLimit?: {
+    windowMs?: number;
+    limit?: number;
+  };
 }
 
 export class HttpTransport extends EventEmitter implements ITransport {
@@ -46,6 +55,7 @@ export class HttpTransport extends EventEmitter implements ITransport {
   private wss?: WebSocketServer;
   private running = false;
   private activeConnections = new Set<WebSocket>();
+  private sseClients = new Map<string, Response>();
 
   private messagesReceived = 0;
   private messagesSent = 0;
@@ -73,11 +83,16 @@ export class HttpTransport extends EventEmitter implements ITransport {
       port: this.config.port,
     });
 
+    assertSafeBind(this.config.host, this.config.auth?.enabled === true, this.config.allowUnauthenticated);
+
     this.server = createServer(this.app);
 
     this.wss = new WebSocketServer({
       server: this.server,
       path: '/ws',
+      // CORS does not apply to upgrades, so a token-less server checks Host and Origin itself.
+      verifyClient: (info: { req: IncomingMessage }) =>
+        this.config.auth?.enabled === true || refuseOpenRequest(info.req, this.config.host, this.config.corsOrigins) === undefined,
     });
 
     this.setupWebSocketHandlers();
@@ -111,6 +126,11 @@ export class HttpTransport extends EventEmitter implements ITransport {
       }
     }
     this.activeConnections.clear();
+
+    for (const response of this.sseClients.values()) {
+      response.end();
+    }
+    this.sseClients.clear();
 
     if (this.wss) {
       this.wss.close();
@@ -163,9 +183,26 @@ export class HttpTransport extends EventEmitter implements ITransport {
         this.errors++;
       }
     }
+
+    for (const response of this.sseClients.values()) {
+      response.write(`event: message\ndata: ${message}\n\n`);
+      this.messagesSent++;
+    }
   }
 
   private setupMiddleware(): void {
+    // A server with no token must not answer a web page or a rebound hostname.
+    if (this.config.auth?.enabled !== true) {
+      this.app.use((req: Request, res: Response, next: NextFunction) => {
+        const why = refuseOpenRequest(req, this.config.host, this.config.corsOrigins);
+        if (why === undefined) {
+          next();
+          return;
+        }
+        res.status(403).json({ jsonrpc: '2.0', id: null, error: { code: -32000, message: `Forbidden: ${why}` } });
+      });
+    }
+
     this.app.use(helmet({
       contentSecurityPolicy: false,
     }));
@@ -201,6 +238,34 @@ export class HttpTransport extends EventEmitter implements ITransport {
       }));
     }
 
+    // Bound authenticated and unauthenticated RPC traffic before route-level
+    // authorization or request dispatch can consume significant resources.
+    this.app.use(['/rpc', '/mcp'], rateLimit({
+      windowMs: this.config.rateLimit?.windowMs ?? 60_000,
+      limit: this.config.rateLimit?.limit ?? 120,
+      standardHeaders: 'draft-7',
+      legacyHeaders: false,
+      message: {
+        jsonrpc: '2.0',
+        id: null,
+        error: { code: -32000, message: 'Rate limit exceeded' },
+      },
+    }));
+
+    // Bearer-token gate for every route (health excepted, see isPublicHealthRequest).
+    // Runs after CORS (so preflights are unchanged) and the rate limiter (so
+    // failed attempts are bounded), and before the body parser so an
+    // unauthenticated client cannot make the server read or parse a body.
+    if (this.config.auth?.enabled) {
+      this.app.use((req: Request, res: Response, next: NextFunction) => {
+        if (this.isPublicHealthRequest(req) || this.validateAuth(req).valid) {
+          next();
+          return;
+        }
+        this.rejectUnauthorized(req, res);
+      });
+    }
+
     this.app.use(express.json({
       limit: this.config.maxRequestSize || '10mb',
     }));
@@ -208,9 +273,11 @@ export class HttpTransport extends EventEmitter implements ITransport {
     if (this.config.requestTimeout) {
       this.app.use((req, res, next) => {
         res.setTimeout(this.config.requestTimeout!, () => {
+          // A handler may have completed just as the socket timeout fired.
+          if (res.headersSent || res.writableEnded || res.destroyed) return;
           res.status(408).json({
             jsonrpc: '2.0',
-            id: null,
+            id: req.body?.id ?? null,
             error: { code: -32000, message: 'Request timeout' },
           });
         });
@@ -235,6 +302,12 @@ export class HttpTransport extends EventEmitter implements ITransport {
 
   private setupRoutes(): void {
     this.app.get('/health', (req, res) => {
+      // With auth enabled this route is reachable without credentials, so it
+      // reveals only liveness: no timestamp, no connection count.
+      if (this.config.auth?.enabled) {
+        res.json({ status: 'ok' });
+        return;
+      }
       res.json({
         status: 'ok',
         timestamp: new Date().toISOString(),
@@ -244,6 +317,31 @@ export class HttpTransport extends EventEmitter implements ITransport {
 
     this.app.post('/rpc', async (req, res) => {
       await this.handleHttpRequest(req, res);
+    });
+
+    // Legacy MCP clients fall back to the HTTP+SSE transport when
+    // Streamable HTTP negotiation fails. Advertise this same POST endpoint
+    // and route its responses back over the established event stream.
+    this.app.get('/mcp', (req, res) => {
+      if (this.config.auth?.enabled && !this.validateAuth(req).valid) {
+        this.rejectUnauthorized(req, res);
+        return;
+      }
+
+      const sessionId = randomUUID();
+      res.status(200);
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache, no-transform');
+      res.setHeader('Connection', 'keep-alive');
+      res.flushHeaders();
+      this.sseClients.set(sessionId, res);
+      res.write(`event: endpoint\ndata: /mcp?sessionId=${encodeURIComponent(sessionId)}\n\n`);
+
+      res.on('close', () => {
+        if (this.sseClients.get(sessionId) === res) {
+          this.sseClients.delete(sessionId);
+        }
+      });
     });
 
     this.app.post('/mcp', async (req, res) => {
@@ -272,6 +370,7 @@ export class HttpTransport extends EventEmitter implements ITransport {
     this.app.use((err: Error, req: Request, res: Response, next: NextFunction) => {
       this.logger.error('Express error', { error: err });
       this.errors++;
+      if (res.headersSent || res.writableEnded || res.destroyed) return;
       res.status(500).json({
         jsonrpc: '2.0',
         id: null,
@@ -348,16 +447,7 @@ export class HttpTransport extends EventEmitter implements ITransport {
     if (requiresAuth && this.config.auth) {
       const authResult = this.validateAuth(req);
       if (!authResult.valid) {
-        this.logger.warn('Authentication failed', {
-          ip: req.ip,
-          path: req.path,
-          error: authResult.error,
-        });
-        res.status(401).json({
-          jsonrpc: '2.0',
-          id: null,
-          error: { code: -32001, message: 'Unauthorized' },
-        });
+        this.rejectUnauthorized(req, res);
         return;
       }
     } else if (requiresAuth && !this.config.auth) {
@@ -384,11 +474,15 @@ export class HttpTransport extends EventEmitter implements ITransport {
       return;
     }
 
+    const sseSessionId = typeof req.query.sessionId === 'string' ? req.query.sessionId : undefined;
+    const sseResponse = sseSessionId ? this.sseClients.get(sseSessionId) : undefined;
+
     if (message.id === undefined) {
       if (this.notificationHandler) {
         await this.notificationHandler(message as MCPNotification);
       }
-      res.status(204).end();
+      if (res.headersSent || res.writableEnded || res.destroyed) return;
+      res.status(sseResponse ? 202 : 204).end();
     } else {
       if (!this.requestHandler) {
         res.status(500).json({
@@ -401,10 +495,19 @@ export class HttpTransport extends EventEmitter implements ITransport {
 
       try {
         const response = await this.requestHandler(message as MCPRequest);
-        res.json(response);
+        // A timed-out request can still finish its tool work; its HTTP reply
+        // already belongs to the timeout path and must not be written again.
+        if (res.headersSent || res.writableEnded || res.destroyed) return;
+        if (sseResponse) {
+          sseResponse.write(`event: message\ndata: ${JSON.stringify(response)}\n\n`);
+          res.status(202).end();
+        } else {
+          res.json(response);
+        }
         this.messagesSent++;
       } catch (error) {
         this.errors++;
+        if (res.headersSent || res.writableEnded || res.destroyed) return;
         res.status(500).json({
           jsonrpc: '2.0',
           id: message.id,
@@ -473,54 +576,50 @@ export class HttpTransport extends EventEmitter implements ITransport {
   }
 
   /**
-   * SECURITY: Timing-safe token comparison to prevent timing attacks
+   * SECURITY: constant-time token comparison. Both sides are hashed first so
+   * the comparison is over equal-length digests and leaks neither content nor
+   * length.
    */
   private timingSafeCompare(a: string, b: string): boolean {
-    const crypto = require('crypto');
-
-    // Ensure both strings are the same length for timing-safe comparison
-    const bufA = Buffer.from(a, 'utf-8');
-    const bufB = Buffer.from(b, 'utf-8');
-
-    // If lengths differ, still do a comparison to prevent length-based timing
-    if (bufA.length !== bufB.length) {
-      // Compare against itself to maintain constant time
-      crypto.timingSafeEqual(bufA, bufA);
-      return false;
-    }
-
-    return crypto.timingSafeEqual(bufA, bufB);
+    const digestA = createHash('sha256').update(a, 'utf8').digest();
+    const digestB = createHash('sha256').update(b, 'utf8').digest();
+    return timingSafeEqual(digestA, digestB);
   }
 
-  private validateAuth(req: Request): { valid: boolean; error?: string } {
-    const auth = req.headers.authorization;
+  /** Only GET/HEAD of exactly /health (any case, optional trailing slash) is public. */
+  private isPublicHealthRequest(req: Request): boolean {
+    if (req.method !== 'GET' && req.method !== 'HEAD') return false;
+    return req.path.toLowerCase().replace(/\/$/, '') === '/health';
+  }
 
-    if (!auth) {
-      return { valid: false, error: 'Authorization header required' };
+  /** One generic 401 for every failure mode: no hint about what was wrong. */
+  private rejectUnauthorized(req: Request, res: Response): void {
+    // Never log the Authorization header or any token material.
+    this.logger.warn('Authentication failed', { ip: req.ip, path: req.path });
+    res.setHeader('WWW-Authenticate', 'Bearer');
+    res.status(401).json({
+      jsonrpc: '2.0',
+      id: null,
+      error: { code: -32001, message: 'Unauthorized' },
+    });
+  }
+
+  private validateAuth(req: Request): { valid: boolean } {
+    const given = bearerToken(req.headers.authorization);
+    if (!given) {
+      return { valid: false };
     }
 
-    const tokenMatch = auth.match(/^Bearer\s+(.+)$/i);
-    if (!tokenMatch) {
-      return { valid: false, error: 'Invalid authorization format' };
-    }
-
-    const token = tokenMatch[1];
-
-    if (this.config.auth?.tokens?.length) {
-      // SECURITY: Use timing-safe comparison to prevent timing attacks
-      let valid = false;
-      for (const validToken of this.config.auth.tokens) {
-        if (this.timingSafeCompare(token, validToken)) {
-          valid = true;
-          break;
-        }
+    // Fail closed: auth enabled with no configured token accepts nothing.
+    const tokens = this.config.auth?.tokens ?? [];
+    let valid = false;
+    for (const validToken of tokens) {
+      // No early exit, so timing does not depend on which token matched.
+      if (this.timingSafeCompare(given, validToken)) {
+        valid = true;
       }
-      if (!valid) {
-        return { valid: false, error: 'Invalid token' };
-      }
     }
-
-    return { valid: true };
+    return { valid };
   }
 }
 

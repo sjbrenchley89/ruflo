@@ -1,11 +1,12 @@
 {
   "name": "ruflo",
-  "version": "3.7.0-alpha.166",
+  "mcpName": "io.github.ruvnet/ruflo",
+  "version": "3.77.0",
   "description": "Ruflo - Enterprise AI agent orchestration platform. Deploy 60+ specialized agents in coordinated swarms with self-learning, fault-tolerant consensus, vector memory, and MCP integration",
   "main": "bin/ruflo.js",
   "type": "module",
   "bin": {
-    "ruflo": "./bin/ruflo.js"
+    "ruflo": "bin/ruflo.js"
   },
   "homepage": "https://github.com/ruvnet/claude-flow#readme",
   "bugs": {
@@ -18,13 +19,12 @@
   },
   "files": [
     "bin/**",
-    "src/**",
     "dist/**",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
-    "prepublishOnly": "cp ../README.md ./README.md",
+    "prepublishOnly": "node scripts/prepare-publish.mjs",
     "dev": "node src/mcp-bridge/index.js",
     "dev:bridge": "node --watch src/mcp-bridge/index.js",
     "dev:test": "node src/mcp-bridge/test-harness.js",
@@ -40,10 +40,14 @@
     "package:rvf": "bash src/scripts/package-rvf.sh"
   },
   "dependencies": {
-    "@claude-flow/cli": "^3.7.0-alpha.11"
+    "@claude-flow/cli": "3.77.0"
   },
+  "optionalDependencies": {},
   "overrides": {
+    "ruvector": "^0.3.13",
+    "better-sqlite3": "12.9.0",
     "@ruvector/rvf-wasm": "0.1.5",
+    "@ruvector/rvf": "0.3.4",
     "@hono/node-server": ">=1.19.10",
     "flatted": ">=3.4.0",
     "tar": ">=7.5.11",
@@ -55,16 +59,31 @@
     "cacache": ">=20.0.0",
     "make-fetch-happen": ">=15.0.0",
     "express-rate-limit": ">=8.4.1",
-    "protobufjs": ">=7.5.5",
-    "uuid": ">=14.0.0"
+    "protobufjs": ">=7.5.6",
+    "uuid": ">=14.0.0",
+    "@opentelemetry/core": ">=2.8.0",
+    "@opentelemetry/resources": ">=2.8.0",
+    "@opentelemetry/sdk-trace-base": ">=2.8.0",
+    "@opentelemetry/sdk-node": ">=0.220.0",
+    "@opentelemetry/auto-instrumentations-node": ">=0.75.0",
+    "@opentelemetry/exporter-prometheus": ">=0.220.0",
+    "@opentelemetry/exporter-trace-otlp-grpc": ">=0.220.0",
+    "@opentelemetry/exporter-trace-otlp-http": ">=0.220.0",
+    "@opentelemetry/exporter-trace-otlp-proto": ">=0.220.0",
+    "@opentelemetry/otlp-exporter-base": ">=0.220.0",
+    "@opentelemetry/otlp-grpc-exporter-base": ">=0.220.0",
+    "@opentelemetry/otlp-transformer": ">=0.220.0",
+    "agentdb": "^3.3.0",
+    "agentic-flow": "^2.0.14 || ^3.0.0",
+    "@ruvector/ruvllm": "^4.1.0",
+    "fast-uri": ">=3.1.6"
   },
   "engines": {
     "node": ">=20.0.0"
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/ruvnet/claude-flow.git",
-    "directory": "ruflo"
+    "url": "https://github.com/ruvnet/claude-flow.git"
   },
   "keywords": [
     "ruflo",

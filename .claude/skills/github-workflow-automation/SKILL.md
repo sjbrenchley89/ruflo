@@ -166,7 +166,7 @@ jobs:
   swarm-analysis:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - name: Initialize Swarm
         uses: ruvnet/swarm-action@v1
@@ -192,7 +192,7 @@ jobs:
   detect-and-build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - name: Detect Languages
         id: detect
@@ -525,15 +525,15 @@ mcp__claude-flow__swarm_init {
 }
 
 // Step 2: Spawn specialized agents
-mcp__claude-flow__agent_spawn { type: "coordinator", name: "GitHub Coordinator" }
-mcp__claude-flow__agent_spawn { type: "reviewer", name: "Code Reviewer" }
-mcp__claude-flow__agent_spawn { type: "tester", name: "QA Agent" }
-mcp__claude-flow__agent_spawn { type: "analyst", name: "Security Analyst" }
+mcp__claude-flow__agent_spawn { agentType: "coordinator", name: "GitHub Coordinator" }
+mcp__claude-flow__agent_spawn { agentType: "reviewer", name: "Code Reviewer" }
+mcp__claude-flow__agent_spawn { agentType: "tester", name: "QA Agent" }
+mcp__claude-flow__agent_spawn { agentType: "analyst", name: "Security Analyst" }
 
 // Step 3: Orchestrate GitHub workflow
-mcp__claude-flow__task_orchestrate {
-  task: "Complete PR review and merge workflow",
-  strategy: "parallel",
+mcp__claude-flow__task_create {
+  type: "review",
+  description: "Complete PR review and merge workflow",
   priority: "high"
 }
 ```
@@ -819,7 +819,7 @@ jobs:
     needs: initialize
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - name: Backend Tests
         run: |
           npx ruv-swarm agents spawn --type tester \
@@ -830,7 +830,7 @@ jobs:
     needs: initialize
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - name: Frontend Tests
         run: |
           npx ruv-swarm agents spawn --type tester \
@@ -841,7 +841,7 @@ jobs:
     needs: initialize
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - name: Security Scan
         run: |
           npx ruv-swarm agents spawn --type security \
@@ -871,7 +871,7 @@ jobs:
     outputs:
       packages: ${{ steps.detect.outputs.packages }}
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 

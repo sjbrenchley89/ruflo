@@ -96,6 +96,27 @@ describe('resolveAutoMemoryDir', () => {
     expect(result).toContain('workspaces-my-project');
   });
 
+  it('should normalize underscores to dashes (issue #2282)', () => {
+    // Claude Code normalizes both `/` and `_` to `-` when computing the
+    // project key, so paths like /home/phil/A-Project/RX_ERP/ map to
+    // -home-phil-A-Project-RX-ERP, not -home-phil-A-Project-RX_ERP.
+    const result = resolveAutoMemoryDir('/home/phil/A-Project/RX_ERP');
+    expect(result).toContain('A-Project-RX-ERP');
+    expect(result).not.toContain('RX_ERP');
+  });
+
+  it('should normalize a colon to a dash, as a Windows drive letter needs (issue #3303)', () => {
+    // Claude Code replaces the colon too: a git root of D:\projects\elearning\v3_26
+    // maps to D--projects-elearning-v3-26. A colon is not legal inside a Windows path
+    // segment, so leaving it there made ensureMemoryDir() throw ENOENT and doSync()
+    // swallow it as "Sync failed (non-critical)" — the sync never ran on Windows.
+    //
+    // Driven with an absolute path that no repository sits above, so findGitRoot
+    // returns null on every platform and the key comes from the input alone.
+    const result = resolveAutoMemoryDir('/3303-not-a-repo/drive:d/v3_26');
+    expect(path.basename(path.dirname(result))).toBe('-3303-not-a-repo-drive-d-v3-26');
+  });
+
   it('should produce consistent paths for same input', () => {
     const a = resolveAutoMemoryDir('/workspaces/my-project');
     const b = resolveAutoMemoryDir('/workspaces/my-project');
@@ -148,8 +169,64 @@ Content of section two.
     expect(entries[1].heading).toBe('Section Two');
   });
 
-  it('should return empty array for content without ## headings', () => {
+  it('should fall back to single untitled entry when no ## headings or frontmatter (issue #2283)', () => {
+    // Pre-fix behavior was to return [] — we now emit one entry with the
+    // body as content so files without ## subheadings still import.
     const content = '# Only h1 heading\nSome text\n';
+    const entries = parseMarkdownEntries(content);
+    expect(entries).toHaveLength(1);
+    expect(entries[0].heading).toBe('(untitled)');
+    expect(entries[0].content).toContain('# Only h1 heading');
+    expect(entries[0].content).toContain('Some text');
+  });
+
+  it('should parse YAML frontmatter + body as a single entry (issue #2283)', () => {
+    // Claude Code's auto-memory format: YAML frontmatter + free-text body,
+    // no ## sub-headings. Pre-fix this returned [] silently.
+    const content = `---
+name: GitHub identity for RX Platform
+description: Phil uses PrimitiveOne / one@primitive1.com for...
+type: user
+originSessionId: 753b313d-3414-abcd
+---
+For the RX Platform / RX_ERP project specifically:
+
+- **GitHub login**: \`PrimitiveOne\`
+- **GitHub email**: \`one@primitive1.com\`
+`;
+    const entries = parseMarkdownEntries(content);
+    expect(entries).toHaveLength(1);
+    expect(entries[0].heading).toBe('GitHub identity for RX Platform');
+    expect(entries[0].content).toContain('GitHub login');
+    expect(entries[0].content).toContain('PrimitiveOne');
+    expect(entries[0].metadata.type).toBe('user');
+    expect(entries[0].metadata.description).toContain('Phil uses PrimitiveOne');
+    expect(entries[0].metadata.originSessionId).toBe('753b313d-3414-abcd');
+  });
+
+  it('should prefer ## headings over frontmatter fallback when both present', () => {
+    const content = `---
+name: Should be ignored when ## headings exist
+type: user
+---
+## Real Section
+Section content
+`;
+    const entries = parseMarkdownEntries(content);
+    expect(entries).toHaveLength(1);
+    expect(entries[0].heading).toBe('Real Section');
+    expect(entries[0].content).toContain('Section content');
+  });
+
+  it('should return empty array for empty content', () => {
+    expect(parseMarkdownEntries('')).toHaveLength(0);
+  });
+
+  it('should return empty array when frontmatter has no body', () => {
+    const content = `---
+name: Frontmatter only
+---
+`;
     const entries = parseMarkdownEntries(content);
     expect(entries).toHaveLength(0);
   });
@@ -171,10 +248,6 @@ Line 3
     const content = '## Padded\n\n  Text here  \n\n';
     const entries = parseMarkdownEntries(content);
     expect(entries[0].content).toBe('Text here');
-  });
-
-  it('should handle empty content', () => {
-    expect(parseMarkdownEntries('')).toHaveLength(0);
   });
 });
 
@@ -927,7 +1000,9 @@ Already in DB
       }));
     });
 
-    it('should handle files with no ## headings', async () => {
+    it('should import files with no ## headings as a single untitled entry (issue #2283)', async () => {
+      // Pre-#2283 the parser dropped these silently. Now a file with body but
+      // no sub-headings imports as one entry with the full body as content.
       fsSync.writeFileSync(
         path.join(testDir, 'empty.md'),
         '# Just a title\nSome text without sections\n',
@@ -935,8 +1010,229 @@ Already in DB
       );
 
       const result = await bridge.importFromAutoMemory();
-      expect(result.imported).toBe(0);
+      expect(result.imported).toBe(1);
       expect(result.files).toContain('empty.md');
+    });
+  });
+
+  describe('importFromAutoMemory - delete-sync (Dream Cycle 2026-10-13)', () => {
+    // #4080 (2026-10-12) flagged importFromAutoMemory() as additive-only: it
+    // never deletes an AgentDB entry whose source heading was removed from
+    // the markdown file. These tests are the baseline-fails/candidate-passes
+    // discriminating set for that fix.
+
+    it('deletes the AgentDB entry for a heading removed from its source file', async () => {
+      (backend.query as any).mockResolvedValue([
+        {
+          id: 'old-1',
+          key: 'auto-memory:test.md:Old',
+          metadata: { sourceFile: 'test.md', heading: 'Old', memoryDir: testDir, contentHash: 'stale-hash' },
+        },
+      ]);
+      (backend.bulkDelete as any).mockImplementation(async (ids: string[]) => ids.length);
+
+      fsSync.writeFileSync(path.join(testDir, 'test.md'), '## New\nNew content\n', 'utf-8');
+
+      const result = await bridge.importFromAutoMemory();
+
+      expect(backend.bulkDelete).toHaveBeenCalledWith(['old-1']);
+      expect(result.deleted).toBe(1);
+    });
+
+    it('does not delete an entry for an unchanged heading (no-op case)', async () => {
+      (backend.query as any).mockResolvedValue([
+        {
+          id: 'x-1',
+          key: 'auto-memory:same.md:Keep',
+          metadata: { sourceFile: 'same.md', heading: 'Keep', memoryDir: testDir, contentHash: hashContent('Keep me') },
+        },
+      ]);
+
+      fsSync.writeFileSync(path.join(testDir, 'same.md'), '## Keep\nKeep me\n', 'utf-8');
+
+      const result = await bridge.importFromAutoMemory();
+
+      expect(backend.bulkDelete).not.toHaveBeenCalled();
+      expect(result.deleted).toBe(0);
+    });
+
+    it('scopes deletion per source file — a same-named heading in another file is untouched', async () => {
+      (backend.query as any).mockResolvedValue([
+        {
+          id: 'a-1',
+          key: 'auto-memory:a.md:Shared',
+          metadata: { sourceFile: 'a.md', heading: 'Shared', memoryDir: testDir, contentHash: hashContent('Content A') },
+        },
+        {
+          id: 'b-1',
+          key: 'auto-memory:b.md:Shared',
+          metadata: { sourceFile: 'b.md', heading: 'Shared', memoryDir: testDir, contentHash: 'stale-b-hash' },
+        },
+      ]);
+      (backend.bulkDelete as any).mockImplementation(async (ids: string[]) => ids.length);
+
+      // a.md keeps its '## Shared' heading; b.md's was removed.
+      fsSync.writeFileSync(path.join(testDir, 'a.md'), '## Shared\nContent A\n', 'utf-8');
+      fsSync.writeFileSync(path.join(testDir, 'b.md'), '## Other\nContent B\n', 'utf-8');
+
+      const result = await bridge.importFromAutoMemory();
+
+      expect(backend.bulkDelete).toHaveBeenCalledWith(['b-1']);
+      expect(result.deleted).toBe(1);
+    });
+
+    it('refuses to delete-sync when a non-empty file parses to zero entries (guards against a false full wipe)', async () => {
+      (backend.query as any).mockResolvedValue([
+        {
+          id: 'ghost-1',
+          key: 'auto-memory:ghost.md:Something',
+          metadata: { sourceFile: 'ghost.md', heading: 'Something', memoryDir: testDir, contentHash: 'h' },
+        },
+      ]);
+
+      // Frontmatter-only file: non-empty raw content, but the body parses to
+      // zero entries (no '##' headings, nothing left after trimming).
+      fsSync.writeFileSync(path.join(testDir, 'ghost.md'), '---\nname: ghost\n---\n\n', 'utf-8');
+
+      let skipEvent: any;
+      bridge.on('import:delete-skipped', (e) => { skipEvent = e; });
+
+      const result = await bridge.importFromAutoMemory();
+
+      expect(backend.bulkDelete).not.toHaveBeenCalled();
+      expect(result.deleted).toBe(0);
+      expect(skipEvent).toEqual({ file: 'ghost.md', reason: 'suspicious-empty-parse' });
+    });
+
+    it('catches a per-file read failure without deleting that file\'s entries or aborting the rest of the batch', async () => {
+      // A directory named *.md matches the readdirSync filter but throws
+      // EISDIR on readFile — a read failure that is NOT permission-dependent
+      // (unlike chmod, which no-ops when the test runner is root).
+      // Pre-seed an existing entry for 'broken.md' itself, so "doesn't delete
+      // that file's entries" is actually exercised rather than vacuously true
+      // (adversarial critic finding: the prior version of this test had no
+      // old entries for broken.md, so the bulkDelete-not-called assertion
+      // would have passed even without the catch block).
+      (backend.query as any).mockResolvedValue([
+        {
+          id: 'broken-1',
+          key: 'auto-memory:broken.md:Stale',
+          metadata: { sourceFile: 'broken.md', heading: 'Stale', memoryDir: testDir, contentHash: 'h' },
+        },
+      ]);
+      fsSync.mkdirSync(path.join(testDir, 'broken.md'));
+      fsSync.writeFileSync(path.join(testDir, 'good.md'), '## Still Here\nContent\n', 'utf-8');
+
+      let errorEvent: any;
+      bridge.on('import:file-error', (e) => { errorEvent = e; });
+
+      const result = await bridge.importFromAutoMemory();
+
+      expect(errorEvent).toBeDefined();
+      expect(errorEvent.file).toBe('broken.md');
+      expect(result.files).toContain('good.md');
+      expect(result.files).not.toContain('broken.md');
+      // broken.md IS still present on disk (as a directory) — it's just
+      // unreadable — so it must NOT be treated as "removed from disk" either.
+      expect(backend.bulkDelete).not.toHaveBeenCalled();
+    });
+
+    it('deletes all of a source file\'s entries when the file is removed entirely from disk (not just emptied)', async () => {
+      (backend.query as any).mockResolvedValue([
+        {
+          id: 'gone-1',
+          key: 'auto-memory:vanished.md:A',
+          metadata: { sourceFile: 'vanished.md', heading: 'A', memoryDir: testDir, contentHash: 'h1' },
+        },
+        {
+          id: 'gone-2',
+          key: 'auto-memory:vanished.md:B',
+          metadata: { sourceFile: 'vanished.md', heading: 'B', memoryDir: testDir, contentHash: 'h2' },
+        },
+        {
+          id: 'kept-1',
+          key: 'auto-memory:present.md:C',
+          metadata: { sourceFile: 'present.md', heading: 'C', memoryDir: testDir, contentHash: hashContent('still here') },
+        },
+      ]);
+      (backend.bulkDelete as any).mockImplementation(async (ids: string[]) => ids.length);
+
+      // Only present.md exists on disk this run; vanished.md was deleted.
+      fsSync.writeFileSync(path.join(testDir, 'present.md'), '## C\nstill here\n', 'utf-8');
+
+      const result = await bridge.importFromAutoMemory();
+
+      const deletedIds = (backend.bulkDelete as any).mock.calls[0][0];
+      expect(new Set(deletedIds)).toEqual(new Set(['gone-1', 'gone-2']));
+      expect(result.deleted).toBe(2);
+    });
+
+    it('refuses the whole-file-removed delete-sync when the memory dir looks suspiciously empty', async () => {
+      (backend.query as any).mockResolvedValue([
+        {
+          id: 'x-1',
+          key: 'auto-memory:a.md:Heading',
+          metadata: { sourceFile: 'a.md', heading: 'Heading', memoryDir: testDir, contentHash: 'h' },
+        },
+      ]);
+
+      // No .md files written to testDir at all this run.
+      let skipEvent: any;
+      bridge.on('import:delete-skipped', (e) => { skipEvent = e; });
+
+      const result = await bridge.importFromAutoMemory();
+
+      expect(backend.bulkDelete).not.toHaveBeenCalled();
+      expect(result.deleted).toBe(0);
+      expect(skipEvent).toEqual({ file: '*', reason: 'suspicious-empty-directory' });
+    });
+
+    it('scopes delete-sync to this memoryDir — an entry written by a different memoryDir sharing the same backend is untouched (review finding)', async () => {
+      // The same backend can be shared across multiple memory dirs — e.g. the
+      // SessionStart hook's main dir vs. a worktree dir from
+      // worktreeMemoryDir(). Importing one dir must never treat the other
+      // dir's same-named file/heading as "gone" and delete it.
+      (backend.query as any).mockResolvedValue([
+        {
+          id: 'other-dir-1',
+          key: 'auto-memory:shared.md:Heading',
+          metadata: {
+            sourceFile: 'shared.md',
+            heading: 'Heading',
+            memoryDir: '/some/other/worktree/memory/dir',
+            contentHash: 'h',
+          },
+        },
+      ]);
+
+      // testDir has no 'shared.md' at all — if the other dir's entry were
+      // eligible, both the per-file diff and the whole-file-removed pass
+      // would delete it.
+      fsSync.writeFileSync(path.join(testDir, 'present.md'), '## Still Here\nContent\n', 'utf-8');
+
+      const result = await bridge.importFromAutoMemory();
+
+      expect(backend.bulkDelete).not.toHaveBeenCalled();
+      expect(result.deleted).toBe(0);
+    });
+
+    it('a legacy entry with no recorded memoryDir is never delete-sync eligible', async () => {
+      (backend.query as any).mockResolvedValue([
+        {
+          id: 'legacy-1',
+          key: 'auto-memory:legacy.md:Old',
+          metadata: { sourceFile: 'legacy.md', heading: 'Old', contentHash: 'h' }, // no memoryDir field
+        },
+      ]);
+
+      // legacy.md is absent from disk — it would read as "removed from disk"
+      // if the legacy entry were eligible for delete-sync.
+      fsSync.writeFileSync(path.join(testDir, 'present.md'), '## Still Here\nContent\n', 'utf-8');
+
+      const result = await bridge.importFromAutoMemory();
+
+      expect(backend.bulkDelete).not.toHaveBeenCalled();
+      expect(result.deleted).toBe(0);
     });
   });
 

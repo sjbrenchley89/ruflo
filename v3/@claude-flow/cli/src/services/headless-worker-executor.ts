@@ -24,6 +24,10 @@ import { EventEmitter } from 'events';
 import { existsSync, readFileSync, readdirSync, mkdirSync, writeFileSync } from 'fs';
 import { join, relative } from 'path';
 import type { WorkerType } from './worker-daemon.js';
+import { getGlobalAiBudget, isQuotaErrorText } from './global-ai-budget.js';
+import { resolveGitWorkspaceIdentity } from './git-workspace-identity.js';
+import { getAiJobDedupRegistry, computeAiJobKey, hashWorkerConfig } from './ai-job-dedup.js';
+import { withHeadlessPlugins } from '../mods/headless-plugins.js';
 
 // ============================================
 // Type Definitions
@@ -169,6 +173,18 @@ export interface HeadlessExecutionResult {
   /** Estimated tokens used (if available) */
   tokensUsed?: number;
 
+  /** #2661 root-fix — structured usage, when `claude --print --output-format json` exposed it. */
+  inputTokens?: number;
+  outputTokens?: number;
+  costUsd?: number;
+
+  /**
+   * When the stored claude.ai sign-in the worker ran under ends (ISO 8601),
+   * from `credential_expires_at` in the `claude -p` JSON result (Claude Code
+   * 2.1.318+). Absent for API-key auth and older CLIs.
+   */
+  credentialExpiresAt?: string;
+
   /** Model used for execution */
   model: string;
 
@@ -186,6 +202,17 @@ export interface HeadlessExecutionResult {
 
   /** Execution ID for tracking */
   executionId: string;
+
+  /** ADR-510 — plugins in the worker profile that could not be found; the worker ran without them. */
+  missingPlugins?: string[];
+
+  /**
+   * #2661 — true when the launch was skipped because the same job
+   * (repositoryId + HEAD + worker + config) succeeded within the freshness
+   * window, e.g. in a sibling worktree. No model call happened; consumers
+   * must not overwrite persisted metrics with this result.
+   */
+  dedupSkipped?: boolean;
 }
 
 /**
@@ -197,6 +224,8 @@ interface PoolEntry {
   workerType: HeadlessWorkerType;
   startTime: Date;
   timeout: NodeJS.Timeout;
+  /** #4463 — settles the execution promise, signals the tree and escalates to SIGKILL. Idempotent. */
+  abort?: () => void;
 }
 
 /**
@@ -312,7 +341,7 @@ Provide a JSON report with:
       sandbox: 'strict',
       model: 'haiku',
       outputFormat: 'json',
-      contextPatterns: ['**/*.ts', '**/*.js', '**/.env*', '**/package.json'],
+      contextPatterns: ['**/*.ts', '**/*.js', '**/package.json'],
       timeoutMs: 5 * 60 * 1000,
     },
   },
@@ -568,6 +597,70 @@ export function getModelId(model: ModelType): string {
   return MODEL_IDS[model];
 }
 
+export interface ClaudePrintEnvelope {
+  result: string;
+  inputTokens?: number;
+  outputTokens?: number;
+  costUsd?: number;
+  durationMs?: number;
+  /** ISO 8601 end of the stored claude.ai sign-in (Claude Code 2.1.318+). */
+  credentialExpiresAt?: string;
+}
+
+/** Days before a sign-in ends at which the executor emits 'credential-expiring' (matches Claude Code's own stderr warning). */
+export const CREDENTIAL_EXPIRY_WARN_DAYS = 10;
+
+/**
+ * Normalise `credential_expires_at` to ISO 8601. Accepts an ISO string or an
+ * epoch number (seconds or milliseconds); anything else is undefined.
+ */
+export function normalizeCredentialExpiry(v: unknown): string | undefined {
+  let ms: number | undefined;
+  if (typeof v === 'number' && Number.isFinite(v) && v > 0) ms = v < 1e12 ? v * 1000 : v;
+  else if (typeof v === 'string' && v.trim()) {
+    const t = Date.parse(v);
+    if (Number.isFinite(t)) ms = t;
+  }
+  return ms === undefined ? undefined : new Date(ms).toISOString();
+}
+
+/**
+ * #2661 root-fix — best-effort parse of `claude --print --output-format
+ * json`'s response envelope. Deliberately lenient: probes a couple of
+ * plausible field-name shapes (the CLI's JSON schema is not a versioned
+ * public contract) and returns null on anything unexpected rather than
+ * throwing, so a schema mismatch degrades to "no usage captured" — the
+ * caller then falls back to the raw stdout text, exactly today's behavior.
+ * Exported for direct unit testing without spawning a real process.
+ */
+export function parseClaudePrintJsonEnvelope(raw: string): ClaudePrintEnvelope | null {
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed[0] !== '{') return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== 'object') return null;
+  const obj = parsed as Record<string, unknown>;
+
+  const result = typeof obj.result === 'string' ? obj.result : undefined;
+  if (result === undefined) return null; // not the envelope shape we expect
+
+  const usage = (obj.usage && typeof obj.usage === 'object') ? obj.usage as Record<string, unknown> : undefined;
+  const numOrUndef = (v: unknown): number | undefined => (typeof v === 'number' && Number.isFinite(v) ? v : undefined);
+
+  return {
+    result,
+    inputTokens: numOrUndef(usage?.input_tokens ?? usage?.inputTokens),
+    outputTokens: numOrUndef(usage?.output_tokens ?? usage?.outputTokens),
+    costUsd: numOrUndef(obj.total_cost_usd ?? obj.cost_usd ?? obj.totalCostUsd),
+    durationMs: numOrUndef(obj.duration_ms ?? obj.durationMs),
+    credentialExpiresAt: normalizeCredentialExpiry(obj.credential_expires_at ?? obj.credentialExpiresAt),
+  };
+}
+
 /**
  * Get worker configuration by type
  */
@@ -629,27 +722,49 @@ export class HeadlessWorkerExecutor extends EventEmitter {
   // ============================================
 
   /**
-   * Check if Claude Code CLI is available
+   * Check if Claude Code CLI is available.
+   *
+   * #2110 fix — three issues addressed:
+   *   1. Cache only `true`, never `false`. A transient failure (WSL2 cold
+   *      start, AV scanner, slow shell init) used to set
+   *      `claudeCodeAvailable = false` for the rest of the daemon
+   *      lifetime, so the daemon kept running local stubs even after the
+   *      user fixed `claude auth login`. Now: false results re-probe on
+   *      the next call.
+   *   2. Log the actual error from the catch block instead of silently
+   *      swallowing it. Operators couldn't distinguish timeout / ENOENT /
+   *      auth-failure / exit-code without this.
+   *   3. Honour `CLAUDE_CODE_AVAILABILITY_TIMEOUT_MS` for WSL2 / slow
+   *      systems where `claude --version` can take >5s on first invoke.
    */
   async isAvailable(): Promise<boolean> {
-    if (this.claudeCodeAvailable !== null) {
-      return this.claudeCodeAvailable;
+    // Only the `true` result is cached — `false` is re-probed every call
+    // so a transient failure doesn't poison the rest of the daemon's life.
+    if (this.claudeCodeAvailable === true) {
+      return true;
     }
 
+    const timeoutMs = Number.parseInt(process.env.CLAUDE_CODE_AVAILABILITY_TIMEOUT_MS || '', 10) || 5000;
     try {
       const output = execSync('claude --version', {
         encoding: 'utf-8',
         stdio: 'pipe',
-        timeout: 5000,
+        timeout: timeoutMs,
         windowsHide: true, // Prevent phantom console windows on Windows
       });
       this.claudeCodeAvailable = true;
       this.claudeCodeVersion = output.trim();
       this.emit('status', { available: true, version: this.claudeCodeVersion });
       return true;
-    } catch {
-      this.claudeCodeAvailable = false;
-      this.emit('status', { available: false });
+    } catch (err) {
+      // Don't cache false — let the next call retry. Surface the actual
+      // error via emit so operators can diagnose timeout / ENOENT / auth.
+      this.claudeCodeAvailable = null;
+      const reason =
+        err instanceof Error
+          ? `${err.name}: ${err.message}`.slice(0, 200)
+          : String(err).slice(0, 200);
+      this.emit('status', { available: false, reason });
       return false;
     }
   }
@@ -753,6 +868,19 @@ export class HeadlessWorkerExecutor extends EventEmitter {
   }
 
   /**
+   * #2661 — signal a pool entry's whole process group, not just the head.
+   * Children are spawned `detached: true` on POSIX precisely so their MCP
+   * bridge grandchildren can be reaped with `kill(-pid)`; a head-only kill
+   * orphans them (#2098B).
+   */
+  private killEntryTree(proc: ChildProcess, signal: NodeJS.Signals): void {
+    if (process.platform !== 'win32' && typeof proc.pid === 'number') {
+      try { process.kill(-proc.pid, signal); return; } catch { /* fall through */ }
+    }
+    try { proc.kill(signal); } catch { /* already dead */ }
+  }
+
+  /**
    * Cancel a running execution
    */
   cancel(executionId: string): boolean {
@@ -762,7 +890,11 @@ export class HeadlessWorkerExecutor extends EventEmitter {
     }
 
     clearTimeout(entry.timeout);
-    entry.process.kill('SIGTERM');
+    if (entry.abort) {
+      entry.abort();
+    } else {
+      this.killEntryTree(entry.process, 'SIGTERM');
+    }
     this.processPool.delete(executionId);
     this.emit('cancelled', { executionId });
 
@@ -782,11 +914,16 @@ export class HeadlessWorkerExecutor extends EventEmitter {
     const entries = Array.from(this.processPool.entries());
     for (const [executionId, entry] of entries) {
       clearTimeout(entry.timeout);
-      entry.process.kill('SIGTERM');
-      // SIGKILL fallback after 5s to prevent orphan processes (#1395 Bug 6)
-      setTimeout(() => {
-        try { if (!entry.process.killed) entry.process.kill('SIGKILL'); } catch { /* already dead */ }
-      }, 5000).unref();
+      if (entry.abort) {
+        // Settles the promise and owns the SIGTERM -> SIGKILL escalation (#4463).
+        entry.abort();
+      } else {
+        this.killEntryTree(entry.process, 'SIGTERM');
+        // SIGKILL fallback after 5s to prevent orphan processes (#1395 Bug 6)
+        setTimeout(() => {
+          try { if (entry.process.exitCode === null && entry.process.signalCode === null) this.killEntryTree(entry.process, 'SIGKILL'); } catch { /* already dead */ }
+        }, 5000).unref();
+      }
       this.emit('cancelled', { executionId });
       cancelled++;
     }
@@ -861,6 +998,72 @@ export class HeadlessWorkerExecutor extends EventEmitter {
     const startTime = Date.now();
     const executionId = `${workerType}_${startTime}_${Math.random().toString(36).slice(2, 8)}`;
 
+    // #2661 invariant 5 — cross-worktree job dedup. Worktrees of one
+    // repository at the same HEAD would otherwise run identical analyses
+    // once per worktree. jobKey = sha256(repositoryId, HEAD, worker,
+    // configHash); a success within the freshness window (the worker's own
+    // interval, floor 10 min) skips the launch entirely — no budget spend,
+    // no process. HEAD moves → new key → the job runs again.
+    const identity = resolveGitWorkspaceIdentity(this.projectRoot);
+    const jobKey = computeAiJobKey({
+      repositoryId: identity.repositoryId,
+      head: identity.head,
+      workerType,
+      configHash: hashWorkerConfig(headless),
+    });
+    const dedup = getAiJobDedupRegistry();
+    const envWindowSecs = Number.parseInt(process.env.RUFLO_AI_DEDUP_WINDOW_SECS || '', 10);
+    const freshnessMs = Number.isFinite(envWindowSecs) && envWindowSecs >= 0
+      ? envWindowSecs * 1000
+      : Math.max(baseConfig.intervalMs || 0, 10 * 60 * 1000);
+    const freshness = dedup.isFresh(jobKey, freshnessMs);
+    if (freshness.fresh) {
+      const skipped: HeadlessExecutionResult = {
+        success: true,
+        dedupSkipped: true,
+        output: '',
+        parsedOutput: undefined,
+        durationMs: 0,
+        model: 'none',
+        sandboxMode: headless.sandbox,
+        workerType,
+        timestamp: new Date(),
+        executionId,
+      };
+      this.logExecution(
+        executionId,
+        'result',
+        `dedup-skip: job ${jobKey.slice(0, 12)} succeeded ${Math.round((Date.now() - (freshness.lastRunAt ?? Date.now())) / 1000)}s ago (repo ${identity.repositoryId.slice(0, 12)}, head ${identity.head.slice(0, 12) || 'n/a'})`
+      );
+      this.emit('dedup:skipped', { executionId, workerType, jobKey, lastRunAt: freshness.lastRunAt });
+      this.processQueue();
+      return skipped;
+    }
+
+    // #2661 — every autonomous launch must reserve a slot in the USER-GLOBAL
+    // AI budget before any process is created. This is the hard invariant
+    // that bounds aggregate launches across all worktree daemons: per-daemon
+    // maxConcurrent limits multiply with worktree count, the global budget
+    // does not. Denials return an error result (with a receipted reason)
+    // instead of queueing, so denied work never piles up into a retry storm.
+    const budget = getGlobalAiBudget();
+    const model = headless.model || 'sonnet';
+    const permit = await budget.reserve({ workerType, model, workspace: this.projectRoot });
+    if (!permit.allowed) {
+      const denied = this.createErrorResult(
+        workerType,
+        `Denied by global AI budget: ${permit.reason}`
+      );
+      denied.executionId = executionId;
+      this.logExecution(executionId, 'error', `budget-denied: ${permit.reason}`);
+      // NOTE: deliberately no `emit('error', ...)` here — Node treats
+      // unlistened 'error' events as throws, and callers consume the
+      // returned error result; `budget:denied` is the observable signal.
+      this.emit('budget:denied', { executionId, workerType, reason: permit.reason });
+      this.processQueue();
+      return denied;
+    }
+
     this.emit('start', { executionId, workerType, config: headless });
 
     try {
@@ -896,16 +1099,61 @@ export class HeadlessWorkerExecutor extends EventEmitter {
         parsedOutput,
         durationMs: Date.now() - startTime,
         tokensUsed: result.tokensUsed,
+        inputTokens: result.inputTokens,
+        outputTokens: result.outputTokens,
+        costUsd: result.costUsd,
         model: headless.model || 'sonnet',
         sandboxMode: headless.sandbox,
         workerType,
         timestamp: new Date(),
         executionId,
         error: result.error,
+        ...(result.missingPlugins ? { missingPlugins: result.missingPlugins } : {}),
+        ...(result.credentialExpiresAt ? { credentialExpiresAt: result.credentialExpiresAt } : {}),
       };
+
+      // Claude Code 2.1.318: surface a claude.ai sign-in that ends soon, so the
+      // daemon can say so before workers start failing on auth.
+      if (result.credentialExpiresAt) {
+        const daysLeft = (Date.parse(result.credentialExpiresAt) - Date.now()) / 86_400_000;
+        if (daysLeft <= CREDENTIAL_EXPIRY_WARN_DAYS) {
+          this.emit('credential-expiring', { expiresAt: result.credentialExpiresAt, daysLeft: Math.max(0, Math.floor(daysLeft)), workerType });
+        }
+      }
 
       // Log result
       this.logExecution(executionId, 'result', JSON.stringify(executionResult, null, 2));
+
+      // #2661 root-fix — structured per-launch telemetry, receipted
+      // regardless of success/failure (a failed launch still spent
+      // whatever tokens it spent before erroring).
+      budget.recordUsage(permit.permitId, {
+        workerType,
+        model,
+        inputTokens: result.inputTokens,
+        outputTokens: result.outputTokens,
+        durationMs: result.apiDurationMs ?? executionResult.durationMs,
+        costUsd: result.costUsd,
+      });
+
+      // #2661 invariant 5 — record the success so sibling worktrees at the
+      // same HEAD skip this job for the rest of the freshness window.
+      if (result.success) {
+        dedup.recordSuccess(jobKey, {
+          workerType,
+          repositoryId: identity.repositoryId,
+          workspace: this.projectRoot,
+        });
+      }
+
+      // #2661 — a quota/429/usage-limit failure opens the user-global
+      // circuit breaker so EVERY daemon stops launching for the cooldown
+      // window instead of retrying into an exhausted quota. Only inspected
+      // on failure: successful analysis output may legitimately discuss
+      // rate limiting in the user's own code.
+      if (!result.success && isQuotaErrorText(result.error)) {
+        await budget.recordQuotaError(`${workerType}: ${(result.error ?? '').slice(0, 200)}`);
+      }
 
       this.emit('complete', executionResult);
       return executionResult;
@@ -916,10 +1164,15 @@ export class HeadlessWorkerExecutor extends EventEmitter {
       executionResult.durationMs = Date.now() - startTime;
 
       this.logExecution(executionId, 'error', errorMessage);
+      if (isQuotaErrorText(errorMessage)) {
+        await budget.recordQuotaError(`${workerType}: ${errorMessage.slice(0, 200)}`);
+      }
       this.emit('error', executionResult);
 
       return executionResult;
     } finally {
+      // #2661 — free the global concurrency slot (launch counts persist).
+      await budget.release(permit.permitId);
       // Process next in queue
       this.processQueue();
     }
@@ -1136,8 +1389,23 @@ Analyze the above codebase context and provide your response following the forma
       executionId: string;
       workerType: HeadlessWorkerType;
     }
-  ): Promise<{ success: boolean; output: string; tokensUsed?: number; error?: string }> {
-    return new Promise((resolve) => {
+  ): Promise<{
+    success: boolean;
+    output: string;
+    tokensUsed?: number;
+    inputTokens?: number;
+    outputTokens?: number;
+    costUsd?: number;
+    apiDurationMs?: number;
+    credentialExpiresAt?: string;
+    error?: string;
+    missingPlugins?: string[];
+  }> {
+    return new Promise((resolveRaw) => {
+      // ADR-510: a plugin the worker profile wants but cannot find is recorded on the result.
+      let missingPlugins: string[] = [];
+      const resolve = (r: Parameters<typeof resolveRaw>[0]) =>
+        resolveRaw(missingPlugins.length > 0 ? { ...r, missingPlugins } : r);
       const env: Record<string, string> = {
         ...(process.env as Record<string, string>),
         CLAUDE_CODE_HEADLESS: 'true',
@@ -1170,11 +1438,32 @@ Analyze the above codebase context and provide your response following the forma
       // writes the prompt and closes stdin atomically — the EOF still
       // unblocks `claude --print` (the original concern in #1395) but no
       // shell tokenization touches the prompt.
-      const child = spawn('claude', ['--print'], {
+      // #2098B / #2093 — `claude --print` can spawn grandchildren (MCP
+      // server stdio bridges, plugin tools). When the head times out a
+      // plain `child.kill()` only signals the head; grandchildren get
+      // reparented to init and survive — the symptom @maxstefanakis1114
+      // diagnosed as a 5-second redispatch + subprocess-table growth.
+      // `detached: true` puts the child in its own process group so we
+      // can signal the whole tree with `process.kill(-pid, sig)`.
+      // #2661 root-fix — structured usage telemetry. `--output-format json`
+      // wraps the response in an envelope carrying `result` (the actual
+      // text — what `output` must still contain, unchanged for every
+      // existing downstream parser) alongside `usage`/cost/duration
+      // metadata. Parsing is lenient (parseClaudePrintJsonEnvelope below)
+      // and ALWAYS falls back to the raw text on any mismatch — a schema
+      // surprise from an older/newer `claude` CLI must degrade to exactly
+      // today's behavior (no usage captured), never break analysis output.
+      // ADR-510: `claude -p` on a fresh config loads no marketplace plugins, so
+      // pass the worker profile (default ruflo-mods) as --plugin-dir and turn
+      // function hooks on unless the caller set CLAUDE_CODE_ENABLE_FUNCTION_HOOKS.
+      const staged = withHeadlessPlugins(['--print', '--output-format', 'json'], env, { projectRoot: this.projectRoot });
+      missingPlugins = staged.missing;
+      const child = spawn('claude', staged.argv, {
         cwd: this.projectRoot,
-        env,
+        env: staged.env,
         stdio: ['pipe', 'pipe', 'pipe'],
         windowsHide: true, // Prevent phantom console windows on Windows
+        detached: process.platform !== 'win32',
       });
       try {
         child.stdin?.end(prompt);
@@ -1183,16 +1472,39 @@ Analyze the above codebase context and provide your response following the forma
         // will surface the real cause.
       }
 
+      // Kill the whole process group on POSIX, fall back to the child on
+      // Windows (where setsid-style detach isn't available the same way).
+      const killTree = (signal: NodeJS.Signals) => {
+        if (process.platform !== 'win32' && typeof child.pid === 'number') {
+          try { process.kill(-child.pid, signal); return; } catch { /* fall through */ }
+        }
+        try { child.kill(signal); } catch { /* already dead */ }
+      };
+
+      // #4463 — `child.killed` only means a signal was delivered, not that the
+      // child exited, so escalation keys off the exit state instead.
+      const hasExited = () => child.exitCode !== null || child.signalCode !== null;
+      let escalationHandle: NodeJS.Timeout | undefined;
+      let deadlineHandle: NodeJS.Timeout | undefined;
+      const terminate = () => {
+        if (escalationHandle) return; // already signalled; never repeat SIGTERM
+        killTree('SIGTERM');
+        // Give it a moment to terminate gracefully, then force it.
+        escalationHandle = setTimeout(() => {
+          if (!hasExited()) killTree('SIGKILL');
+        }, 5000);
+      };
+      const stopTimers = () => {
+        clearTimeout(escalationHandle);
+        clearTimeout(deadlineHandle);
+      };
+      child.once('exit', () => clearTimeout(escalationHandle));
+      child.once('close', stopTimers);
+
       // Setup timeout
       const timeoutHandle = setTimeout(() => {
         if (this.processPool.has(options.executionId)) {
-          child.kill('SIGTERM');
-          // Give it a moment to terminate gracefully
-          setTimeout(() => {
-            if (!child.killed) {
-              child.kill('SIGKILL');
-            }
-          }, 5000);
+          terminate();
         }
       }, options.timeoutMs);
 
@@ -1212,7 +1524,16 @@ Analyze the above codebase context and provide your response following the forma
 
       const cleanup = () => {
         clearTimeout(timeoutHandle);
+        clearTimeout(deadlineHandle);
         this.processPool.delete(options.executionId);
+      };
+
+      poolEntry.abort = () => {
+        if (resolved) return;
+        resolved = true;
+        terminate();
+        cleanup();
+        resolve({ success: false, output: stdout || stderr, error: 'Execution cancelled' });
       };
 
       child.stdout?.on('data', (data: Buffer) => {
@@ -1240,9 +1561,18 @@ Analyze the above codebase context and provide your response following the forma
         resolved = true;
         cleanup();
 
+        const envelope = parseClaudePrintJsonEnvelope(stdout);
         resolve({
           success: code === 0,
-          output: stdout || stderr,
+          output: envelope?.result ?? stdout ?? stderr,
+          inputTokens: envelope?.inputTokens,
+          outputTokens: envelope?.outputTokens,
+          tokensUsed: envelope
+            ? (envelope.inputTokens ?? 0) + (envelope.outputTokens ?? 0)
+            : undefined,
+          costUsd: envelope?.costUsd,
+          apiDurationMs: envelope?.durationMs,
+          credentialExpiresAt: envelope?.credentialExpiresAt,
           error: code !== 0 ? stderr || `Process exited with code ${code}` : undefined,
         });
       });
@@ -1260,12 +1590,14 @@ Analyze the above codebase context and provide your response following the forma
       });
 
       // Handle timeout
-      setTimeout(() => {
+      deadlineHandle = setTimeout(() => {
         if (resolved) return;
         if (!this.processPool.has(options.executionId)) return;
 
         resolved = true;
-        child.kill('SIGTERM');
+        // Normally a no-op: the timeout handler above already signalled the
+        // tree and owns the SIGKILL escalation (no duplicate SIGTERM).
+        terminate();
         cleanup();
 
         resolve({

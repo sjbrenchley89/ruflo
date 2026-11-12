@@ -72,19 +72,36 @@ if (!existsSync(ADAPTER_TS)) {
     'expected method signature `solveCG(matrix: number[][], vector: number[], opts?: ...)`',
   );
   check(
-    'adapter exposes `SublinearAdapter.isMcpAvailable()` detection',
+    'adapter exposes `SublinearAdapter.isMcpAvailable()` detection (legacy alias)',
     /static\s+isMcpAvailable\s*\(/.test(src),
     'expected `static isMcpAvailable()` for graceful degrade detection',
   );
   check(
-    'adapter declares `SolveResult` with the documented fields',
+    'adapter exposes `SublinearAdapter.detectSublinearTool()` (native-dispatch probe, #55)',
+    /static\s+detectSublinearTool\s*\(/.test(src),
+    'native dispatch is gated by this two-probe detection (globalThis + RUFLO_SUBLINEAR_NATIVE env var)',
+  );
+  check(
+    'adapter calls `detectSublinearTool()` before falling back to local CG',
+    /detectSublinearTool\s*\(\s*\)/.test(src),
+    'the dispatch path must consult the detection probe — otherwise native is unreachable',
+  );
+  check(
+    'adapter honours `RUFLO_SUBLINEAR_NATIVE` env-var override',
+    /RUFLO_SUBLINEAR_NATIVE/.test(src),
+    'operator-controlled native-dispatch override (#55) must be wired in the detection',
+  );
+  check(
+    'adapter declares `SolveResult` with the documented fields (incl. new method + solver)',
     /interface\s+SolveResult/.test(src) &&
       /solution\s*:\s*number\[\]/.test(src) &&
       /iterations\s*:\s*number/.test(src) &&
       /residual\s*:\s*number/.test(src) &&
       /latencyMs\s*:\s*number/.test(src) &&
-      /path\s*:\s*'cg-local'\s*\|\s*'cg-mcp'/.test(src),
-    'SolveResult must declare solution, iterations, residual, latencyMs, path',
+      /path\s*:\s*'cg-local'\s*\|\s*'cg-mcp'/.test(src) &&
+      /method\s*:\s*'cg-sublinear-native'\s*\|\s*'cg-local'/.test(src) &&
+      /solver\s*:\s*'sublinear-time-solver@1\.7\.0'\s*\|\s*'local-js-cg'/.test(src),
+    'SolveResult must declare solution, iterations, residual, latencyMs, path, method, solver',
   );
   check(
     'adapter has symmetric-input validation (rejects non-SPD with degraded flag)',
@@ -136,8 +153,8 @@ if (!existsSync(SKILL_MD)) {
     'the MCP tool that powers Phase 3 must be allow-listed',
   );
   check(
-    'skill declares `mcp__claude-flow__memory_store` for artifact persistence',
-    /^allowed-tools:[^\n]*mcp__claude-flow__memory_store/m.test(skill),
+    'skill declares plugin-qualified `memory_store` for artifact persistence',
+    /^allowed-tools:[^\n]*mcp__plugin_ruflo-core_ruflo__memory_store/m.test(skill),
     'persistence to trading-risk namespace requires memory_store',
   );
   check(
@@ -156,9 +173,14 @@ if (!existsSync(SKILL_MD)) {
     'when the CG path degrades, the legacy `npx neural-trader --portfolio optimize` route must be the documented fallback',
   );
   check(
-    'skill metadata distinguishes `cg-sublinear`, `cg-local`, `neumann-fallback`',
+    'skill metadata distinguishes `cg-sublinear-native` (or legacy `cg-sublinear`), `cg-local`, `neumann-fallback`',
     /cg-sublinear/.test(skill) && /cg-local/.test(skill) && /neumann-fallback/.test(skill),
     'artifact provenance must record which path produced the weights',
+  );
+  check(
+    'skill documents the `RUFLO_SUBLINEAR_NATIVE` env-var override',
+    /RUFLO_SUBLINEAR_NATIVE/.test(skill),
+    'native-dispatch override is the operator-controlled rollout switch (#55)',
   );
 }
 
@@ -185,14 +207,23 @@ try {
   const result = await adapter.solveCG(A, b, { tolerance: 1e-9, maxIterations: 100 });
 
   check(
-    'adapter returns the documented result shape',
+    'adapter returns the documented result shape (incl. method + solver tags)',
     Array.isArray(result.solution) &&
       typeof result.iterations === 'number' &&
       typeof result.residual === 'number' &&
       typeof result.latencyMs === 'number' &&
-      (result.path === 'cg-local' || result.path === 'cg-mcp'),
+      (result.path === 'cg-local' || result.path === 'cg-mcp') &&
+      (result.method === 'cg-local' || result.method === 'cg-sublinear-native') &&
+      (result.solver === 'local-js-cg' || result.solver === 'sublinear-time-solver@1.7.0'),
     `got: ${JSON.stringify(result)}`,
   );
+
+  // Contract note: the actual native-vs-JS dispatch is a *runtime* path —
+  // determined by whether the harness has mounted `mcp__ruflo-sublinear__solve`
+  // (or `RUFLO_SUBLINEAR_NATIVE=1` is set). The smoke validates the contract
+  // that both paths exist and the result shape carries `method` + `solver`;
+  // the actual 40-60× speedup measurement happens in the bench when the
+  // daemon is up (CI exercises the native path).
 
   const err0 = Math.abs(result.solution[0] - expected[0]);
   const err1 = Math.abs(result.solution[1] - expected[1]);

@@ -266,9 +266,12 @@ jobs:
         uses: ruvnet/swarm-action@v1
         with:
           command: |
-            if [[ "${{ github.event.label.name }}" == "swarm-ready" ]]; then
+            LABEL_NAME_FILE=$(mktemp)
+            printf '%s' "${{ github.event.label.name }}" > "$LABEL_NAME_FILE"
+            if grep -qx 'swarm-ready' "$LABEL_NAME_FILE"; then
               npx ruv-swarm github issue-init ${{ github.event.issue.number }}
             fi
+            rm -f "$LABEL_NAME_FILE"
 ```
 
 ### Issue Board Integration
@@ -492,10 +495,10 @@ npx ruv-swarm github issue-init 567 \
 ```bash
 # Initialize issue-specific swarm with optimal topology
 mcp__claude-flow__swarm_init { topology: "hierarchical", maxAgents: 8 }
-mcp__claude-flow__agent_spawn { type: "coordinator", name: "Issue Coordinator" }
-mcp__claude-flow__agent_spawn { type: "analyst", name: "Issue Analyzer" }
-mcp__claude-flow__agent_spawn { type: "coder", name: "Solution Developer" }
-mcp__claude-flow__agent_spawn { type: "tester", name: "Validation Engineer" }
+mcp__claude-flow__agent_spawn { agentType: "coordinator", name: "Issue Coordinator" }
+mcp__claude-flow__agent_spawn { agentType: "analyst", name: "Issue Analyzer" }
+mcp__claude-flow__agent_spawn { agentType: "coder", name: "Solution Developer" }
+mcp__claude-flow__agent_spawn { agentType: "tester", name: "Validation Engineer" }
 
 # Store issue context in swarm memory
 mcp__claude-flow__memory_usage {

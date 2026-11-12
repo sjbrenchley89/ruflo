@@ -25,7 +25,7 @@ export const AgentConfigSchema = z.object({
     maxMemoryMb: z.number().int().positive().optional(),
     maxCpuPercent: z.number().min(0).max(100).optional(),
   }).optional(),
-  metadata: z.record(z.unknown()).optional(),
+  metadata: z.record(z.string(), z.unknown()).optional(),
 });
 
 /**
@@ -37,7 +37,7 @@ export const TaskConfigSchema = z.object({
   priority: z.number().int().min(0).max(100).default(50),
   timeout: z.number().int().positive().optional(),
   assignedAgent: z.string().optional(),
-  input: z.record(z.unknown()).optional(),
+  input: z.record(z.string(), z.unknown()).optional(),
   metadata: z.object({
     requiredCapabilities: z.array(z.string()).optional(),
     retryCount: z.number().int().min(0).optional(),
@@ -53,7 +53,7 @@ export const TaskConfigSchema = z.object({
  * Swarm configuration schema
  */
 export const SwarmConfigSchema = z.object({
-  topology: z.enum(['hierarchical', 'mesh', 'ring', 'star', 'adaptive', 'hierarchical-mesh']),
+  topology: z.enum(['hierarchical', 'mesh', 'ring', 'star', 'adaptive', 'pheromone-adaptive', 'hierarchical-mesh']),
   maxAgents: z.number().int().positive().default(20),
   autoScale: z.object({
     enabled: z.boolean().default(false),
@@ -75,7 +75,7 @@ export const SwarmConfigSchema = z.object({
     batchSize: z.number().int().positive().default(10),
     flushIntervalMs: z.number().int().positive().default(100),
   }).optional(),
-  metadata: z.record(z.unknown()).optional(),
+  metadata: z.record(z.string(), z.unknown()).optional(),
 });
 
 /**
@@ -127,7 +127,7 @@ export const MCPServerConfigSchema = z.object({
     resources: z.boolean().default(true),
     prompts: z.boolean().default(true),
     logging: z.boolean().default(true),
-    experimental: z.record(z.boolean()).optional(),
+    experimental: z.record(z.string(), z.boolean()).optional(),
   }).optional(),
 });
 

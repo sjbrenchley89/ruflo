@@ -6,13 +6,15 @@
  */
 
 import initSqlJs from 'sql.js';
-import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, statSync } from 'fs';
-import { dirname, join, basename } from 'path';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, statSync, openSync, writeSync, fsyncSync, closeSync, renameSync, rmSync } from 'fs';
+import { dirname, join, basename, resolve } from 'path';
 import { fileURLToPath } from 'url';
 import { execSync } from 'child_process';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const PROJECT_ROOT = join(__dirname, '../..');
+const PROJECT_ROOT = process.env.CLAUDE_PROJECT_DIR
+  ? resolve(process.env.CLAUDE_PROJECT_DIR)
+  : join(__dirname, '../..');
 const V3_DIR = join(PROJECT_ROOT, 'v3');
 const DB_PATH = join(PROJECT_ROOT, '.claude-flow', 'metrics.db');
 
@@ -138,7 +140,22 @@ async function initDatabase() {
 function persist() {
   const data = db.export();
   const buffer = Buffer.from(data);
-  writeFileSync(DB_PATH, buffer);
+  // Atomic write (issue #2584): temp → fsync → rename so a kill/OOM mid-flush
+  // or a concurrent writer can't leave a torn, malformed metrics.db image.
+  const tmp = `${DB_PATH}.tmp-${process.pid}-${Date.now().toString(36)}`;
+  let fd;
+  try {
+    fd = openSync(tmp, 'wx');
+    if (buffer.length > 0) writeSync(fd, buffer, 0, buffer.length, 0);
+    fsyncSync(fd);
+    closeSync(fd);
+    fd = undefined;
+    renameSync(tmp, DB_PATH);
+  } catch (e) {
+    if (fd !== undefined) { try { closeSync(fd); } catch { /* */ } }
+    try { rmSync(tmp, { force: true }); } catch { /* */ }
+    throw e;
+  }
 }
 
 /**

@@ -22,7 +22,7 @@ jobs:
   swarm-analysis:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       
       - name: Initialize Swarm
         uses: ruvnet/swarm-action@v1
@@ -70,7 +70,7 @@ jobs:
   detect-and-build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       
       - name: Detect Languages
         id: detect
@@ -452,13 +452,13 @@ npx ruv-swarm actions profile \
 ```bash
 # Initialize comprehensive workflow automation swarm
 mcp__claude-flow__swarm_init { topology: "mesh", maxAgents: 12 }
-mcp__claude-flow__agent_spawn { type: "coordinator", name: "Workflow Coordinator" }
-mcp__claude-flow__agent_spawn { type: "architect", name: "Pipeline Architect" }
-mcp__claude-flow__agent_spawn { type: "coder", name: "Workflow Developer" }
-mcp__claude-flow__agent_spawn { type: "tester", name: "CI/CD Tester" }
-mcp__claude-flow__agent_spawn { type: "optimizer", name: "Performance Optimizer" }
-mcp__claude-flow__agent_spawn { type: "monitor", name: "Automation Monitor" }
-mcp__claude-flow__agent_spawn { type: "analyst", name: "Workflow Analyzer" }
+mcp__claude-flow__agent_spawn { agentType: "coordinator", name: "Workflow Coordinator" }
+mcp__claude-flow__agent_spawn { agentType: "architect", name: "Pipeline Architect" }
+mcp__claude-flow__agent_spawn { agentType: "coder", name: "Workflow Developer" }
+mcp__claude-flow__agent_spawn { agentType: "tester", name: "CI/CD Tester" }
+mcp__claude-flow__agent_spawn { agentType: "optimizer", name: "Performance Optimizer" }
+mcp__claude-flow__agent_spawn { agentType: "monitor", name: "Automation Monitor" }
+mcp__claude-flow__agent_spawn { agentType: "analyst", name: "Workflow Analyzer" }
 
 # Create intelligent workflow automation rules
 mcp__claude-flow__automation_setup {

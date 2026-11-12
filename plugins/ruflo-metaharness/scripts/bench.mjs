@@ -1,0 +1,153 @@
+#!/usr/bin/env node
+// bench.mjs — wrapper around `metaharness-darwin bench <create|verify>`.
+//
+// Bench suites are JSON files describing a corpus of (input, expected-output)
+// tasks. `evolve --bench <suite.json>` scores each variant against the
+// corpus instead of (or in addition to) the project's test command, which
+// lets you evolve a harness against a fixed evaluation set independent of
+// the repo's natural tests. `bench create` scaffolds a suite from a repo;
+// `bench verify` checks a suite parses and every task is well-formed.
+//
+// USAGE
+//   node scripts/bench.mjs --op create --repo .              # scaffold suite.json from current dir
+//   node scripts/bench.mjs --op create --repo . --out /tmp/foo.json
+//   node scripts/bench.mjs --op verify --suite /tmp/foo.json
+//
+// EXIT CODES
+//   0  ok (or degraded — Darwin not available)
+//   1  --op verify and any task malformed
+//   2  config error or upstream invocation failure
+//
+// DIAGNOSTICS (#4930)
+//   Every JSON payload carries a top-level `darwinSource`: which darwin ran.
+//     library    — bare import of @metaharness/darwin, verified in-process
+//     cli-local  — darwin CLI from an installed copy next to this plugin
+//     cli-cache  — darwin CLI from the one-time ~/.ruflo/darwin-cache-<pin> install
+//     none       — darwin could not be resolved at all (degraded)
+//   A degraded payload also carries the upstream exit code and stderr tail.
+
+import { guardCliArgs } from './_cli-args.mjs';
+
+import { runDarwin, emitDarwinDegradedJsonAndExit, importDarwinLib } from './_darwin.mjs';
+import { existsSync } from 'node:fs';
+import { resolve } from 'node:path';
+
+guardCliArgs(import.meta.url, {
+  '--op': 'value',
+  '--repo': 'value',
+  '--suite': 'value',
+  '--out': 'value',
+  '--format': 'value',
+});
+
+const ARGS = (() => {
+  const a = { op: null, repo: '.', suite: null, out: null, format: 'json' };
+  for (let i = 2; i < process.argv.length; i++) {
+    const v = process.argv[i];
+    if (v === '--op') a.op = process.argv[++i];
+    else if (v === '--repo') a.repo = process.argv[++i];
+    else if (v === '--suite') a.suite = process.argv[++i];
+    else if (v === '--out') a.out = process.argv[++i];
+    else if (v === '--format') a.format = process.argv[++i];
+  }
+  return a;
+})();
+
+function safetyChecks() {
+  if (!['create', 'verify'].includes(ARGS.op)) {
+    console.error('bench: --op must be create|verify');
+    process.exit(2);
+  }
+  if (ARGS.op === 'create' && !existsSync(resolve(ARGS.repo))) {
+    console.error(`bench: --repo path does not exist: ${ARGS.repo}`);
+    process.exit(2);
+  }
+  if (ARGS.op === 'verify' && !ARGS.suite) {
+    console.error('bench: --suite is required for verify');
+    process.exit(2);
+  }
+  if (ARGS.op === 'verify' && !existsSync(resolve(ARGS.suite))) {
+    console.error(`bench: --suite path does not exist: ${ARGS.suite}`);
+    process.exit(2);
+  }
+}
+
+// ADR-526 — verify through darwin's library (loadSuite + verifySuite), the
+// same two calls the darwin CLI makes, without spawning it. Returns false when
+// the library is unavailable so main() falls back to the CLI.
+async function verifyInProcess() {
+  const darwin = await importDarwinLib();
+  if (!darwin?.bench?.loadSuite || !darwin?.bench?.verifySuite) return false;
+  const start = Date.now();
+  let payload;
+  let exitCode;
+  try {
+    const suite = await darwin.bench.loadSuite(resolve(ARGS.suite));
+    const check = darwin.bench.verifySuite(suite);
+    const tasks = Array.isArray(suite.tasks) ? suite.tasks.length : 0;
+    exitCode = check.ok ? 0 : 1;
+    payload = {
+      success: check.ok,
+      darwinSource: 'library',
+      data: {
+        op: 'verify', suiteId: suite.id, version: suite.version, tasks, hashOk: check.ok, hash: check.actual,
+        stdoutTail: `Suite ${suite.id}@${suite.version}: ${tasks} tasks, hash ${check.ok ? 'OK' : 'MISMATCH'} (${String(check.actual).slice(0, 12)}…)\n`,
+        durationMs: Date.now() - start,
+      },
+      generatedAt: new Date().toISOString(),
+    };
+  } catch (e) {
+    exitCode = 1;
+    payload = { success: false, darwinSource: 'library', data: { op: 'verify', error: e?.message ?? String(e), durationMs: Date.now() - start }, generatedAt: new Date().toISOString() };
+  }
+  console.log(JSON.stringify(payload, null, 2));
+  process.exit(exitCode);
+}
+
+async function main() {
+  safetyChecks();
+  if (ARGS.op === 'verify' && (await verifyInProcess())) return;
+
+  const cliArgs = ARGS.op === 'create'
+    ? ['bench', 'create', resolve(ARGS.repo), ...(ARGS.out ? ['--out', resolve(ARGS.out)] : [])]
+    : ['bench', 'verify', resolve(ARGS.suite)];
+
+  const r = runDarwin(cliArgs, { timeoutMs: 60_000 });
+  const darwinSource = r.source ? `cli-${r.source}` : 'none';
+
+  if (r.degraded) {
+    emitDarwinDegradedJsonAndExit(r.reason, {
+      darwinSource,
+      upstreamExitCode: r.exitCode,
+      stderrTail: String(r.stderr ?? '').slice(-1200),
+    });
+    return;
+  }
+
+  if (r.exitCode !== 0 && r.exitCode !== 1) {
+    const payload = {
+      success: false,
+      darwinSource,
+      data: { exitCode: r.exitCode, stderrTail: r.stderr.slice(-400) },
+      generatedAt: new Date().toISOString(),
+    };
+    console.log(JSON.stringify(payload, null, 2));
+    process.exit(2);
+  }
+
+  const payload = {
+    success: r.exitCode === 0,
+    darwinSource,
+    data: {
+      op: ARGS.op,
+      ...(r.json ?? { stdoutTail: r.stdout.slice(-2000) }),
+      durationMs: r.durationMs,
+    },
+    generatedAt: new Date().toISOString(),
+  };
+
+  console.log(JSON.stringify(payload, null, 2));
+  process.exit(r.exitCode);
+}
+
+main();

@@ -8,10 +8,174 @@
  *
  * @module v3/cli/memory-initializer
  */
+import type { AppendCondition } from './append-conditions.js';
 
+import { loadBetterSqlite3 } from './shared-sqlite.js';
+import { resolveMemoryRoot } from './memory-root.js';
+import { getProjectRoot } from '../services/project-root.js';
+import { DEFAULT_SEARCH_THRESHOLD } from './search-defaults.js';
+import { liveMemoryRowSql } from './live-memory-row.js';
+import { encodeEmbeddingQ8, MAX_LIST_EMBEDDINGS, type EmbeddingQ8 } from './embedding-q8.js';
 import * as fs from 'fs';
 import * as path from 'path';
-import { readFileMaybeEncrypted, writeFileRestricted } from '../fs-secure.js';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { createRequire } from 'node:module';
+import { readFileMaybeEncrypted, writeDbImagePreservingFormat, writeFileAtomic, writeFileRestricted } from '../fs-secure.js';
+import {
+  _resetEmbeddingConfigCache,
+  DEFAULT_EMBEDDING_DIMENSION,
+  resolveEffectiveEmbeddingConfig,
+  resolveEmbeddingConfig,
+} from './embedding-config.js';
+import { restoreMemoryDbFromBackup } from '../services/memory-backup.js';
+import { validateIdentifier } from '../mcp-tools/validate-input.js';
+import { resolveModelCacheDir } from './model-cache-dir.js';
+
+/**
+ * ADR-323 — typed memory provenance. Distinguishes WHO/WHAT wrote a memory
+ * entry (a user's stated claim vs an agent's own output vs a tool result vs
+ * a raw system observation) so retrieval can filter by trust level instead
+ * of treating every entry in a shared namespace as equally authoritative.
+ * `unknown` is the backward-compatible default for entries written before
+ * this field existed, and for callers that don't pass one.
+ */
+export const PROVENANCE_TYPES = [
+  'user_claim',
+  'agent_output',
+  'system_observation',
+  'tool_result',
+  'unknown',
+] as const;
+export type ProvenanceType = (typeof PROVENANCE_TYPES)[number];
+
+export function isValidProvenanceType(value: unknown): value is ProvenanceType {
+  return typeof value === 'string' && (PROVENANCE_TYPES as readonly string[]).includes(value);
+}
+
+/**
+ * #2356 — cached, synchronous capability probe for @ruvector/core. `getHNSWStatus`
+ * is sync and is called by `neural status` in a fresh process that never warms
+ * the lazy HNSW singleton, so reporting availability off the warm singleton
+ * alone produced a false "Not loaded — @ruvector/core not available" even when
+ * the package is installed and exposes VectorDb. Resolving the module (without
+ * importing/initializing it) is a faithful, cheap availability signal.
+ */
+let _ruvectorCoreResolvable: boolean | undefined;
+function isRuvectorCoreResolvable(): boolean {
+  if (_ruvectorCoreResolvable !== undefined) return _ruvectorCoreResolvable;
+  try {
+    const req = createRequire(import.meta.url);
+    req.resolve('@ruvector/core');
+    _ruvectorCoreResolvable = true;
+  } catch {
+    _ruvectorCoreResolvable = false;
+  }
+  return _ruvectorCoreResolvable;
+}
+
+/**
+ * #2735 / #3161 — before a whole-image sql.js read-modify-persist (export() +
+ * rename over the live database path), refuse if a native (better-sqlite3)
+ * WAL connection is actually LIVE. `-wal`/`-shm` sidecar presence alone is
+ * not proof of that: #3161 found `ruflo doctor`'s readonly diagnostic
+ * connections leave orphaned sidecars behind after a plain `.close()` (WAL
+ * mode does not checkpoint on close unless the closing connection was the
+ * last holder in a state that triggers one), permanently blocking every
+ * later write in that project.
+ *
+ * Liveness is probed in two steps, because a single `wal_checkpoint`
+ * busy-check is not sufficient on its own:
+ *
+ *  1. Open our own probe connection and run `PRAGMA wal_checkpoint(TRUNCATE)`.
+ *     `busy !== 0` means another connection genuinely holds a lock blocking
+ *     the checkpoint RIGHT NOW (an open transaction) — unsafe, refuse
+ *     immediately. This also truncates a genuinely-orphaned WAL as a side
+ *     effect.
+ *  2. If `busy === 0`, close our probe connection and re-check whether the
+ *     sidecars are still on disk. SQLite only deletes `-wal`/`-shm` when the
+ *     LAST connection to the database closes. If nothing else is attached,
+ *     OUR close is that last close and the sidecars vanish — safe, proceed.
+ *     If they are still present after our own close, some OTHER connection
+ *     is still attached (even idle, holding no lock — e.g. a foreign native
+ *     handle that already finished its last statement), so step 1's
+ *     busy-check alone would have missed it. Refuse.
+ *
+ * Step 2 is what makes this safe against an idle-but-attached native
+ * connection (an open handle holding no lock does not block checkpointing,
+ * so step 1 alone would report "safe" even though a real holder is still
+ * attached) without resorting to platform-specific process scanning.
+ *
+ * The common case (no sidecars at all) stays a couple of cheap `existsSync`
+ * calls — a DB connection is only opened when a sidecar is actually present
+ * to investigate.
+ *
+ * This is still a scoped-down version of the fuller "scan live process
+ * holders" design discussed in #2735: it does not close the narrow
+ * assess-then-write race (a native opener could still attach in the gap
+ * between this check and the write), but it directly closes the
+ * demonstrated corruption mechanism — a whole-image write proceeding while
+ * an ALREADY-OPEN native connection genuinely holds the file — with no
+ * platform-specific process scanning. Fails closed (treats any probe error
+ * as "unsafe") because this is a safety gate, not a best-effort probe.
+ */
+async function hasNativeWalSidecars(dbPath: string): Promise<boolean> {
+  try {
+    if (!fs.existsSync(`${dbPath}-wal`) && !fs.existsSync(`${dbPath}-shm`)) {
+      return false;
+    }
+  } catch {
+    return true;
+  }
+
+  let db: { pragma(sql: string): unknown; close(): void } | undefined;
+  try {
+    const Database = await loadBetterSqlite3();
+    const opened = new Database(dbPath);
+    db = opened;
+    // Report busy immediately instead of retrying for the driver's default
+    // (multi-second) busy_timeout — a live holder's checkpoint-blocking
+    // lock is a steady-state fact at probe time, not a transient we should
+    // wait out, and this is a safety gate on a hot write path.
+    opened.pragma('busy_timeout = 0');
+    const [{ busy }] = opened.pragma('wal_checkpoint(TRUNCATE)') as Array<{ busy: number }>;
+    if (busy !== 0) return true;
+  } catch {
+    return true;
+  } finally {
+    try {
+      db?.close();
+    } catch {
+      // best-effort
+    }
+  }
+
+  // Nothing was mid-transaction at probe time, and our own (now-closed)
+  // probe connection just truncated the WAL. If the sidecars are still
+  // here, another connection is still attached and kept them alive through
+  // our close.
+  try {
+    return fs.existsSync(`${dbPath}-wal`) || fs.existsSync(`${dbPath}-shm`);
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * #3397 — this process's own graph-edge-writer handle keeps -wal/-shm on disk
+ * between its idle-release ticks. Release (checkpoint + close) it before the
+ * #2735 guard runs, so the guard only sees sidecars some OTHER native
+ * connection is holding. The guard itself is unchanged: even a same-process
+ * open WAL connection makes a whole-image sql.js write unsafe until its WAL
+ * has been checkpointed, which is exactly what releasing does.
+ */
+async function releaseOwnNativeHandle(dbPath: string): Promise<void> {
+  try {
+    const { releaseBridgeDb } = await import('./graph-edge-writer.js');
+    releaseBridgeDb(dbPath);
+  } catch {
+    // Writer module unavailable — nothing of ours to release; the guard decides.
+  }
+}
 
 /**
  * #1854: previously every site that needed the memory directory hardcoded
@@ -22,10 +186,18 @@ import { readFileMaybeEncrypted, writeFileRestricted } from '../fs-secure.js';
  * this file flows through it.
  *
  * Precedence (highest → lowest):
- *   1. CLAUDE_FLOW_MEMORY_PATH env var
- *   2. memory.persistPath / memory.path in claude-flow.config.json (cwd or
- *      the directory the CLI was invoked from)
- *   3. Default: cwd/.swarm
+ *   1. CLAUDE_FLOW_MEMORY_PATH env var (a relative value resolves against
+ *      the project root)
+ *   2. memory.persistPath / memory.path in claude-flow.config.json or
+ *      .claude-flow/config.json at the project root
+ *   3. Default: <project root>/.swarm
+ *
+ * #2633: "project root" is the nearest ancestor of process.cwd() carrying a
+ * Ruflo marker (getProjectRoot: the walk the daemon uses since #2877, minus
+ * home / filesystem roots),
+ * so a shell that drifted into a subdirectory still opens the project's
+ * memory DB instead of silently starting a new one. With no marker it is
+ * process.cwd(), exactly as before.
  *
  * Cached per-process so repeated lookups are cheap; reset only by spawning
  * a fresh process (which is how config changes already propagate).
@@ -33,35 +205,7 @@ import { readFileMaybeEncrypted, writeFileRestricted } from '../fs-secure.js';
 let _memoryRootCache: string | undefined;
 export function getMemoryRoot(): string {
   if (_memoryRootCache !== undefined) return _memoryRootCache;
-
-  // 1. Env var
-  const envPath = process.env.CLAUDE_FLOW_MEMORY_PATH;
-  if (envPath && envPath.trim().length > 0) {
-    _memoryRootCache = path.resolve(envPath);
-    return _memoryRootCache;
-  }
-
-  // 2. Config file (claude-flow.config.json)
-  const configCandidates = [
-    path.resolve(process.cwd(), 'claude-flow.config.json'),
-    path.resolve(process.cwd(), '.claude-flow', 'config.json'),
-  ];
-  for (const configPath of configCandidates) {
-    if (!fs.existsSync(configPath)) continue;
-    try {
-      const raw = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
-      const fromConfig: unknown = raw?.memory?.persistPath ?? raw?.memory?.path;
-      if (typeof fromConfig === 'string' && fromConfig.trim().length > 0) {
-        _memoryRootCache = path.resolve(fromConfig);
-        return _memoryRootCache;
-      }
-    } catch {
-      /* malformed config — fall through to default */
-    }
-  }
-
-  // 3. Default
-  _memoryRootCache = path.resolve(process.cwd(), '.swarm');
+  _memoryRootCache = resolveMemoryRoot(getProjectRoot());
   return _memoryRootCache;
 }
 
@@ -70,9 +214,39 @@ export function _resetMemoryRootCache(): void {
   _memoryRootCache = undefined;
 }
 
+/**
+ * #2105: Resolve the full path to the SQLite memory database.
+ * Precedence (highest to lowest):
+ *   1. cliFlag             - explicit --path flag passed by a subcommand
+ *   2. CLAUDE_FLOW_DB_PATH - full file-path override (new in #2105)
+ *   3. getMemoryRoot()/memory.db - directory from CLAUDE_FLOW_MEMORY_PATH /
+ *                                  config / default cwd/.swarm
+ */
+export function resolveDbPath(cliFlag?: string): string {
+  if (cliFlag && cliFlag.trim().length > 0) {
+    return path.resolve(cliFlag);
+  }
+  const envDb = process.env.CLAUDE_FLOW_DB_PATH;
+  if (envDb && envDb.trim().length > 0) {
+    return path.resolve(envDb);
+  }
+  return path.join(getMemoryRoot(), 'memory.db');
+}
+
+// #2652/#2120: legacy rows with NULL status predate soft-delete semantics and
+// are active. Keep fallback retrieve/delete aligned with list and the native
+// bridge instead of making a row visible to one command but not another.
+const ACTIVE_MEMORY_ROW_SQL = `(status = 'active' OR status IS NULL)`;
+
 // ADR-053: Lazy import of AgentDB v3 bridge
 let _bridge: typeof import('./memory-bridge.js') | null | undefined;
 async function getBridge(): Promise<typeof import('./memory-bridge.js') | null> {
+  // #2120 — Allow callers to force the raw sql.js fallback path. The
+  // ensureSchemaColumns backfill (NULL → 'active') lives in that
+  // fallback, so smokes that verify legacy-DB migration semantics need a
+  // way to bypass the bridge. Also useful when the bridge would hang on
+  // network-bound init (Xenova model fetch) in offline CI.
+  if (process.env.CLAUDE_FLOW_DISABLE_BRIDGE === '1') return null;
   if (_bridge === null) return null;
   if (_bridge) return _bridge;
   try {
@@ -82,6 +256,31 @@ async function getBridge(): Promise<typeof import('./memory-bridge.js') | null> 
     _bridge = null;
     return null;
   }
+}
+
+/**
+ * Build the WAL-sidecar refusal message, naming the bridge failure when one
+ * was recorded.
+ *
+ * The refusal tells the operator to "restore the native better-sqlite3
+ * bridge" but, on its own, gives them no way to discover why it is down —
+ * and the usual cause is a latched init failure inside the bridge, not a
+ * missing better-sqlite3. Appending the recorded reason turns an unactionable
+ * message into a diagnosis.
+ */
+async function walRefusalError(operation: 'write' | 'read/write', bridgeDbPath?: string): Promise<string> {
+  const base = 'memory database has an active native WAL connection '
+    + '(found -wal/-shm sidecar files) — refusing an unsafe sql.js '
+    + `whole-image ${operation}. Retry once the native writer completes, or `
+    + 'restore the native better-sqlite3 bridge.';
+  try {
+    const bridge = await getBridge();
+    const reason = bridge?.getBridgeFailureReason?.(bridgeDbPath);
+    if (reason) return `${base} Bridge unavailable: ${reason}`;
+  } catch {
+    // Diagnostics must never mask the refusal they annotate.
+  }
+  return base;
 }
 
 /**
@@ -118,6 +317,13 @@ CREATE TABLE IF NOT EXISTS memory_entries (
   tags TEXT, -- JSON array
   metadata TEXT, -- JSON object
   owner_id TEXT,
+
+  -- ADR-323: who/what produced this entry — lets shared-namespace retrieval
+  -- filter by trust level instead of conflating a user's stated claim with
+  -- an agent's own output or a raw tool/system observation.
+  provenance_type TEXT DEFAULT 'unknown' CHECK(provenance_type IN (
+    'user_claim', 'agent_output', 'system_observation', 'tool_result', 'unknown'
+  )),
 
   -- Timestamps
   created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now') * 1000),
@@ -369,6 +575,36 @@ CREATE TABLE IF NOT EXISTS vector_indexes (
 );
 
 -- ============================================
+-- GRAPH EDGES (ADR-130 Phase 1)
+-- Unified knowledge graph backend — sql.js canonical store
+-- ============================================
+
+-- Unified graph edges table (ADR-130)
+-- Node IDs use domain-prefixed format: {domain}:{uuid}
+-- where domain in (mem, agent, task, entity, span, pattern)
+CREATE TABLE IF NOT EXISTS graph_edges (
+  id              TEXT PRIMARY KEY,          -- edge-{uuid}
+  source_id       TEXT NOT NULL,             -- domain-prefixed node ID
+  target_id       TEXT NOT NULL,             -- domain-prefixed node ID
+  relation        TEXT NOT NULL,             -- e.g. "caused", "depends-on", "imports"
+  weight          REAL DEFAULT 1.0,
+  -- Temporal / reliability semantics (ADR-130 §"graph that forgets" property)
+  confidence      REAL DEFAULT 1.0,          -- [0,1]; updated by JUDGE step
+  decay_rate      REAL DEFAULT 0.0,          -- per-day exponential decay applied at read time
+  last_reinforced TEXT,                      -- ISO-8601; set when CONSOLIDATE re-touches edge
+  witness_id      TEXT,                      -- FK to verification/witness-fixes.json (ADR-103)
+  -- Embedding storage: "inline:{base64}" | "vector_indexes:{id}" | NULL
+  embedding_ref   TEXT,
+  metadata        TEXT,                      -- JSON blob for plugin-specific fields
+  created_at      TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_graph_edges_source    ON graph_edges (source_id);
+CREATE INDEX IF NOT EXISTS idx_graph_edges_target    ON graph_edges (target_id);
+CREATE INDEX IF NOT EXISTS idx_graph_edges_relation  ON graph_edges (relation);
+CREATE INDEX IF NOT EXISTS idx_graph_edges_reinforced ON graph_edges (last_reinforced);
+
+-- ============================================
 -- SYSTEM METADATA
 -- ============================================
 
@@ -384,7 +620,7 @@ CREATE TABLE IF NOT EXISTS metadata (
 // Uses @ruvector/core from agentic-flow for WASM-accelerated HNSW
 // ============================================================================
 
-interface HNSWEntry {
+export interface HNSWEntry {
   id: string;
   key: string;
   namespace: string;
@@ -565,6 +801,69 @@ function saveHNSWMetadata(): void {
   }
 }
 
+export function removeHNSWEntriesByLogicalKey(
+  entries: Map<string, HNSWEntry>,
+  key: string,
+  namespace: string,
+): number {
+  let removed = 0;
+  for (const [id, entry] of entries) {
+    if (entry.key === key && (entry.namespace ?? 'default') === namespace) {
+      entries.delete(id);
+      removed++;
+    }
+  }
+  return removed;
+}
+
+function removeHNSWEntriesByKey(key: string, namespace: string): number {
+  if (!hnswIndex?.entries) return 0;
+  const removed = removeHNSWEntriesByLogicalKey(hnswIndex.entries, key, namespace);
+  if (removed > 0) {
+    saveHNSWMetadata();
+    rebuildSearchIndex();
+  }
+  return removed;
+}
+
+/**
+ * Remove HNSW metadata whose authoritative SQLite row is no longer active.
+ * Persistent graph nodes may remain physically allocated, but without metadata
+ * they cannot resolve into search results; the next rebuild repopulates only
+ * active rows. Returns the number of searchable vectors invalidated.
+ */
+export async function reconcileHNSWIndex(dbPath?: string): Promise<number> {
+  if (!hnswIndex?.entries) return 0;
+  const effectivePath = dbPath
+    ? path.resolve(dbPath)
+    : path.join(getMemoryRoot(), 'memory.db');
+  if (!fs.existsSync(effectivePath)) return 0;
+  try {
+    const initSqlJs = (await import('sql.js')).default;
+    const SQL = await initSqlJs();
+    const db = new SQL.Database(readFileMaybeEncrypted(effectivePath, null));
+    const rows = db.exec(`SELECT id FROM memory_entries WHERE status = 'active'`);
+    const active = new Set(
+      (rows[0]?.values ?? []).map((row) => String(row[0])),
+    );
+    db.close();
+    let removed = 0;
+    for (const id of hnswIndex.entries.keys()) {
+      if (!active.has(id)) {
+        hnswIndex.entries.delete(id);
+        removed++;
+      }
+    }
+    if (removed > 0) {
+      saveHNSWMetadata();
+      rebuildSearchIndex();
+    }
+    return removed;
+  } catch {
+    return 0;
+  }
+}
+
 /**
  * Add entry to HNSW index (with automatic persistence)
  */
@@ -576,7 +875,7 @@ export async function addToHNSWIndex(
   // ADR-053: Try AgentDB v3 bridge first
   const bridge = await getBridge();
   if (bridge) {
-    const bridgeResult = await bridge.bridgeAddToHNSW(id, embedding, entry);
+    const bridgeResult = await bridge.bridgeAddEmbedding(id, embedding, entry);
     if (bridgeResult === true) return true;
   }
 
@@ -613,7 +912,7 @@ export async function searchHNSWIndex(
   // ADR-053: Try AgentDB v3 bridge first
   const bridge = await getBridge();
   if (bridge) {
-    const bridgeResult = await bridge.bridgeSearchHNSW(queryEmbedding, options);
+    const bridgeResult = await bridge.bridgeSearchBruteForceCosine(queryEmbedding, options);
     if (bridgeResult) return bridgeResult;
   }
 
@@ -670,23 +969,49 @@ export function getHNSWStatus(): {
   initialized: boolean;
   entryCount: number;
   dimensions: number;
+  algorithm: 'hnsw' | 'brute-force-cosine';
 } {
-  // ADR-053: If bridge was previously loaded, report availability
-  if (_bridge && _bridge !== null) {
-    // Bridge is loaded — HNSW-equivalent is available via AgentDB v3
+  // #2922: this branch previously reported `available: true` whenever the
+  // bridge was loaded, on the theory that "AgentDB v3 is HNSW-equivalent" —
+  // but the bridge's actual search path (bridgeSearchBruteForceCosine, see
+  // memory-bridge.ts) does a full-table SELECT + brute-force cosine loop and
+  // never touches @ruvector/core or an HNSW index, regardless of whether
+  // ruvector-core itself is installed. `available` here means "an HNSW
+  // index is the one actually searched", matching what this function's own
+  // name promises — that's false while the bridge is the active path, so
+  // this no longer claims otherwise. Vector search itself still works via
+  // the bridge; `algorithm` tells callers it's brute-force, not HNSW.
+  //
+  // #3228: this branch previously tested only that the bridge MODULE was
+  // loaded. On Windows the module imports fine but `getRegistry()` returns
+  // null behind the #3024 kill-switch, so every read/write actually goes to
+  // the sql.js store while this function still reported the bridge as the
+  // active path — `describeBackend()` then printed "sqlite (bridge, ...)"
+  // for a store the bridge never touched. Gate on whether the bridge is
+  // *permitted to be* the active path, not on whether the module resolved.
+  // `shouldDisableNativeBridge()` is sync and a pure function of platform +
+  // env, so it is a faithful discriminator here and needs no warm registry.
+  if (_bridge && _bridge !== null && !_bridge.shouldDisableNativeBridge()) {
     return {
-      available: true,
-      initialized: true,
+      available: false,
+      initialized: false,
       entryCount: hnswIndex?.entries.size ?? 0,
-      dimensions: hnswIndex?.dimensions ?? 384
+      dimensions: hnswIndex?.dimensions ?? 384,
+      algorithm: 'brute-force-cosine',
     };
   }
 
+  // #2356: `available` now reflects real capability (index already loaded OR
+  // @ruvector/core installed and resolvable), not merely whether the lazy
+  // singleton happens to be warm in this process. `initialized` still reports
+  // whether the in-process index is actually loaded, so callers can tell
+  // "installed but not yet loaded" apart from "loaded".
   return {
-    available: hnswIndex !== null,
+    available: hnswIndex !== null || isRuvectorCoreResolvable(),
     initialized: hnswIndex?.initialized ?? false,
     entryCount: hnswIndex?.entries.size ?? 0,
-    dimensions: hnswIndex?.dimensions ?? 384
+    dimensions: hnswIndex?.dimensions ?? 384,
+    algorithm: 'hnsw',
   };
 }
 
@@ -973,7 +1298,7 @@ export function flashAttentionSearch(
 /**
  * Initial metadata to insert after schema creation
  */
-export function getInitialMetadata(backend: string): string {
+export function getInitialMetadata(backend: string, dimension: number = DEFAULT_EMBEDDING_DIMENSION): string {
   return `
 INSERT OR REPLACE INTO metadata (key, value) VALUES
   ('schema_version', '3.0.0'),
@@ -985,13 +1310,13 @@ INSERT OR REPLACE INTO metadata (key, value) VALUES
   ('temporal_decay', 'enabled'),
   ('hnsw_indexing', 'enabled');
 
--- Create default vector index configuration. Dimension matches the default
--- ONNX embedding model (Xenova/all-MiniLM-L6-v2, 384-dim); HNSW rejects
--- inserts whose dim does not match this row, so a 768 here breaks every
--- memory_store --vector and memory_search on a fresh install (#1947).
+-- Create default vector index configuration. Dimension matches the
+-- configured embedding model (#2305; default Xenova/all-MiniLM-L6-v2,
+-- 384-dim); HNSW rejects inserts whose dim does not match this row, so a
+-- mismatch here breaks every memory_store --vector and memory_search (#1947).
 INSERT OR IGNORE INTO vector_indexes (id, name, dimensions) VALUES
-  ('default', 'default', 384),
-  ('patterns', 'patterns', 384);
+  ('default', 'default', ${dimension}),
+  ('patterns', 'patterns', ${dimension});
 `;
 }
 
@@ -1030,7 +1355,7 @@ export interface MemoryInitResult {
  * Ensure memory_entries table has all required columns
  * Adds missing columns for older databases (e.g., 'content' column)
  */
-export async function ensureSchemaColumns(dbPath: string): Promise<{
+export async function ensureSchemaColumns(dbPath: string, options: { encryptWrites?: boolean } = {}): Promise<{
   success: boolean;
   columnsAdded: string[];
   error?: string;
@@ -1042,56 +1367,87 @@ export async function ensureSchemaColumns(dbPath: string): Promise<{
       return { success: true, columnsAdded: [] };
     }
 
-    const initSqlJs = (await import('sql.js')).default;
-    const SQL = await initSqlJs();
+    // #2878: the ALTER/backfill below is a whole-image read-modify-write like
+    // every other mutator here. Reentrant, so the callers that run this from
+    // inside their own critical section don't self-deadlock.
+    return await withMemoryDbLock(dbPath, async () => {
+      const initSqlJs = (await import('sql.js')).default;
+      const SQL = await initSqlJs();
 
-    const fileBuffer = readFileMaybeEncrypted(dbPath, null);
-    const db = new SQL.Database(fileBuffer);
+      const fileBuffer = readFileMaybeEncrypted(dbPath, null);
+      const db = new SQL.Database(fileBuffer);
 
-    // Get current columns in memory_entries
-    const tableInfo = db.exec("PRAGMA table_info(memory_entries)");
-    const existingColumns = new Set(
-      tableInfo[0]?.values?.map(row => row[1] as string) || []
-    );
+      // Get current columns in memory_entries
+      const tableInfo = db.exec("PRAGMA table_info(memory_entries)");
+      const existingColumns = new Set(
+        tableInfo[0]?.values?.map(row => row[1] as string) || []
+      );
 
-    // Required columns that may be missing in older schemas
-    // Issue #977: 'type' column was missing from this list, causing store failures on older DBs
-    const requiredColumns: Array<{ name: string; definition: string }> = [
-      { name: 'content', definition: "content TEXT DEFAULT ''" },
-      { name: 'type', definition: "type TEXT DEFAULT 'semantic'" },
-      { name: 'embedding', definition: 'embedding TEXT' },
-      { name: 'embedding_model', definition: "embedding_model TEXT DEFAULT 'local'" },
-      { name: 'embedding_dimensions', definition: 'embedding_dimensions INTEGER' },
-      { name: 'tags', definition: 'tags TEXT' },
-      { name: 'metadata', definition: 'metadata TEXT' },
-      { name: 'owner_id', definition: 'owner_id TEXT' },
-      { name: 'expires_at', definition: 'expires_at INTEGER' },
-      { name: 'last_accessed_at', definition: 'last_accessed_at INTEGER' },
-      { name: 'access_count', definition: 'access_count INTEGER DEFAULT 0' },
-      { name: 'status', definition: "status TEXT DEFAULT 'active'" }
-    ];
+      // Required columns that may be missing in older schemas
+      // Issue #977: 'type' column was missing from this list, causing store failures on older DBs
+      const requiredColumns: Array<{ name: string; definition: string }> = [
+        { name: 'content', definition: "content TEXT DEFAULT ''" },
+        { name: 'type', definition: "type TEXT DEFAULT 'semantic'" },
+        { name: 'embedding', definition: 'embedding TEXT' },
+        { name: 'embedding_model', definition: "embedding_model TEXT DEFAULT 'local'" },
+        { name: 'embedding_dimensions', definition: 'embedding_dimensions INTEGER' },
+        { name: 'tags', definition: 'tags TEXT' },
+        { name: 'metadata', definition: 'metadata TEXT' },
+        { name: 'owner_id', definition: 'owner_id TEXT' },
+        { name: 'expires_at', definition: 'expires_at INTEGER' },
+        { name: 'last_accessed_at', definition: 'last_accessed_at INTEGER' },
+        { name: 'access_count', definition: 'access_count INTEGER DEFAULT 0' },
+        { name: 'status', definition: "status TEXT DEFAULT 'active'" },
+        // ADR-323: older DBs predate provenance typing entirely — backfilled
+        // as 'unknown' via the DEFAULT, same convention as 'type'/'status'
+        // above (no CHECK on the ALTER; enforcement happens in storeEntry()/
+        // bridgeStoreEntry() so an invalid value gets a CLI-friendly error
+        // instead of a raw SQLite constraint failure).
+        { name: 'provenance_type', definition: "provenance_type TEXT DEFAULT 'unknown'" }
+      ];
 
-    let modified = false;
-    for (const col of requiredColumns) {
-      if (!existingColumns.has(col.name)) {
-        try {
-          db.run(`ALTER TABLE memory_entries ADD COLUMN ${col.definition}`);
-          columnsAdded.push(col.name);
-          modified = true;
-        } catch (e) {
-          // Column might already exist or other error - continue
+      let modified = false;
+      for (const col of requiredColumns) {
+        if (!existingColumns.has(col.name)) {
+          try {
+            db.run(`ALTER TABLE memory_entries ADD COLUMN ${col.definition}`);
+            columnsAdded.push(col.name);
+            modified = true;
+          } catch (e) {
+            // Column might already exist or other error - continue
+          }
         }
       }
-    }
 
-    if (modified) {
-      // Save updated database
-      const data = db.export();
-      writeFileRestricted(dbPath, Buffer.from(data), { encrypt: true });
-    }
+      // #2120 — Belt-and-suspenders backfill. `ALTER TABLE ADD COLUMN
+      // status TEXT DEFAULT 'active'` should populate existing rows with
+      // 'active' in modern SQLite, but: (a) some auto-memory bridge writes
+      // happen via INSERT paths that pass an explicit NULL, (b) some
+      // historical sql.js builds skipped the DEFAULT backfill, (c)
+      // entries can be migrated in from older snapshots. After ensuring
+      // the column exists, force-backfill any remaining NULL → 'active'.
+      // Safe on already-correct DBs (0 rows updated).
+      if (columnsAdded.includes('status') || existingColumns.has('status')) {
+        try {
+          db.run(`UPDATE memory_entries SET status = 'active' WHERE status IS NULL`);
+          // #3918: only a backfill that changed rows dirties the image. Setting
+          // this unconditionally rewrote every up-to-date store on each open (and,
+          // with encryption at rest, with a fresh nonce, so the bytes changed too).
+          if (db.getRowsModified() > 0) modified = true;
+        } catch {
+          /* table is read-only or doesn't exist — skip */
+        }
+      }
 
-    db.close();
-    return { success: true, columnsAdded };
+      if (modified) {
+        // Save updated database
+        const data = db.export();
+        writeDbImagePreservingFormat(dbPath, data, { encrypt: options.encryptWrites ?? true });
+      }
+
+      db.close();
+      return { success: true, columnsAdded };
+    });
   } catch (error) {
     return {
       success: false,
@@ -1167,14 +1523,33 @@ export async function checkAndMigrateLegacy(options: {
  * (ReasoningBank, SkillLibrary, ExplainableRecall, etc.) are instantiated.
  *
  * Uses the memory-bridge's getControllerRegistry() which lazily creates
- * a singleton ControllerRegistry and initializes it with the given dbPath.
- * After this call, all enabled controllers are ready for immediate use.
+ * a singleton ControllerRegistry. Deliberately called with NO dbPath so the
+ * bridge resolves its own dedicated file via `getAgentDbPath()` — the same
+ * resolution every other bridge call (bridgeStoreEntry, bridgeGetEntry, ...)
+ * uses when it omits `dbPath`. After this call, all enabled controllers are
+ * ready for immediate use.
  *
- * Failures are isolated: if @claude-flow/memory or agentdb is not installed,
- * this returns an empty result without throwing.
+ * #3155: this used to be called with the sql.js-facing `memory.db` path
+ * (the one just written by the block above, via `resolveDbPath()`), which
+ * seeded the process-wide ControllerRegistry singleton with THAT file as
+ * AgentDB's native better-sqlite3 database — instead of the dedicated
+ * `agentdb-memory.db` sibling `getAgentDbPath()` exists specifically to
+ * provide (#2786, so native better-sqlite3 doesn't hit a possibly-encrypted
+ * `memory.db`). Because `initializeMemoryDatabase()` only reaches this call
+ * on a database's FIRST-EVER init (the `#1791.6` already-exists branch above
+ * returns early without activating anything), a bridge started against a
+ * brand-new `.swarm/` directory would activate the registry against
+ * `memory.db`, store/retrieve correctly for that process's lifetime, and
+ * then a SUBSEQUENT process — where `.swarm/memory.db` already exists so
+ * this init path is skipped — would have its first bridge call activate the
+ * registry against `agentdb-memory.db` instead (via the `dbPath ||
+ * getAgentDbPath()` fallback in memory-bridge.ts's `getRegistry()`), an
+ * empty file that never received the earlier writes. Restarting the bridge
+ * therefore silently lost read access to everything it had written, with no
+ * error anywhere. Passing no dbPath here makes both code paths agree on
+ * `agentdb-memory.db` every time, regardless of init history.
  */
 async function activateControllerRegistry(
-  dbPath: string,
   verbose?: boolean,
 ): Promise<{ activated: string[]; failed: string[]; initTimeMs: number }> {
   const startTime = performance.now();
@@ -1187,14 +1562,13 @@ async function activateControllerRegistry(
       return { activated, failed, initTimeMs: performance.now() - startTime };
     }
 
-    const registry = await bridge.getControllerRegistry(dbPath);
-    if (!registry) {
+    const controllers = await bridge.bridgeListControllers();
+    if (!controllers) {
       return { activated, failed, initTimeMs: performance.now() - startTime };
     }
 
     // Collect controller status from the registry
-    if (typeof registry.listControllers === 'function') {
-      const controllers = registry.listControllers();
+    if (controllers) {
       for (const ctrl of controllers) {
         if (ctrl.enabled) {
           activated.push(ctrl.name);
@@ -1215,6 +1589,326 @@ async function activateControllerRegistry(
 }
 
 /**
+ * Self-heal an EXISTING memory database that is missing the `vector_indexes`
+ * table or per-namespace rows.
+ *
+ * Why this exists: fresh installs create `vector_indexes` + seed rows, but a
+ * DB written by an older CLI or by agentdb directly may have thousands of
+ * embedded rows in `memory_entries` and NO `vector_indexes` table at all.
+ * Two things break as a result:
+ *   1. The statusline's vector count read collapsed to `0` (the count query
+ *      referenced the missing table and failed whole — now split, but the
+ *      HNSW flag still needs the table).
+ *   2. #1941 — `memory_search` routes per namespace via `vector_indexes`; a
+ *      namespace with no row returns 0 results even when entries exist.
+ *
+ * This is idempotent and conservative:
+ *   - Does NOTHING (no writes) when the table already exists and every embedded
+ *     namespace already has a row — the common already-healed path, hit on
+ *     every MCP start, must not write to the live DB unnecessarily.
+ *   - Before ANY write, runs `PRAGMA quick_check`; if the DB reports structural
+ *     corruption it SKIPS the repair entirely (returns `corrupt:true`) rather
+ *     than writing into a malformed btree and risking making it worse. The
+ *     caller/user should recover via `sqlite3 old.db .recover | sqlite3 new.db`.
+ *   - Does NOT checkpoint. mode=ro readers already see committed WAL frames, and
+ *     forcing a checkpoint on a DB with a torn WAL could persist latent damage.
+ *
+ * When a repair IS needed and the DB is healthy: creates the table if absent,
+ * seeds the fresh-install default rows, and backfills an accurate
+ * `total_vectors` per namespace. Runs on the existing-DB path of
+ * `initializeMemoryDatabase` (MCP start / `memory init`) and from `ruflo init`.
+ *
+ * Uses better-sqlite3 (WAL-safe, native). If the native module is unavailable
+ * it is a silent no-op — the split statusline query already prevents the count
+ * from zeroing; only the HNSW flag and namespace routing stay degraded.
+ */
+/**
+ * Auto-recover a structurally-corrupt memory DB into a clean one, universally
+ * (better-sqlite3 only — no dependency on the external `sqlite3` CLI, which is
+ * absent on many npx hosts). Safe by construction:
+ *   1. Confirms corruption (quick_check) — no-op on a healthy DB.
+ *   2. Acquires an EXCLUSIVE lock (BEGIN IMMEDIATE). If another process is
+ *      writing, it SKIPS (returns reason:'writer-active') rather than racing a
+ *      writer and losing its in-flight writes — the mistake that must not recur.
+ *   3. Rebuilds a fresh DB table-by-table (schema + rows), skipping any single
+ *      table whose pages won't scan so one bad table can't abort the whole
+ *      rebuild.
+ *   4. VERIFIES the rebuild (integrity_check == ok AND recovered
+ *      memory_entries count >= the readable source count) BEFORE touching the
+ *      original.
+ *   5. Backs up the corrupt DB to `<db>.corrupt-<ts>.bak`, then atomically
+ *      renames the verified rebuild into place and drops stale -wal/-shm.
+ * On any failure the original + backup are left intact — never destructive.
+ */
+export async function recoverMemoryDatabase(
+  dbPath: string,
+  opts: { verbose?: boolean } = {},
+): Promise<{ recovered: boolean; backupPath?: string; rows?: number; reason?: string; restoredFromBackup?: boolean; from?: string; restoreReason?: string }> {
+  if (!dbPath || !fs.existsSync(dbPath)) return { recovered: false, reason: 'no-db' };
+
+  // Fallback for when the in-place rebuild can't produce a verified DB (issue
+  // #2584): rebuild-from-corrupt salvages nothing when the damage is total, so
+  // restore the newest integrity-ok backup instead of leaving the store dead.
+  const restoreFromBackup = async (reason: string) => {
+    const r = await restoreMemoryDbFromBackup(dbPath, { verbose: opts.verbose });
+    if (r.restored) {
+      return { recovered: true, restoredFromBackup: true, backupPath: r.corruptBackupPath, rows: r.rows, from: r.from };
+    }
+    return { recovered: false, reason, restoreReason: r.skipped };
+  };
+
+  let Database: any;
+  try {
+    // Module name behind a variable so TS does not statically resolve the
+    // optional native dep's types at build time (CI may not install them).
+    // #3693: same better-sqlite3 identity as AgentDB (see shared-sqlite.ts).
+    Database = await loadBetterSqlite3();
+  } catch {
+    return await restoreFromBackup('no-native');
+  }
+
+  const ts = Date.now();
+  const tmpPath = `${dbPath}.recovering-${ts}`;
+  const bakPath = `${dbPath}.corrupt-${ts}.bak`;
+  let src: any;
+  let dst: any;
+
+  try {
+    src = new Database(dbPath, { timeout: 1500 });
+
+    // Confirm corruption — never rewrite a healthy DB.
+    const qc = src.prepare('PRAGMA quick_check(1)').get() as Record<string, string> | undefined;
+    const qcVal = qc ? String(Object.values(qc)[0] ?? '') : '';
+    if (qcVal.toLowerCase() === 'ok') { src.close(); return { recovered: false, reason: 'not-corrupt' }; }
+
+    // Exclusive-writer guard: acquire the write lock. If busy, another process
+    // is writing — do NOT race it. Reading within this txn is still allowed.
+    try {
+      src.exec('BEGIN IMMEDIATE');
+    } catch {
+      src.close();
+      return { recovered: false, reason: 'writer-active' };
+    }
+
+    let srcRows = 0;
+    try { srcRows = (src.prepare('SELECT COUNT(*) AS c FROM memory_entries').get() as { c: number })?.c ?? 0; } catch { /* unreadable */ }
+
+    try { fs.rmSync(tmpPath, { force: true }); } catch { /* fresh */ }
+    dst = new Database(tmpPath);
+
+    // Copy schema: tables first (so data can be inserted), then indexes/triggers.
+    const objects = src
+      .prepare("SELECT type, name, sql FROM sqlite_master WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%'")
+      .all() as Array<{ type: string; name: string; sql: string }>;
+    const tables = objects.filter(o => o.type === 'table');
+    const others = objects.filter(o => o.type !== 'table');
+
+    for (const t of tables) {
+      try { dst.exec(t.sql); } catch { /* skip an untranslatable table def */ }
+    }
+
+    // Copy rows table-by-table; a table whose pages won't scan is skipped whole.
+    let copiedEntries = 0;
+    for (const t of tables) {
+      try {
+        const cols = (dst.prepare(`PRAGMA table_info("${t.name}")`).all() as Array<{ name: string }>).map(c => c.name);
+        if (!cols.length) continue;
+        const colList = cols.map(c => `"${c}"`).join(',');
+        const placeholders = cols.map(() => '?').join(',');
+        const insert = dst.prepare(`INSERT OR IGNORE INTO "${t.name}" (${colList}) VALUES (${placeholders})`);
+        const rows = src.prepare(`SELECT ${colList} FROM "${t.name}"`).all() as Array<Record<string, unknown>>;
+        const runAll = dst.transaction((rs: Array<Record<string, unknown>>) => {
+          for (const r of rs) insert.run(cols.map(c => r[c] as any));
+        });
+        runAll(rows);
+        if (t.name === 'memory_entries') copiedEntries = rows.length;
+      } catch { /* skip a table whose data pages are unreadable */ }
+    }
+
+    for (const o of others) {
+      try { dst.exec(o.sql); } catch { /* an index over corrupt data — non-fatal */ }
+    }
+
+    dst.close(); dst = null;
+    try { src.exec('ROLLBACK'); } catch { /* ignore */ }
+    src.close(); src = null;
+
+    // Verify BEFORE touching the original.
+    const check = new Database(tmpPath, { readonly: true });
+    const integ = String(check.pragma('integrity_check', { simple: true }) ?? '');
+    let dstRows = 0;
+    try { dstRows = (check.prepare('SELECT COUNT(*) AS c FROM memory_entries').get() as { c: number })?.c ?? 0; } catch { /* */ }
+    check.close();
+
+    if (integ.toLowerCase() !== 'ok' || dstRows < srcRows) {
+      try { fs.rmSync(tmpPath, { force: true }); } catch { /* */ }
+      if (opts.verbose) {
+        console.log(`memory DB rebuild-in-place failed (integrity=${integ}, rows ${dstRows}/${srcRows}) — trying newest good backup`);
+      }
+      return await restoreFromBackup('verify-failed');
+    }
+
+    // Back up the corrupt DB, then atomically swap in the verified rebuild.
+    fs.copyFileSync(dbPath, bakPath);
+    fs.renameSync(tmpPath, dbPath);
+    for (const s of ['-wal', '-shm']) { try { fs.rmSync(`${dbPath}${s}`, { force: true }); } catch { /* */ } }
+
+    if (opts.verbose) {
+      console.log(`memory DB auto-recovered: ${dstRows} rows, integrity ok. Corrupt original saved to ${bakPath}`);
+    }
+    return { recovered: true, backupPath: bakPath, rows: dstRows };
+  } catch (e) {
+    try { dst?.close(); } catch { /* */ }
+    try { src?.exec('ROLLBACK'); } catch { /* */ }
+    try { src?.close(); } catch { /* */ }
+    try { fs.rmSync(tmpPath, { force: true }); } catch { /* */ }
+    if (opts.verbose) console.log(`memory DB rebuild-in-place error (${(e as Error)?.message ?? e}) — trying newest good backup`);
+    return await restoreFromBackup('error');
+  }
+}
+
+export async function repairVectorIndexes(
+  dbPath: string,
+  opts: { verbose?: boolean; autoRecover?: boolean } = {},
+): Promise<{ repaired: boolean; tableCreated: boolean; namespaces: string[]; corrupt?: boolean; recovered?: boolean; backupPath?: string }> {
+  const res = { repaired: false, tableCreated: false, namespaces: [] as string[], corrupt: false };
+  if (!dbPath || !fs.existsSync(dbPath)) return res;
+
+  let Database: any;
+  try {
+    // Module name behind a variable so TS does not statically resolve the
+    // optional native dep's types at build time (CI may not install them).
+    // #3693: same better-sqlite3 identity as AgentDB (see shared-sqlite.ts).
+    Database = await loadBetterSqlite3();
+  } catch {
+    // Native module absent (e.g. WASM-only host). Statusline fix still covers
+    // the display; nothing to repair here.
+    return res;
+  }
+
+  let db: any;
+  try {
+    db = new Database(dbPath, { timeout: 3000 });
+
+    const tableExists = (name: string): boolean =>
+      (db.prepare("SELECT COUNT(*) AS c FROM sqlite_master WHERE type='table' AND name=?").get(name)?.c ?? 0) > 0;
+
+    // Nothing to key off if there is no entries table.
+    if (!tableExists('memory_entries')) { db.close(); return res; }
+
+    const hasVectorIndexes = tableExists('vector_indexes');
+
+    // Namespaces that actually have embeddings.
+    const nsRows = db
+      .prepare(
+        "SELECT COALESCE(namespace, 'default') AS ns, COUNT(*) AS c " +
+        'FROM memory_entries WHERE embedding IS NOT NULL GROUP BY ns',
+      )
+      .all() as Array<{ ns: string; c: number }>;
+
+    // Which of those are already present in vector_indexes? If the table exists
+    // and every embedded namespace already has a row, the DB is already healed
+    // — return WITHOUT writing anything (common path on every MCP start).
+    let needsWrite = !hasVectorIndexes;
+    if (hasVectorIndexes) {
+      const present = new Set(
+        (db.prepare('SELECT name FROM vector_indexes').all() as Array<{ name: string }>).map(r => r.name),
+      );
+      needsWrite = nsRows.some(r => !present.has(String(r.ns || 'default')));
+    }
+    if (!needsWrite) { db.close(); return res; }
+
+    // A write is needed. GUARD: never write into a structurally corrupt DB —
+    // that risks worsening the damage. quick_check is cheaper than a full
+    // integrity_check and only runs on the rare repair path, not every start.
+    const qc = db.prepare('PRAGMA quick_check(1)').get() as Record<string, string> | undefined;
+    const qcVal = qc ? String(Object.values(qc)[0] ?? '') : '';
+    if (qcVal.toLowerCase() !== 'ok') {
+      res.corrupt = true;
+      db.close(); // release our handle before recovery may swap the file
+      if (opts.autoRecover) {
+        // Auto-fix: rebuild the corrupt DB (backup + verify + atomic swap), then
+        // provision vector_indexes on the clean rebuild. This is what makes any
+        // npx-deployed ruflo self-repair a corrupt memory DB on init / MCP start.
+        const rec = await recoverMemoryDatabase(dbPath, { verbose: opts.verbose });
+        if (rec.recovered) {
+          const healed = await repairVectorIndexes(dbPath, { verbose: opts.verbose });
+          return { ...healed, corrupt: true, recovered: true, backupPath: rec.backupPath };
+        }
+        if (opts.verbose) {
+          console.log(`vector_indexes repair skipped — corruption (${qcVal}); auto-recovery not run (${rec.reason ?? 'unknown'})`);
+        }
+      } else if (opts.verbose) {
+        console.log(
+          'vector_indexes repair SKIPPED — memory DB reports corruption (' + qcVal + '). ' +
+          'Recover with:  sqlite3 <db> .recover | sqlite3 <db>.recovered',
+        );
+      }
+      return res;
+    }
+
+    if (!hasVectorIndexes) {
+      db.exec(`CREATE TABLE IF NOT EXISTS vector_indexes (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL UNIQUE,
+        dimensions INTEGER NOT NULL,
+        metric TEXT DEFAULT 'cosine' CHECK(metric IN ('cosine', 'euclidean', 'dot')),
+        hnsw_m INTEGER DEFAULT 16,
+        hnsw_ef_construction INTEGER DEFAULT 200,
+        hnsw_ef_search INTEGER DEFAULT 100,
+        quantization_type TEXT CHECK(quantization_type IN ('none', 'scalar', 'product')),
+        quantization_bits INTEGER DEFAULT 8,
+        total_vectors INTEGER DEFAULT 0,
+        last_rebuild_at INTEGER,
+        created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now') * 1000),
+        updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now') * 1000)
+      )`);
+      res.tableCreated = true;
+    }
+
+    // 384 = default ONNX model dim (Xenova/all-MiniLM-L6-v2); HNSW rejects
+    // dim-mismatched inserts, so this must match the stored embeddings (#1947).
+    const ensureRow = db.prepare(
+      'INSERT OR IGNORE INTO vector_indexes (id, name, dimensions) VALUES (?, ?, 384)',
+    );
+    const setCount = db.prepare(
+      'UPDATE vector_indexes SET total_vectors = ?, updated_at = ? WHERE name = ?',
+    );
+
+    const backfill = db.transaction(() => {
+      // Parity with a fresh install's seed rows.
+      ensureRow.run('default', 'default');
+      ensureRow.run('patterns', 'patterns');
+
+      const now = Date.now();
+      for (const r of nsRows) {
+        const ns = String(r.ns || 'default');
+        ensureRow.run(ns, ns);
+        setCount.run(r.c, now, ns);
+        res.namespaces.push(ns);
+      }
+    });
+    backfill();
+
+    res.repaired = res.tableCreated || res.namespaces.length > 0;
+    db.close();
+
+    if (opts.verbose && res.repaired) {
+      console.log(
+        `vector_indexes ${res.tableCreated ? 'created' : 'refreshed'} — ` +
+        `backfilled ${res.namespaces.length} namespace(s)`,
+      );
+    }
+  } catch (e) {
+    try { db?.close(); } catch { /* already closed */ }
+    if (opts.verbose) {
+      console.log(`vector_indexes repair skipped: ${(e as Error)?.message ?? e}`);
+    }
+  }
+  return res;
+}
+
+/**
  * Initialize the memory database properly using sql.js
  */
 export async function initializeMemoryDatabase(options: {
@@ -1232,8 +1926,7 @@ export async function initializeMemoryDatabase(options: {
     migrate = true
   } = options;
 
-  const swarmDir = getMemoryRoot();
-  const dbPath = customPath || path.join(swarmDir, 'memory.db');
+  const dbPath = resolveDbPath(customPath);
   const dbDir = path.dirname(dbPath);
 
   try {
@@ -1258,19 +1951,24 @@ export async function initializeMemoryDatabase(options: {
     // surfaced an `[ERROR]` and a "Initialization failed" spinner even when
     // the existing DB was perfectly healthy.
     if (fs.existsSync(dbPath) && !force) {
+      // #2568-followup: an existing DB may predate `vector_indexes` (or was
+      // written by agentdb directly). Self-heal it here — this branch is hit on
+      // every MCP-server start and `memory init`, so any ruflo repairs itself.
+      // Idempotent + best-effort; never turns a healthy re-init into a failure.
+      const heal = await repairVectorIndexes(dbPath, { verbose, autoRecover: true });
       return {
         success: true,
         alreadyExists: true,
         backend,
         dbPath,
         schemaVersion: '3.0.0',
-        tablesCreated: [],
+        tablesCreated: heal.tableCreated ? ['vector_indexes'] : [],
         indexesCreated: [],
         features: {
           vectorEmbeddings: false,
           patternLearning: false,
           temporalDecay: false,
-          hnswIndexing: false,
+          hnswIndexing: heal.repaired,
           migrationTracking: false
         }
       };
@@ -1288,6 +1986,8 @@ export async function initializeMemoryDatabase(options: {
       // Load existing database or create new
       if (fs.existsSync(dbPath) && force) {
         fs.unlinkSync(dbPath);
+        // #2305: the recorded dimension of the deleted store no longer binds.
+        _resetEmbeddingConfigCache();
       }
 
       db = new SQL.Database();
@@ -1304,7 +2004,7 @@ export async function initializeMemoryDatabase(options: {
       db.run(MEMORY_SCHEMA_V3);
 
       // Insert initial metadata
-      db.run(getInitialMetadata(backend));
+      db.run(getInitialMetadata(backend, resolveEmbeddingConfig(process.cwd()).dimension));
 
       // Save to file
       const data = db.export();
@@ -1316,11 +2016,11 @@ export async function initializeMemoryDatabase(options: {
 
       // Also create schema file for reference
       const schemaPath = path.join(dbDir, 'schema.sql');
-      fs.writeFileSync(schemaPath, MEMORY_SCHEMA_V3 + '\n' + getInitialMetadata(backend));
+      fs.writeFileSync(schemaPath, MEMORY_SCHEMA_V3 + '\n' + getInitialMetadata(backend, resolveEmbeddingConfig(process.cwd()).dimension));
 
       // ADR-053: Activate ControllerRegistry so controllers (ReasoningBank,
       // SkillLibrary, ExplainableRecall, etc.) are instantiated during init
-      const controllerResult = await activateControllerRegistry(dbPath, verbose);
+      const controllerResult = await activateControllerRegistry(verbose);
 
       return {
         success: true,
@@ -1365,7 +2065,7 @@ export async function initializeMemoryDatabase(options: {
     } else {
       // Fall back to schema file approach
       const schemaPath = path.join(dbDir, 'schema.sql');
-      fs.writeFileSync(schemaPath, MEMORY_SCHEMA_V3 + '\n' + getInitialMetadata(backend));
+      fs.writeFileSync(schemaPath, MEMORY_SCHEMA_V3 + '\n' + getInitialMetadata(backend, resolveEmbeddingConfig(process.cwd()).dimension));
 
       // Create minimal valid SQLite file
       const sqliteHeader = Buffer.alloc(4096, 0);
@@ -1383,7 +2083,7 @@ export async function initializeMemoryDatabase(options: {
       writeFileRestricted(dbPath, sqliteHeader, { encrypt: true });
 
       // ADR-053: Activate ControllerRegistry even on fallback path
-      const controllerResult = await activateControllerRegistry(dbPath, verbose);
+      const controllerResult = await activateControllerRegistry(verbose);
 
       return {
         success: true,
@@ -1453,13 +2153,17 @@ export async function checkMemoryInitialization(dbPath?: string): Promise<{
     return { initialized: false };
   }
 
+  // #3249: declared outside the try so the handle can be released on the
+  // failure path as well as the success path.
+  let db: any;
+
   try {
     // Try to load with sql.js
     const initSqlJs = (await import('sql.js')).default;
     const SQL = await initSqlJs();
 
-    const fileBuffer = fs.readFileSync(path_);
-    const db = new SQL.Database(fileBuffer);
+    const fileBuffer = readFileMaybeEncrypted(path_, null);
+    db = new SQL.Database(fileBuffer);
 
     // Check for metadata table
     const tables = db.exec("SELECT name FROM sqlite_master WHERE type='table'");
@@ -1478,8 +2182,6 @@ export async function checkMemoryInitialization(dbPath?: string): Promise<{
       // Metadata table might not exist
     }
 
-    db.close();
-
     return {
       initialized: true,
       version,
@@ -1494,6 +2196,19 @@ export async function checkMemoryInitialization(dbPath?: string): Promise<{
   } catch {
     // Could not read database
     return { initialized: false };
+  } finally {
+    // #3249: release the handle on every path. An RFE1-encrypted image is not
+    // parseable as SQLite, so the schema query above throws and the catch
+    // returns — which used to skip the inline db.close() entirely, leaving the
+    // sql.js Database and its MEMFS copy open for the life of the process.
+    // Every memory MCP tool call runs this check, so a long session accumulates
+    // one unclosed handle per call. Measured retention is a few hundred KiB per
+    // leaked handle (it does not scale with image size).
+    try {
+      db?.close();
+    } catch {
+      // Already closed, or never successfully constructed.
+    }
   }
 }
 
@@ -1510,37 +2225,41 @@ export async function applyTemporalDecay(dbPath?: string): Promise<{
   const path_ = dbPath || path.join(swarmDir, 'memory.db');
 
   try {
-    const initSqlJs = (await import('sql.js')).default;
-    const SQL = await initSqlJs();
+    // #2878: decays `patterns` but rewrites the whole memory.db image, so it
+    // races the memory_entries writers over the same file.
+    return await withMemoryDbLock(path_, async () => {
+      const initSqlJs = (await import('sql.js')).default;
+      const SQL = await initSqlJs();
 
-    const fileBuffer = fs.readFileSync(path_);
-    const db = new SQL.Database(fileBuffer);
+      const fileBuffer = readFileMaybeEncrypted(path_, null);
+      const db = new SQL.Database(fileBuffer);
 
-    // Apply decay: confidence *= exp(-decay_rate * days_since_last_use)
-    const now = Date.now();
-    const decayQuery = `
-      UPDATE patterns
-      SET
-        confidence = confidence * (1.0 - decay_rate * ((? - COALESCE(last_matched_at, created_at)) / 86400000.0)),
-        updated_at = ?
-      WHERE status = 'active'
-        AND confidence > 0.1
-        AND (? - COALESCE(last_matched_at, created_at)) > 86400000
-    `;
+      // Apply decay: confidence *= exp(-decay_rate * days_since_last_use)
+      const now = Date.now();
+      const decayQuery = `
+        UPDATE patterns
+        SET
+          confidence = confidence * (1.0 - decay_rate * ((? - COALESCE(last_matched_at, created_at)) / 86400000.0)),
+          updated_at = ?
+        WHERE status = 'active'
+          AND confidence > 0.1
+          AND (? - COALESCE(last_matched_at, created_at)) > 86400000
+      `;
 
-    db.run(decayQuery, [now, now, now]);
+      db.run(decayQuery, [now, now, now]);
 
-    const changes = db.getRowsModified();
+      const changes = db.getRowsModified();
 
-    // Save
-    const data = db.export();
-    fs.writeFileSync(path_, Buffer.from(data));
-    db.close();
+      // Save (atomic — issue #2584: a torn full-image flush corrupts the store)
+      const data = db.export();
+      writeDbImagePreservingFormat(path_, data);
+      db.close();
 
-    return {
-      success: true,
-      patternsDecayed: changes
-    };
+      return {
+        success: true,
+        patternsDecayed: changes
+      };
+    });
   } catch (error) {
     return {
       success: false,
@@ -1559,9 +2278,32 @@ interface EmbeddingModel {
   model: unknown;
   tokenizer: unknown;
   dimensions: number;
+  /** Which model produced the vectors (ADR-527 checks it against the agent centroids). */
+  modelId?: string;
+  /**
+   * ADR-454: distinguishes a hash-fallback state that's legitimately
+   * permanent (no transformers package importable at all) from one caused
+   * by an environmental/fixable failure (EACCES, ENOSPC, a transient
+   * download failure) that should be retried rather than memoized forever.
+   */
+  degradedReason?: 'permanent' | 'retryable';
+  lastAttemptAt?: number;
 }
 
+/** ADR-454: minimum interval before a 'retryable' degraded state re-attempts real init. */
+const MODEL_INIT_RETRY_INTERVAL_MS = 60_000;
+
+/**
+ * State of the LOCAL embedding chain only (transformers.js / agentic-flow /
+ * ruvector ONNX / hash). #3375: the AgentDB bridge's result is cached
+ * separately in `bridgeEmbeddingInfo` and must never be written here — it used
+ * to be recorded as `{ loaded: true, model: null }`, which made
+ * generateLocalEmbedding() skip loading any local model and always return the
+ * hash fallback, so rescueAgentdbEmbedder()'s `backend === 'onnx'` probe could
+ * never pass.
+ */
 let embeddingModelState: EmbeddingModel | null = null;
+let bridgeEmbeddingInfo: { dimensions: number } | null = null;
 
 /**
  * Lazy load ONNX embedding model
@@ -1581,10 +2323,11 @@ export async function loadEmbeddingModel(options?: {
   const startTime = Date.now();
 
   // Already loaded
-  if (embeddingModelState?.loaded) {
+  const cached = bridgeEmbeddingInfo ?? (embeddingModelState?.loaded ? embeddingModelState : null);
+  if (cached) {
     return {
       success: true,
-      dimensions: embeddingModelState.dimensions,
+      dimensions: cached.dimensions,
       modelName: 'cached',
       loadTime: 0
     };
@@ -1595,16 +2338,55 @@ export async function loadEmbeddingModel(options?: {
   if (bridge) {
     const bridgeResult = await bridge.bridgeLoadEmbeddingModel();
     if (bridgeResult && bridgeResult.success) {
-      // Mark local state as loaded too so subsequent calls use cache
-      embeddingModelState = {
-        loaded: true,
-        model: null, // Bridge handles embedding
-        tokenizer: null,
-        dimensions: bridgeResult.dimensions
-      };
+      // #3375: cache the bridge result on its own. Do NOT mark the local
+      // chain as loaded — the bridge's model is not callable from here.
+      bridgeEmbeddingInfo = { dimensions: bridgeResult.dimensions };
       return bridgeResult;
     }
   }
+
+  return loadLocalEmbeddingChain(verbose, startTime);
+}
+
+/**
+ * Load the LOCAL embedding chain into `embeddingModelState`, never consulting
+ * the AgentDB bridge. Used by loadEmbeddingModel() after the bridge declines,
+ * and directly by generateLocalEmbedding() so the "bridge-free" contract the
+ * #2312 comment on that function describes actually holds (#3375).
+ */
+async function loadLocalEmbeddingChain(verbose = false, startTime = Date.now()): Promise<{
+  success: boolean;
+  dimensions: number;
+  modelName: string;
+  loadTime?: number;
+  error?: string;
+}> {
+  if (embeddingModelState?.loaded) {
+    const isRetryableDue =
+      embeddingModelState.degradedReason === 'retryable' &&
+      Date.now() - (embeddingModelState.lastAttemptAt ?? 0) >= MODEL_INIT_RETRY_INTERVAL_MS;
+    if (!isRetryableDue) {
+      return { success: true, dimensions: embeddingModelState.dimensions, modelName: 'cached', loadTime: 0 };
+    }
+    // Fall through to re-attempt real initialization — the retryable
+    // failure (e.g. EACCES on the model cache dir) may now be fixed.
+  }
+
+  let sawRetryableFailure = false;
+
+  // #2305: honour `.claude-flow/embeddings.json` instead of always loading
+  // MiniLM/384 — unless the memory store already holds vectors of another
+  // dimension, in which case its recorded dimension is kept (with a warning).
+  // Both stores the memory path writes vectors to are checked, in the same
+  // order the bridge uses, so the local chain and the bridge agree.
+  const memoryDbPath = resolveDbPath();
+  const embCfg = await resolveEffectiveEmbeddingConfig({
+    root: process.cwd(),
+    dbPaths: [memoryDbPath, path.join(path.dirname(memoryDbPath), 'agentdb-memory.db')],
+  });
+  // The agentic-flow and ruvector fallbacks below bundle MiniLM only; using
+  // them for any other configured dimension would mix vector sizes.
+  const bundledMiniLmFits = embCfg.dimension === DEFAULT_EMBEDDING_DIMENSION;
 
   try {
     // ADR-094: prefer @huggingface/transformers (clears protobufjs <7.5.5
@@ -1614,6 +2396,7 @@ export async function loadEmbeddingModel(options?: {
     // @claude-flow/embeddings/src/transformers-loader.ts.
     let transformersSource: '@huggingface/transformers' | '@xenova/transformers' | null = null;
     let pipelineFn: ((task: string, model?: string) => Promise<unknown>) | null = null;
+    let transformersModule: Record<string, unknown> | null = null;
 
     {
       const tryLoad = async (specifier: string): Promise<Record<string, unknown> | null> => {
@@ -1624,54 +2407,93 @@ export async function loadEmbeddingModel(options?: {
       if (hf && typeof hf.pipeline === 'function') {
         pipelineFn = hf.pipeline as (t: string, m?: string) => Promise<unknown>;
         transformersSource = '@huggingface/transformers';
+        transformersModule = hf;
       } else {
         const xen = await tryLoad('@xenova/transformers');
         if (xen && typeof xen.pipeline === 'function') {
           pipelineFn = xen.pipeline as (t: string, m?: string) => Promise<unknown>;
           transformersSource = '@xenova/transformers';
+          transformersModule = xen;
         }
       }
     }
 
     if (pipelineFn && transformersSource) {
-      if (verbose) {
-        console.log(`Loading ONNX embedding model via ${transformersSource} (all-MiniLM-L6-v2)...`);
+      // #2461: pipelineFn() can throw with `fetch failed` on Windows behind
+      // a corporate proxy / strict firewall when transformers tries to pull
+      // the model files from the HuggingFace CDN. Without the catch, that
+      // throw escapes the outer try and aborts loadEmbeddingModel() with
+      // success=false BEFORE we reach the (working) ruvector ONNX fallback
+      // below — leaving embeddingModelState=null, which then crashes
+      // generateLocalEmbedding() with "Cannot read properties of null
+      // (reading 'model')" on every memory store / search call.
+      try {
+        if (verbose) {
+          console.log(`Loading ONNX embedding model via ${transformersSource} (${embCfg.model})...`);
+        }
+
+        // ADR-454: route model downloads to a user-writable cache dir —
+        // the package-relative default is root-owned under a system-prefix
+        // global install, which throws EACCES for the runtime user.
+        const cacheDir = resolveModelCacheDir();
+        fs.mkdirSync(cacheDir, { recursive: true });
+        const env = transformersModule?.env as { cacheDir: string } | undefined;
+        if (env) env.cacheDir = cacheDir;
+
+        const embedder = await pipelineFn('feature-extraction', embCfg.model);
+
+        embeddingModelState = {
+          loaded: true,
+          model: embedder,
+          tokenizer: null,
+          dimensions: embCfg.dimension,
+          modelId: embCfg.model,
+        };
+
+        return {
+          success: true,
+          dimensions: embCfg.dimension,
+          modelName: embCfg.model,
+          loadTime: Date.now() - startTime
+        };
+      } catch (err) {
+        // ADR-454: a real backend was importable and callable — this failure
+        // (EACCES, ENOSPC, transient network error, etc.) is environmental,
+        // not a missing dependency, so it must not be memoized permanently.
+        sawRetryableFailure = true;
+        if (verbose) {
+          console.warn(
+            `${transformersSource} pipeline init failed (${err instanceof Error ? err.message : String(err)}); ` +
+            'falling through to ruvector ONNX / agentic-flow / hash fallback.'
+          );
+        }
+        // Intentional fall-through to the next embedder branch.
       }
-      const embedder = await pipelineFn('feature-extraction', 'Xenova/all-MiniLM-L6-v2');
-
-      embeddingModelState = {
-        loaded: true,
-        model: embedder,
-        tokenizer: null,
-        dimensions: 384 // MiniLM-L6 produces 384-dim vectors
-      };
-
-      return {
-        success: true,
-        dimensions: 384,
-        modelName: 'Xenova/all-MiniLM-L6-v2',
-        loadTime: Date.now() - startTime
-      };
     }
 
     // Fallback: Check for agentic-flow ReasoningBank embeddings (v3)
     const reasoningBank = await import('agentic-flow/reasoningbank').catch(() => null);
 
-    if (reasoningBank?.computeEmbedding) {
+    if (bundledMiniLmFits && reasoningBank?.computeEmbedding) {
       if (verbose) {
         console.log('Loading agentic-flow ReasoningBank embedding model...');
       }
 
+      // #3113: register a callable, like the ruvector branch below —
+      // generateLocalEmbedding() only invokes function models. The bundled
+      // model is all-MiniLM-L6-v2 (384-dim, per agentic-flow's
+      // getEmbeddingDimensions()).
       embeddingModelState = {
         loaded: true,
-        model: { embed: reasoningBank.computeEmbedding },
+        model: (text: string) => reasoningBank.computeEmbedding(text),
         tokenizer: null,
-        dimensions: 768
+        dimensions: 384,
+        modelId: 'agentic-flow/all-MiniLM-L6-v2',
       };
 
       return {
         success: true,
-        dimensions: 768,
+        dimensions: 384,
         modelName: 'agentic-flow/reasoningbank',
         loadTime: Date.now() - startTime
       };
@@ -1692,7 +2514,7 @@ export async function loadEmbeddingModel(options?: {
         if (onnxEmb?.embed) {
           // Probe embed to trigger lazy ONNX init and verify it works
           const probe = await onnxEmb.embed('test');
-          if (probe && probe.length > 0 && (Array.isArray(probe) ? probe.some((v: number) => v !== 0) : true)) {
+          if (probe && probe.length > 0 && probe.length === embCfg.dimension && (Array.isArray(probe) ? probe.some((v: number) => v !== 0) : true)) {
             if (verbose) {
               console.log(`Loading ruvector ONNX embedder (all-MiniLM-L6-v2, ${probe.length}d)...`);
             }
@@ -1700,7 +2522,8 @@ export async function loadEmbeddingModel(options?: {
               loaded: true,
               model: (text: string) => onnxEmb.embed(text),
               tokenizer: null,
-              dimensions: probe.length || 384
+              dimensions: probe.length || 384,
+              modelId: 'ruvector/all-MiniLM-L6-v2',
             };
             return {
               success: true,
@@ -1715,35 +2538,21 @@ export async function loadEmbeddingModel(options?: {
       }
     }
 
-    // Legacy fallback: Check for agentic-flow core embeddings
-    const agenticFlow = await import('agentic-flow').catch(() => null);
+    // No agentic-flow root-entry fallback: no published root exports
+    // `embeddings`, and importing it runs its CLI main() in 3.0.0-alpha.x.
 
-    if (agenticFlow && (agenticFlow as any).embeddings) {
-      if (verbose) {
-        console.log('Loading agentic-flow embedding model...');
-      }
-
-      embeddingModelState = {
-        loaded: true,
-        model: (agenticFlow as any).embeddings,
-        tokenizer: null,
-        dimensions: 768
-      };
-
-      return {
-        success: true,
-        dimensions: 768,
-        modelName: 'agentic-flow',
-        loadTime: Date.now() - startTime
-      };
-    }
-
-    // No ONNX model available - use fallback
+    // No ONNX model available - use fallback.
+    // ADR-454: mark whether this is a permanent (no backend importable at
+    // all) or retryable (a backend existed but init failed for an
+    // environmental reason) degraded state, so a later call can re-attempt
+    // real initialization once the condition is fixed.
     embeddingModelState = {
       loaded: true,
       model: null, // Will use simple hash-based fallback
       tokenizer: null,
-      dimensions: 128 // Smaller fallback dimensions
+      dimensions: 128, // Smaller fallback dimensions
+      degradedReason: sawRetryableFailure ? 'retryable' : 'permanent',
+      lastAttemptAt: Date.now()
     };
 
     return {
@@ -1765,39 +2574,124 @@ export async function loadEmbeddingModel(options?: {
 /**
  * Generate real embedding for text
  * Uses ONNX model if available, falls back to deterministic hash
+ *
+ * AUDIT #3: the `backend` field is the authoritative signal for whether the
+ * returned vector carries real ONNX semantics ('onnx') or the deterministic
+ * hash fallback ('mock'). The hash fallback produces inverted/meaningless
+ * semantics, so operators MUST be able to tell the two apart even when the
+ * `model` string reports a real model name (e.g. the AgentDB bridge always
+ * labels its output 'Xenova/all-MiniLM-L6-v2' regardless of whether AgentDB's
+ * own embedder is real or stubbed). Set `backend` truthfully by the path that
+ * actually produced the vector. Do NOT change the embedding math.
  */
-export async function generateEmbedding(text: string): Promise<{
+export async function generateEmbedding(
+  text: string,
+  options?: { normalize?: boolean },
+): Promise<{
   embedding: number[];
   dimensions: number;
   model: string;
+  backend: 'onnx' | 'mock';
 }> {
+  // #4724: AgentDB embed() has no normalize switch and always returns a unit
+  // vector. A raw request has to use the local chain, which can skip L2.
+  if (options?.normalize === false) {
+    return generateLocalEmbedding(text, { normalize: false });
+  }
+
   // ADR-053: Try AgentDB v3 bridge first
   const bridge = await getBridge();
   if (bridge) {
     const bridgeResult = await bridge.bridgeGenerateEmbedding(text);
-    if (bridgeResult) return bridgeResult;
+    if (bridgeResult) {
+      // The bridge labels its output with a real model name unconditionally;
+      // honor the backend it reports if present, otherwise treat a real model
+      // name as ONNX (the bridge only returns when AgentDB's embedder exists).
+      const backend: 'onnx' | 'mock' =
+        (bridgeResult as { backend?: 'onnx' | 'mock' }).backend ?? 'onnx';
+      return { ...bridgeResult, backend };
+    }
   }
 
-  // Ensure model is loaded
-  if (!embeddingModelState?.loaded) {
-    await loadEmbeddingModel();
+  return generateLocalEmbedding(text);
+}
+
+/**
+ * Generate an embedding using ONLY the local model chain (transformers.js /
+ * ruvector ONNX / hash fallback) — never the AgentDB bridge.
+ *
+ * #2312: this MUST stay bridge-free. `memory-bridge.ts` rescues a degraded
+ * agentdb embedder by delegating to this module; if that delegation went
+ * through `generateEmbedding` (bridge-first), the call would re-enter the
+ * patched `agentdb.embedder.embed` and recurse unboundedly:
+ *
+ *   generateEmbedding → bridgeGenerateEmbedding → embedder.embed (patched)
+ *     → generateEmbedding → … (heap OOM at ~4 GB on CI, no stack overflow
+ *     because the cycle is async/microtask-driven)
+ *
+ * Keeping the local chain as its own export breaks that cycle structurally.
+ */
+export async function generateLocalEmbedding(
+  text: string,
+  options?: { normalize?: boolean },
+): Promise<{
+  embedding: number[];
+  dimensions: number;
+  model: string;
+  /** Model id behind an onnx vector, when known (ADR-527). */
+  modelId?: string;
+  backend: 'onnx' | 'mock';
+}> {
+  // Default true keeps the historical unit-norm embedding math.
+  const normalize = options?.normalize !== false;
+  // Ensure the LOCAL model is loaded. #3375: this must not go through
+  // loadEmbeddingModel(), which is bridge-first — when the bridge answered
+  // there, no local model was ever loaded and this function always returned
+  // the hash fallback.
+  //
+  // ADR-454: also re-attempt when the memoized state is a 'retryable'
+  // degraded fallback whose retry interval has elapsed — otherwise this
+  // guard short-circuits past loadLocalEmbeddingChain()'s own retry check
+  // and the fix (e.g. a now-writable cache dir) never gets exercised.
+  const shouldRetryLoad =
+    !embeddingModelState?.loaded ||
+    (embeddingModelState.degradedReason === 'retryable' &&
+      Date.now() - (embeddingModelState.lastAttemptAt ?? 0) >= MODEL_INIT_RETRY_INTERVAL_MS);
+  if (shouldRetryLoad) {
+    await loadLocalEmbeddingChain();
   }
 
-  const state = embeddingModelState!;
+  // #2461: loadEmbeddingModel() can leave embeddingModelState null when an
+  // earlier loader (transformers fetch, ruvector init) throws and we never
+  // reach the hash-fallback assignment. Don't lie with a `!` non-null
+  // assertion — fall back to a synthetic hash-fallback state so we degrade
+  // to the deterministic 128-dim hash embedding instead of crashing the
+  // entire memory store/search path with "reading property 'model' of null".
+  const state = embeddingModelState ?? {
+    loaded: true,
+    model: null,
+    tokenizer: null,
+    dimensions: 128,
+  };
 
   // Use ONNX model if available
   if (state.model && typeof (state.model as any) === 'function') {
     try {
-      const output = await (state.model as any)(text, { pooling: 'mean', normalize: true });
-      // Handle both @xenova/transformers (output.data) and ruvector (plain array) formats
+      const output = await (state.model as any)(text, { pooling: 'mean', normalize });
+      // Handle @xenova/transformers (output.data), ruvector (plain array) and
+      // typed-array (ReasoningBank Float32Array, #3114) formats. DataView is an
+      // ArrayBuffer view without an iterator (Array.from gives []), so exclude it.
       const embedding = output?.data
         ? Array.from(output.data as Float32Array)
-        : Array.isArray(output) ? output : null;
+        : Array.isArray(output) ? output
+        : ArrayBuffer.isView(output) && !(output instanceof DataView) ? Array.from(output as Float32Array) : null;
       if (embedding) {
         return {
           embedding,
           dimensions: embedding.length,
-          model: 'onnx'
+          model: 'onnx',
+          ...(state.modelId ? { modelId: state.modelId } : {}),
+          backend: 'onnx'
         };
       }
     } catch {
@@ -1805,12 +2699,15 @@ export async function generateEmbedding(text: string): Promise<{
     }
   }
 
-  // Deterministic hash-based fallback (for testing/demo without ONNX)
-  const embedding = generateHashEmbedding(text, state.dimensions);
+  // Deterministic hash-based fallback (for testing/demo without ONNX).
+  // AUDIT #3: backend='mock' — these vectors do NOT carry real semantics.
+  (await import('./embedding-policy.js')).enforceNoStub('memory-initializer.generateLocalEmbedding'); // "no stubs" strict mode
+  const embedding = generateHashEmbedding(text, state.dimensions, normalize);
   return {
     embedding,
     dimensions: state.dimensions,
-    model: 'hash-fallback'
+    model: 'hash-fallback',
+    backend: 'mock'
   };
 }
 
@@ -1890,7 +2787,7 @@ export async function generateBatchEmbeddings(
  * Generate deterministic hash-based embedding
  * Not semantic, but deterministic and useful for testing
  */
-function generateHashEmbedding(text: string, dimensions: number): number[] {
+function generateHashEmbedding(text: string, dimensions: number, normalize = true): number[] {
   const embedding: number[] = new Array(dimensions).fill(0);
 
   // Simple hash-based approach for reproducibility
@@ -1905,7 +2802,8 @@ function generateHashEmbedding(text: string, dimensions: number): number[] {
     }
   }
 
-  // Normalize to unit vector
+  // Normalize to unit vector unless the caller asked for the raw vector (#4724).
+  if (!normalize) return embedding;
   const magnitude = Math.sqrt(embedding.reduce((sum, v) => sum + v * v, 0)) || 1;
   return embedding.map(v => v / magnitude);
 }
@@ -2079,12 +2977,11 @@ export async function verifyMemoryInit(dbPath: string, options?: {
       });
     }
 
-    // Cleanup test entry
-    db.run(`DELETE FROM memory_entries WHERE id = ?`, [testId]);
-
-    // Save changes
-    const data = db.export();
-    writeFileRestricted(dbPath, Buffer.from(data), { encrypt: true });
+    // Verification is read-only: sql.js holds an in-memory copy; discarding it on
+    // close() leaves the on-disk DB untouched. Writing back here would race the
+    // still-open better-sqlite3 handle (WAL) owned by ControllerRegistry /
+    // repairVectorIndexes — atomic rename fails with EPERM on Windows (#2596)
+    // and risks clobbering concurrent writes on all platforms.
     db.close();
 
     const passed = tests.filter(t => t.passed).length;
@@ -2122,15 +3019,43 @@ export async function storeEntry(options: {
   namespace?: string;
   generateEmbeddingFlag?: boolean;
   tags?: string[];
+  /** #1426: JSON object persisted to the metadata column. */
+  metadata?: Record<string, unknown>;
   ttl?: number;
   dbPath?: string;
   upsert?: boolean;
+  requireNative?: boolean;
+  appendOnly?: boolean;
+  appendConditions?: AppendCondition[];
+  /** ADR-323: defaults to 'unknown' when omitted. */
+  provenanceType?: string;
 }): Promise<{
   success: boolean;
   id: string;
   embedding?: { dimensions: number; model: string };
   error?: string;
+  /** #2968: set when the bridge's checkpoint failed in a way indicating
+   *  this write may not be durably persisted (sql.js fallback driver). */
+  persistWarning?: string;
+  /** #3325: set by the bridge when an embedding was requested but none could
+   *  be produced — the row is stored without a vector. */
+  embeddingError?: string;
 }> {
+  if (options.appendOnly && !options.requireNative) {
+    return { success: false, id: '', error: 'Immutable append requires a native writer' };
+  }
+
+  // ADR-323: validate before touching either backend so an invalid value
+  // gets one clear error instead of a raw SQLite CHECK-constraint failure
+  // from whichever path (bridge vs sql.js) happens to run.
+  if (options.provenanceType !== undefined && !isValidProvenanceType(options.provenanceType)) {
+    return {
+      success: false,
+      id: '',
+      error: `Invalid provenance type "${options.provenanceType}" — must be one of: ${PROVENANCE_TYPES.join(', ')}`,
+    };
+  }
+
   // ADR-053: Try AgentDB v3 bridge first
   const bridge = await getBridge();
   if (bridge) {
@@ -2139,6 +3064,9 @@ export async function storeEntry(options: {
       // Keep HNSW index in sync with bridge-stored entries
       if (bridgeResult.rawEmbedding && bridgeResult.success) {
         const ns = options.namespace || 'default';
+        // Upsert/resurrection may allocate a new row id. Remove every older
+        // vector for the logical (namespace,key), not merely the newest id.
+        removeHNSWEntriesByKey(options.key, ns);
         await addToHNSWIndex(bridgeResult.id, bridgeResult.rawEmbedding, {
           id: bridgeResult.id,
           key: options.key,
@@ -2150,6 +3078,10 @@ export async function storeEntry(options: {
     }
   }
 
+  if (options.requireNative || options.appendConditions) {
+    return { success: false, id: '', error: 'Native memory writer required; refusing whole-image sql.js fallback' };
+  }
+
   // Fallback: raw sql.js
   const {
     key,
@@ -2159,8 +3091,10 @@ export async function storeEntry(options: {
     tags = [],
     ttl,
     dbPath: customPath,
-    upsert = false
+    upsert: requestedUpsert = false,
+    provenanceType
   } = options;
+  const upsert = requestedUpsert && !options.appendOnly;
 
   const swarmDir = getMemoryRoot();
   const dbPath = customPath ? path.resolve(customPath) : path.join(swarmDir, 'memory.db');
@@ -2170,19 +3104,29 @@ export async function storeEntry(options: {
       return { success: false, id: '', error: 'Database not initialized. Run: claude-flow memory init' };
     }
 
-    // Ensure schema has all required columns (migration for older DBs)
-    await ensureSchemaColumns(dbPath);
-
-    const initSqlJs = (await import('sql.js')).default;
-    const SQL = await initSqlJs();
-
-    const fileBuffer = readFileMaybeEncrypted(dbPath, null);
-    const db = new SQL.Database(fileBuffer);
+    // #2735 — refuse an unsafe whole-image write while a native WAL
+    // connection appears to be attached (sidecars on disk). See
+    // hasNativeWalSidecars()'s doc comment for the corruption mechanism
+    // this closes and its known residual (the narrow assess-then-write
+    // race). This check gates ensureSchemaColumns()'s own whole-image
+    // write below too, not just this function's.
+    await releaseOwnNativeHandle(dbPath);
+    if (await hasNativeWalSidecars(dbPath)) {
+      return {
+        success: false,
+        id: '',
+        error: await walRefusalError('write', options.dbPath),
+      };
+    }
 
     const id = `entry_${Date.now()}_${Math.random().toString(36).substring(7)}`;
     const now = Date.now();
 
-    // Generate embedding if requested
+    // Generate embedding if requested.
+    // #2878: deliberately BEFORE the lock. Embedding generation can take
+    // hundreds of ms (ONNX), and it needs nothing from the database — running
+    // it inside the critical section would hold every other writer off for
+    // its whole duration and push them toward the acquire timeout.
     let embeddingJson: string | null = null;
     let embeddingDimensions: number | null = null;
     let embeddingModel: string | null = null;
@@ -2194,54 +3138,92 @@ export async function storeEntry(options: {
       embeddingModel = embResult.model;
     }
 
-    // #1941: provision a `vector_indexes` row for this namespace before the
-    // entry insert. The HNSW lookup uses this table to find which namespaces
-    // are indexed — without a row, `memory_search({namespace:"X"})` returns
-    // 0 even when memory_entries holds matching rows. INSERT OR IGNORE
-    // preserves the existing `default` / `patterns` rows.
-    try {
-      db.run(
-        `INSERT OR IGNORE INTO vector_indexes (id, name, dimensions) VALUES (?, ?, ?)`,
-        [namespace, namespace, embeddingDimensions ?? 384]
-      );
-    } catch { /* vector_indexes may not exist on legacy DBs — fall through */ }
+    // #2878: load → mutate → persist must be atomic against other writers.
+    // Without this, two concurrent stores both read the same predecessor
+    // image and the last flush silently drops the other's row while still
+    // reporting success.
+    await withMemoryDbLock(dbPath, async () => {
+      // Ensure schema has all required columns (migration for older DBs)
+      await ensureSchemaColumns(dbPath);
 
-    // Insert or update entry (upsert mode uses REPLACE)
-    const insertSql = upsert
-      ? `INSERT OR REPLACE INTO memory_entries (
-          id, key, namespace, content, type,
-          embedding, embedding_dimensions, embedding_model,
-          tags, metadata, created_at, updated_at, expires_at, status
-        ) VALUES (?, ?, ?, ?, 'semantic', ?, ?, ?, ?, ?, ?, ?, ?, 'active')`
-      : `INSERT INTO memory_entries (
-          id, key, namespace, content, type,
-          embedding, embedding_dimensions, embedding_model,
-          tags, metadata, created_at, updated_at, expires_at, status
-        ) VALUES (?, ?, ?, ?, 'semantic', ?, ?, ?, ?, ?, ?, ?, ?, 'active')`;
+      const initSqlJs = (await import('sql.js')).default;
+      const SQL = await initSqlJs();
 
-    db.run(insertSql, [
-      id,
-      key,
-      namespace,
-      value,
-      embeddingJson,
-      embeddingDimensions,
-      embeddingModel,
-      tags.length > 0 ? JSON.stringify(tags) : null,
-      '{}',
-      now,
-      now,
-      ttl ? now + (ttl * 1000) : null
-    ]);
+      const fileBuffer = readFileMaybeEncrypted(dbPath, null);
+      const db = new SQL.Database(fileBuffer);
+      let persistedProvenance = provenanceType ?? 'unknown';
+      if (upsert && provenanceType === undefined) {
+        try {
+          const stmt = db.prepare(
+            'SELECT provenance_type FROM memory_entries WHERE namespace = ? AND key = ? LIMIT 1'
+          );
+          stmt.bind([namespace, key]);
+          if (stmt.step()) {
+            const existingType = stmt.get()[0];
+            persistedProvenance = isValidProvenanceType(existingType) ? existingType : 'unknown';
+          }
+          stmt.free();
+        } catch { /* legacy schema or new row — keep unknown */ }
+      }
 
-    // Save
-    const data = db.export();
-    writeFileRestricted(dbPath, Buffer.from(data), { encrypt: true });
-    db.close();
+      // #1941: provision a `vector_indexes` row for this namespace before the
+      // entry insert. The HNSW lookup uses this table to find which namespaces
+      // are indexed — without a row, `memory_search({namespace:"X"})` returns
+      // 0 even when memory_entries holds matching rows. INSERT OR IGNORE
+      // preserves the existing `default` / `patterns` rows.
+      try {
+        db.run(
+          `INSERT OR IGNORE INTO vector_indexes (id, name, dimensions) VALUES (?, ?, ?)`,
+          [namespace, namespace, embeddingDimensions ?? 384]
+        );
+      } catch { /* vector_indexes may not exist on legacy DBs — fall through */ }
+
+      // Insert or update entry (upsert mode uses REPLACE)
+      const insertSql = upsert
+        ? `INSERT OR REPLACE INTO memory_entries (
+            id, key, namespace, content, type,
+            embedding, embedding_dimensions, embedding_model,
+            tags, metadata, provenance_type, created_at, updated_at, expires_at, status
+          ) VALUES (?, ?, ?, ?, 'semantic', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')`
+        : `INSERT INTO memory_entries (
+            id, key, namespace, content, type,
+            embedding, embedding_dimensions, embedding_model,
+            tags, metadata, provenance_type, created_at, updated_at, expires_at, status
+          ) VALUES (?, ?, ?, ?, 'semantic', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')`;
+
+      try {
+        db.run(insertSql, [
+          id,
+          key,
+          namespace,
+          value,
+          embeddingJson,
+          embeddingDimensions,
+          embeddingModel,
+          tags.length > 0 ? JSON.stringify(tags) : null,
+          JSON.stringify(options.metadata ?? {}),
+          persistedProvenance,
+          now,
+          now,
+          ttl ? now + (ttl * 1000) : null
+        ]);
+      } catch (e) {
+        // Don't leave the handle open (and the lock held) on a constraint
+        // failure — the outer catch turns this into the caller's error.
+        db.close();
+        throw e;
+      }
+
+      // Save
+      const data = db.export();
+      writeDbImagePreservingFormat(dbPath, data);
+      db.close();
+    });
 
     // Add to HNSW index for faster future searches
     if (embeddingJson) {
       const embResult = JSON.parse(embeddingJson) as number[];
+      if (upsert) removeHNSWEntriesByKey(key, namespace);
       await addToHNSWIndex(id, embResult, {
         id,
         key,
@@ -2274,6 +3256,10 @@ export async function searchEntries(options: {
   limit?: number;
   threshold?: number;
   dbPath?: string;
+  /** ADR-323: restrict results to these provenance types (e.g. exclude
+   *  'user_claim' when retrieving for fact-checking, per MemSyco-Bench's
+   *  sycophancy finding). Omit/empty = no filtering (all types). */
+  provenanceFilter?: string[];
 }): Promise<{
   success: boolean;
   results: {
@@ -2282,10 +3268,28 @@ export async function searchEntries(options: {
     content: string;
     score: number;
     namespace: string;
+    provenanceType?: string;
+    /** Dream Cycle 2026-09-03: the query-time cosine score above already
+     *  consumes this vector — surfaced so SmartRetrieval's MMR step can
+     *  reuse it instead of falling back to a text-overlap proxy. Internal
+     *  plumbing only; CLI/MCP response mappers do not forward this field. */
+    embedding?: number[];
   }[];
   searchTime: number;
   error?: string;
 }> {
+  if (options.provenanceFilter?.length) {
+    const invalid = options.provenanceFilter.filter(p => !isValidProvenanceType(p));
+    if (invalid.length > 0) {
+      return {
+        success: false,
+        results: [],
+        searchTime: 0,
+        error: `Invalid provenance filter value(s): ${invalid.join(', ')} — must be one of: ${PROVENANCE_TYPES.join(', ')}`,
+      };
+    }
+  }
+
   // ADR-053: Try AgentDB v3 bridge first
   const bridge = await getBridge();
   if (bridge) {
@@ -2298,8 +3302,9 @@ export async function searchEntries(options: {
     query,
     namespace,
     limit = 10,
-    threshold = 0.3,
-    dbPath: customPath
+    threshold = DEFAULT_SEARCH_THRESHOLD,
+    dbPath: customPath,
+    provenanceFilter
   } = options;
   const effectiveNamespace = namespace || 'all';
 
@@ -2321,7 +3326,11 @@ export async function searchEntries(options: {
 
     // Try RaBitQ pre-filter first (32× compressed Hamming scan)
     try {
-      const { searchRabitq } = await import('./rabitq-index.js');
+      const { ensureRabitqIndex, searchRabitq } = await import('./rabitq-index.js');
+      // #4203: build/rebuild on demand — without this the index was only ever
+      // populated by the explicit `embeddings_rabitq_build` tool, so this
+      // pre-filter always missed.
+      await ensureRabitqIndex({ dbPath, dimensions: queryEmbedding.length });
       const rabitqCandidates = await searchRabitq(queryEmbedding, { k: limit * 2, namespace: effectiveNamespace });
       if (rabitqCandidates && rabitqCandidates.length > 0) {
         // Rerank candidates with exact cosine similarity from SQLite
@@ -2329,18 +3338,27 @@ export async function searchEntries(options: {
         const SQL = await initSqlJs();
         const fileBuffer = readFileMaybeEncrypted(dbPath, null);
         const db = new SQL.Database(fileBuffer);
-        const reranked: { id: string; key: string; content: string; score: number; namespace: string }[] = [];
+        const reranked: { id: string; key: string; content: string; score: number; namespace: string; provenanceType?: string; embedding?: number[] }[] = [];
 
         for (const candidate of rabitqCandidates) {
-          const stmt = db.prepare('SELECT content, embedding FROM memory_entries WHERE id = ? AND status = ?');
-          stmt.bind([candidate.id, 'active']);
+          // ADR-323: provenance_type is fetched in the same per-candidate
+          // query (no extra round-trip) so a provenance-filtered search
+          // still gets RaBitQ's speedup instead of falling back to brute
+          // force.
+          const stmt = db.prepare(`SELECT content, embedding, provenance_type FROM memory_entries WHERE id = ? AND ${liveMemoryRowSql()}`);
+          stmt.bind([candidate.id]);
           if (stmt.step()) {
-            const [content, embeddingJson] = stmt.get() as [string, string | null];
+            const [content, embeddingJson, provenanceTypeVal] = stmt.get() as [string, string | null, string | null];
+            if (provenanceFilter?.length && !provenanceFilter.includes(provenanceTypeVal || 'unknown')) {
+              stmt.free();
+              continue;
+            }
             let score = 0;
+            let parsedEmbedding: number[] | undefined;
             if (embeddingJson) {
               try {
-                const embedding = JSON.parse(embeddingJson) as number[];
-                score = cosineSim(queryEmbedding, embedding);
+                parsedEmbedding = JSON.parse(embeddingJson) as number[];
+                score = cosineSim(queryEmbedding, parsedEmbedding);
               } catch { /* skip */ }
             }
             if (score >= threshold) {
@@ -2350,6 +3368,8 @@ export async function searchEntries(options: {
                 content: (content || '').substring(0, 60) + ((content || '').length > 60 ? '...' : ''),
                 score,
                 namespace: candidate.namespace,
+                provenanceType: provenanceTypeVal || 'unknown',
+                embedding: parsedEmbedding,
               });
             }
           }
@@ -2357,7 +3377,10 @@ export async function searchEntries(options: {
         }
         db.close();
 
-        if (reranked.length > 0) {
+        // A filtered ANN candidate window can underfill even when qualifying
+        // rows exist outside that window. Fall through to the authoritative
+        // filtered SQL scan unless ANN filled the requested page.
+        if (reranked.length > 0 && (!provenanceFilter?.length || reranked.length >= limit)) {
           reranked.sort((a, b) => b.score - a.score);
           return { success: true, results: reranked.slice(0, limit), searchTime: Date.now() - startTime };
         }
@@ -2365,15 +3388,57 @@ export async function searchEntries(options: {
     } catch { /* RaBitQ unavailable, fall through */ }
 
     // Try HNSW search (150x faster than brute-force)
-    const hnswResults = await searchHNSWIndex(queryEmbedding, { k: limit, namespace: effectiveNamespace });
+    const hnswResults = await searchHNSWIndex(queryEmbedding, {
+      k: provenanceFilter?.length ? Math.max(limit * 4, limit + 32) : limit,
+      namespace: effectiveNamespace,
+    });
     if (hnswResults && hnswResults.length > 0) {
       // Filter by threshold
-      const filtered = hnswResults.filter(r => r.score >= threshold);
-      return {
-        success: true,
-        results: filtered,
-        searchTime: Date.now() - startTime
-      };
+      let filtered: Array<{ id: string; key: string; content: string; score: number; namespace: string; provenanceType?: string }> =
+        hnswResults.filter(r => r.score >= threshold);
+
+      // ADR-323: the in-memory HNSW index doesn't carry provenance_type on
+      // its entries, so resolve it from SQLite for a consistent result shape
+      // and apply any trust filter before returning.
+      if (filtered.length > 0) {
+        try {
+          const initSqlJs = (await import('sql.js')).default;
+          const SQL = await initSqlJs();
+          const fileBuffer = readFileMaybeEncrypted(dbPath, null);
+          const db = new SQL.Database(fileBuffer);
+          const provenanceByKey = new Map<string, string>();
+          for (const r of filtered) {
+            const stmt = db.prepare(`SELECT provenance_type FROM memory_entries WHERE namespace = ? AND key = ? AND ${liveMemoryRowSql()} LIMIT 1`);
+            stmt.bind([r.namespace, r.key]);
+            if (stmt.step()) {
+              provenanceByKey.set(JSON.stringify([r.namespace, r.key]), (stmt.get()[0] as string | null) || 'unknown');
+            }
+            stmt.free();
+          }
+          db.close();
+          filtered = filtered
+            .filter(r => provenanceByKey.has(JSON.stringify([r.namespace, r.key])))
+            .map(r => ({ ...r, provenanceType: provenanceByKey.get(JSON.stringify([r.namespace, r.key])) || 'unknown' }));
+          if (provenanceFilter?.length) {
+            filtered = filtered.filter(r => provenanceFilter.includes(r.provenanceType!));
+          }
+        } catch {
+          // An ANN hit alone cannot prove the row is still live. Fall back
+          // to the authoritative SQL scan if liveness cannot be checked.
+          filtered = [];
+        }
+      }
+
+      if (filtered.length >= limit) {
+        return {
+          success: true,
+          results: filtered.slice(0, limit),
+          searchTime: Date.now() - startTime
+        };
+      }
+      // The ANN window did not contain enough matching provenance rows.
+      // Continue into the filtered SQL path to avoid false-empty/underfilled
+      // results caused by post-filtering only the unfiltered top-k.
     }
 
     // Fall back to brute-force SQLite search
@@ -2384,13 +3449,23 @@ export async function searchEntries(options: {
     const db = new SQL.Database(fileBuffer);
 
     // Get entries with embeddings
-    const searchStmt = db.prepare(
-      effectiveNamespace !== 'all'
-        ? `SELECT id, key, namespace, content, embedding FROM memory_entries WHERE status = 'active' AND namespace = ? LIMIT 1000`
-        : `SELECT id, key, namespace, content, embedding FROM memory_entries WHERE status = 'active' LIMIT 1000`
-    );
+    // ADR-323: build the WHERE clause incrementally so namespace and
+    // provenance filters compose (both, either, or neither).
+    const whereClauses = [liveMemoryRowSql()];
+    const whereParams: (string)[] = [];
     if (effectiveNamespace !== 'all') {
-      searchStmt.bind([effectiveNamespace]);
+      whereClauses.push('namespace = ?');
+      whereParams.push(effectiveNamespace);
+    }
+    if (provenanceFilter?.length) {
+      whereClauses.push(`provenance_type IN (${provenanceFilter.map(() => '?').join(',')})`);
+      whereParams.push(...provenanceFilter);
+    }
+    const searchStmt = db.prepare(
+      `SELECT id, key, namespace, content, embedding, provenance_type FROM memory_entries WHERE ${whereClauses.join(' AND ')} LIMIT 1000`
+    );
+    if (whereParams.length > 0) {
+      searchStmt.bind(whereParams);
     }
     const searchRows: unknown[][] = [];
     while (searchStmt.step()) {
@@ -2399,20 +3474,22 @@ export async function searchEntries(options: {
     searchStmt.free();
     const entries = searchRows.length > 0 ? [{ values: searchRows }] : [];
 
-    const results: { id: string; key: string; content: string; score: number; namespace: string }[] = [];
+    const results: { id: string; key: string; content: string; score: number; namespace: string; provenanceType?: string; embedding?: number[] }[] = [];
 
     if (entries[0]?.values) {
       for (const row of entries[0].values) {
-        const [id, key, ns, content, embeddingJson] = row as [string, string, string, string, string | null];
+        const [id, key, ns, content, embeddingJson, provenanceTypeVal] = row as [string, string, string, string, string | null, string | null];
 
         let score = 0;
+        let parsedEmbedding: number[] | undefined;
 
         if (embeddingJson) {
           try {
-            const embedding = JSON.parse(embeddingJson) as number[];
-            score = cosineSim(queryEmbedding, embedding);
+            parsedEmbedding = JSON.parse(embeddingJson) as number[];
+            score = cosineSim(queryEmbedding, parsedEmbedding);
           } catch {
             // Invalid embedding, use keyword score
+            parsedEmbedding = undefined;
           }
         }
 
@@ -2432,7 +3509,9 @@ export async function searchEntries(options: {
             key: key || id.substring(0, 15),
             content: (content || '').substring(0, 60) + ((content || '').length > 60 ? '...' : ''),
             score,
-            namespace: ns || 'default'
+            namespace: ns || 'default',
+            provenanceType: provenanceTypeVal || 'unknown',
+            embedding: parsedEmbedding,
           });
         }
       }
@@ -2490,6 +3569,18 @@ export async function listEntries(options: {
   limit?: number;
   offset?: number;
   dbPath?: string;
+  /** Internal native-mirror writes must remain plaintext, including schema migration. */
+  encryptWrites?: boolean;
+  /** #2073: When true, include the entry's full `content` string in each result. */
+  includeContent?: boolean;
+  /** ADR-323: restrict rows to these provenance types. */
+  provenanceFilter?: string[];
+  /** ADR-472: include each entry's embedding as int8+scale (`embeddingQ8`); at most MAX_LIST_EMBEDDINGS rows. Read-only. */
+  includeEmbedding?: boolean;
+  /** #4056: also return rows whose TTL has passed (with `expiresAt`). For cleanup only; normal reads hide them. */
+  includeExpired?: boolean;
+  /** Require entries to include all of these tags (AND). */
+  tags?: string[];
 }): Promise<{
   success: boolean;
   entries: {
@@ -2500,11 +3591,32 @@ export async function listEntries(options: {
     accessCount: number;
     createdAt: string;
     updatedAt: string;
+    /** #4056: epoch ms the row expires at; null when it never does. */
+    expiresAt?: number | null;
     hasEmbedding: boolean;
+    /** #2073: Present when `includeContent: true` was requested. */
+    content?: string;
+    provenanceType?: string;
+    /** ADR-472: present when `includeEmbedding: true` and the row has a valid stored vector. */
+    embeddingQ8?: EmbeddingQ8;
+    /** Tag set stored with the entry (empty array when none). */
+    tags?: string[];
   }[];
   total: number;
   error?: string;
 }> {
+  if (options.provenanceFilter?.length) {
+    const invalid = options.provenanceFilter.filter(p => !isValidProvenanceType(p));
+    if (invalid.length > 0) {
+      return {
+        success: false,
+        entries: [],
+        total: 0,
+        error: `Invalid provenance filter value(s): ${invalid.join(', ')} — must be one of: ${PROVENANCE_TYPES.join(', ')}`,
+      };
+    }
+  }
+
   // ADR-053: Try AgentDB v3 bridge first
   const bridge = await getBridge();
   if (bridge) {
@@ -2517,7 +3629,9 @@ export async function listEntries(options: {
     namespace,
     limit = 20,
     offset = 0,
-    dbPath: customPath
+    dbPath: customPath,
+    provenanceFilter,
+    tags: requiredTags,
   } = options;
 
   const swarmDir = getMemoryRoot();
@@ -2528,8 +3642,15 @@ export async function listEntries(options: {
       return { success: false, entries: [], total: 0, error: 'Database not found' };
     }
 
+    // Listing can migrate/backfill the schema, so it is also a whole-image
+    // writer. The newly selected native mirror may still have a live WAL.
+    await releaseOwnNativeHandle(dbPath);
+    if (await hasNativeWalSidecars(dbPath)) {
+      return { success: false, entries: [], total: 0, error: await walRefusalError('read/write') };
+    }
+
     // Ensure schema has all required columns (migration for older DBs)
-    await ensureSchemaColumns(dbPath);
+    await ensureSchemaColumns(dbPath, options);
 
     const initSqlJs = (await import('sql.js')).default;
     const SQL = await initSqlJs();
@@ -2537,38 +3658,87 @@ export async function listEntries(options: {
     const fileBuffer = readFileMaybeEncrypted(dbPath, null);
     const db = new SQL.Database(fileBuffer);
 
-    // Get total count
-    const countStmt = namespace
-      ? db.prepare(`SELECT COUNT(*) as cnt FROM memory_entries WHERE status = 'active' AND namespace = ?`)
-      : db.prepare(`SELECT COUNT(*) as cnt FROM memory_entries WHERE status = 'active'`);
+    // #2120 — accept `status IS NULL` alongside `'active'`. Old DBs
+    // that predate the status column may have NULL after migration.
+    // See memory-bridge.ts:bridgeListEntries for full context.
+    const whereClauses = [liveMemoryRowSql({ includeExpired: options.includeExpired })];
+    const whereParams: string[] = [];
     if (namespace) {
-      countStmt.bind([namespace]);
+      whereClauses.push('namespace = ?');
+      whereParams.push(namespace);
     }
+    // ADR-323: restrict to the requested provenance types. This must be
+    // ANDed alongside any tags filter below, never replaced by it — dropping
+    // this clause lets unverified user_claim rows leak into results that
+    // are supposed to be tool_result-only.
+    if (provenanceFilter?.length) {
+      whereClauses.push(`provenance_type IN (${provenanceFilter.map(() => '?').join(',')})`);
+      whereParams.push(...provenanceFilter);
+    }
+    // Tags are stored as JSON-array TEXT (e.g. `["a","b"]`). Match each
+    // required tag as an exact element via SQLite's json_each so a tag of
+    // `prod` can't be satisfied by a substring like `"prod` or by a
+    // differently-cased value like `PROD` (LIKE is ASCII case-insensitive
+    // and matches raw JSON-array bytes, not parsed array elements).
+    const tagFilter = Array.isArray(requiredTags)
+      ? requiredTags.filter((t): t is string => typeof t === 'string' && t.length > 0)
+      : [];
+    for (const tag of tagFilter) {
+      whereClauses.push(`EXISTS (SELECT 1 FROM json_each(tags) WHERE value = ?)`);
+      whereParams.push(tag);
+    }
+    const whereSql = whereClauses.join(' AND ');
+
+    // `|| 100` would treat an explicit `limit: 0` as falsy and silently
+    // substitute the default (returning rows instead of the requested
+    // zero) — only fall back to the default when parsing genuinely failed.
+    const parsedLimit = parseInt(String(limit), 10);
+    const safeLimit = Number.isNaN(parsedLimit) ? 100 : parsedLimit;
+    const parsedOffset = parseInt(String(offset), 10);
+    const safeOffset = Number.isNaN(parsedOffset) ? 0 : parsedOffset;
+
+    // Get total count
+    const countStmt = db.prepare(`SELECT COUNT(*) as cnt FROM memory_entries WHERE ${whereSql}`);
+    if (whereParams.length > 0) countStmt.bind(whereParams);
     const countRows: unknown[][] = [];
     while (countStmt.step()) {
       countRows.push(countStmt.get());
     }
     countStmt.free();
-    const countResult = countRows.length > 0 ? [{ values: countRows }] : [];
-    const total = countResult[0]?.values?.[0]?.[0] as number || 0;
+    const total = (countRows[0]?.[0] as number) || 0;
 
-    // Get entries
-    const safeLimit = parseInt(String(limit), 10) || 100;
-    const safeOffset = parseInt(String(offset), 10) || 0;
-    const listStmt = namespace
-      ? db.prepare(`SELECT id, key, namespace, content, embedding, access_count, created_at, updated_at FROM memory_entries WHERE status = 'active' AND namespace = ? ORDER BY updated_at DESC LIMIT ? OFFSET ?`)
-      : db.prepare(`SELECT id, key, namespace, content, embedding, access_count, created_at, updated_at FROM memory_entries WHERE status = 'active' ORDER BY updated_at DESC LIMIT ? OFFSET ?`);
-    if (namespace) {
-      listStmt.bind([namespace, safeLimit, safeOffset]);
-    } else {
-      listStmt.bind([safeLimit, safeOffset]);
+    // Get entries. ADR-472: embedding rows are capped at MAX_LIST_EMBEDDINGS.
+    const listLimit = options.includeEmbedding ? Math.min(safeLimit, MAX_LIST_EMBEDDINGS) : safeLimit;
+    const columns = 'id, key, namespace, content, embedding, access_count, created_at, updated_at, provenance_type, expires_at, tags';
+    // #4686: page row identities first so the temporary sort B-tree does not
+    // carry full content/embedding payloads for rows outside the page.
+    const pagedSql = `SELECT ${columns} FROM memory_entries
+       WHERE _rowid_ IN (
+         SELECT _rowid_ FROM memory_entries WHERE ${whereSql}
+         ORDER BY updated_at DESC LIMIT ? OFFSET ?
+       )
+       ORDER BY updated_at DESC`;
+    const originalSql = `SELECT ${columns} FROM memory_entries WHERE ${whereSql}
+       ORDER BY updated_at DESC LIMIT ? OFFSET ?`;
+    let listRows: unknown[][] = [];
+    const runList = (sql: string): unknown[][] => {
+      const stmt = db.prepare(sql);
+      try {
+        stmt.bind([...whereParams, listLimit, safeOffset]);
+        const rows: unknown[][] = [];
+        while (stmt.step()) rows.push(stmt.get());
+        return rows;
+      } finally {
+        stmt.free();
+      }
+    };
+    try {
+      listRows = runList(pagedSql);
+    } catch {
+      // Legacy WITHOUT ROWID tables have no _rowid_: keep the original query.
+      listRows = runList(originalSql);
     }
-    const listRows: unknown[][] = [];
-    while (listStmt.step()) {
-      listRows.push(listStmt.get());
-    }
-    listStmt.free();
-    const result = listRows.length > 0 ? [{ values: listRows }] : [];
+
     const entries: {
       id: string;
       key: string;
@@ -2577,25 +3747,64 @@ export async function listEntries(options: {
       accessCount: number;
       createdAt: string;
       updatedAt: string;
+      expiresAt?: number | null;
       hasEmbedding: boolean;
+      content?: string;
+      provenanceType?: string;
+      embeddingQ8?: EmbeddingQ8;
+      tags?: string[];
     }[] = [];
 
-    if (result[0]?.values) {
-      for (const row of result[0].values) {
-        const [id, key, ns, content, embedding, accessCount, createdAt, updatedAt] = row as [
-          string, string, string, string, string | null, number, string, string
-        ];
-        entries.push({
-          id: String(id).substring(0, 20),
-          key: key || String(id).substring(0, 15),
-          namespace: ns || 'default',
-          size: (content || '').length,
-          accessCount: accessCount || 0,
-          createdAt: createdAt || new Date().toISOString(),
-          updatedAt: updatedAt || new Date().toISOString(),
-          hasEmbedding: !!embedding && embedding.length > 10
-        });
+    for (const row of listRows) {
+      const [id, key, ns, content, embedding, accessCount, createdAt, updatedAt, provenanceTypeVal, expiresAtVal, tagsJson] = row as [
+        string, string, string, string, string | null, number, string, string, string | null, number | null, string | null
+      ];
+      let tags: string[] = [];
+      if (tagsJson) {
+        try {
+          const parsed = JSON.parse(tagsJson);
+          if (Array.isArray(parsed)) {
+            tags = parsed.filter((t): t is string => typeof t === 'string');
+          }
+        } catch { /* invalid tags JSON */ }
       }
+      const entry: {
+        id: string;
+        key: string;
+        namespace: string;
+        size: number;
+        accessCount: number;
+        createdAt: string;
+        updatedAt: string;
+        expiresAt?: number | null;
+        hasEmbedding: boolean;
+        content?: string;
+        provenanceType?: string;
+        embeddingQ8?: EmbeddingQ8;
+        tags?: string[];
+      } = {
+        // #2073: don't truncate id when content is requested — callers
+        // (notably memory_export) need the full id to round-trip via import.
+        id: options.includeContent ? String(id) : String(id).substring(0, 20),
+        key: key || String(id).substring(0, 15),
+        namespace: ns || 'default',
+        size: (content || '').length,
+        accessCount: accessCount || 0,
+        createdAt: createdAt || new Date().toISOString(),
+        updatedAt: updatedAt || new Date().toISOString(),
+        expiresAt: expiresAtVal ?? null,
+        hasEmbedding: !!embedding && embedding.length > 10,
+        provenanceType: provenanceTypeVal || 'unknown',
+        tags,
+      };
+      if (options.includeContent) {
+        entry.content = content || '';
+      }
+      if (options.includeEmbedding) {
+        const q8 = encodeEmbeddingQ8(embedding);
+        if (q8) entry.embeddingQ8 = q8;
+      }
+      entries.push(entry);
     }
 
     db.close();
@@ -2656,7 +3865,30 @@ export async function getEntry(options: {
       return { success: false, found: false, error: 'Database not found' };
     }
 
-    // Ensure schema has all required columns (migration for older DBs)
+    // #4734: a get is a pure READ. It no longer bumps access_count nor
+    // export/rewrites the whole sql.js image — doing so made every read a
+    // full-image write that serialised on the exclusive memory.db lock and lost
+    // writes under concurrent readers. It is now lock-free like listEntries /
+    // searchEntries: writeFileAtomic's rename() keeps every reader on a complete
+    // image, and ensureSchemaColumns self-locks only if it must ALTER/backfill.
+    // access_count stays display-only (response returns stored+1); it is never
+    // consulted for eviction/decay, so skipping the persistent bump is safe.
+    //
+    // #2735 — still refuse while a native WAL connection holds an uncommitted
+    // transaction: reading a snapshot a live writer is mid-commit would expose
+    // stale data. releaseOwnNativeHandle drops our own idle handle first.
+    await releaseOwnNativeHandle(dbPath);
+    if (await hasNativeWalSidecars(dbPath)) {
+      return {
+        success: false,
+        found: false,
+        error: await walRefusalError('read/write', options.dbPath),
+      };
+    }
+
+    // Ensure schema has all required columns (migration for older DBs).
+    // This self-locks internally only when it actually has to ALTER/backfill;
+    // on a healthy DB it is a plain read. See ensureSchemaColumns (#2878).
     await ensureSchemaColumns(dbPath);
 
     const initSqlJs = (await import('sql.js')).default;
@@ -2669,7 +3901,7 @@ export async function getEntry(options: {
     const getStmt = db.prepare(`
       SELECT id, key, namespace, content, embedding, access_count, created_at, updated_at, tags
       FROM memory_entries
-      WHERE status = 'active'
+      WHERE ${liveMemoryRowSql()}
         AND key = ?
         AND namespace = ?
       LIMIT 1
@@ -2691,17 +3923,8 @@ export async function getEntry(options: {
       string, string, string, string, string | null, number, string, string, string | null
     ];
 
-    // Update access count
-    db.run(`
-      UPDATE memory_entries
-      SET access_count = access_count + 1, last_accessed_at = strftime('%s', 'now') * 1000
-      WHERE id = ?
-    `, [String(id)]);
-
-    // Save updated database
-    const data = db.export();
-    writeFileRestricted(dbPath, Buffer.from(data), { encrypt: true });
-
+    // Read-only: do NOT bump access_count or re-persist the image (#4734).
+    // The response below still returns accessCount = stored + 1 for display.
     db.close();
 
     let tags: string[] = [];
@@ -2745,6 +3968,8 @@ export async function deleteEntry(options: {
   key: string;
   namespace?: string;
   dbPath?: string;
+  /** Internal native-mirror writes must remain plaintext, including schema migration. */
+  encryptWrites?: boolean;
 }): Promise<{
   success: boolean;
   deleted: boolean;
@@ -2761,15 +3986,7 @@ export async function deleteEntry(options: {
       // #1122: Bridge path must also invalidate the in-memory HNSW index.
       // Without this, deleted vectors remain as ghost entries in search results.
       if (bridgeResult.deleted && hnswIndex?.entries) {
-        // Remove the entry from the HNSW entries map by key+namespace composite
-        for (const [id, entry] of hnswIndex.entries) {
-          if ((entry as any)?.key === options.key && ((entry as any)?.namespace ?? 'default') === (options.namespace ?? 'default')) {
-            hnswIndex.entries.delete(id);
-            break;
-          }
-        }
-        saveHNSWMetadata();
-        rebuildSearchIndex();
+        removeHNSWEntriesByKey(options.key, options.namespace ?? 'default');
       }
       return bridgeResult;
     }
@@ -2797,90 +4014,110 @@ export async function deleteEntry(options: {
       };
     }
 
-    // Ensure schema has all required columns (migration for older DBs)
-    await ensureSchemaColumns(dbPath);
-
-    const initSqlJs = (await import('sql.js')).default;
-    const SQL = await initSqlJs();
-
-    const fileBuffer = readFileMaybeEncrypted(dbPath, null);
-    const db = new SQL.Database(fileBuffer);
-
-    // Check if entry exists first
-    const checkStmt = db.prepare(`
-      SELECT id FROM memory_entries
-      WHERE status = 'active'
-        AND key = ?
-        AND namespace = ?
-      LIMIT 1
-    `);
-    checkStmt.bind([key, namespace]);
-    const checkRows: unknown[][] = [];
-    while (checkStmt.step()) {
-      checkRows.push(checkStmt.get());
-    }
-    checkStmt.free();
-    const checkResult = checkRows.length > 0 ? [{ values: checkRows }] : [];
-
-    if (!checkResult[0]?.values?.[0]) {
-      // Get remaining count before closing
-      const countResult = db.exec(`SELECT COUNT(*) FROM memory_entries WHERE status = 'active'`);
-      const remainingEntries = countResult[0]?.values?.[0]?.[0] as number || 0;
-      db.close();
+    // #2735 — see storeEntry's identical gate for the corruption mechanism
+    // this closes.
+    await releaseOwnNativeHandle(dbPath);
+    if (await hasNativeWalSidecars(dbPath)) {
       return {
-        success: true,
+        success: false,
         deleted: false,
         key,
         namespace,
-        remainingEntries,
-        error: `Key '${key}' not found in namespace '${namespace}'`
+        remainingEntries: 0,
+        error: await walRefusalError('write', options.dbPath),
       };
     }
 
-    // Capture the entry ID for HNSW cleanup
-    const entryId = String(checkResult[0].values[0][0]);
+    // #2878: whole-image read-modify-write — without the lock a concurrent
+    // writer's flush resurrects the row this call just tombstoned.
+    return await withMemoryDbLock(dbPath, async () => {
+      // Ensure schema has all required columns (migration for older DBs)
+      await ensureSchemaColumns(dbPath, options);
 
-    // Delete the entry (soft delete by setting status to 'deleted')
-    // Also null out the embedding to clean up vector data from SQLite
-    db.run(`
-      UPDATE memory_entries
-      SET status = 'deleted',
-          embedding = NULL,
-          updated_at = strftime('%s', 'now') * 1000
-      WHERE key = ?
-        AND namespace = ?
-        AND status = 'active'
-    `, [key, namespace]);
+      const initSqlJs = (await import('sql.js')).default;
+      const SQL = await initSqlJs();
 
-    // Get remaining count
-    const countResult = db.exec(`SELECT COUNT(*) FROM memory_entries WHERE status = 'active'`);
-    const remainingEntries = countResult[0]?.values?.[0]?.[0] as number || 0;
+      const fileBuffer = readFileMaybeEncrypted(dbPath, null);
+      const db = new SQL.Database(fileBuffer);
 
-    // Save updated database
-    const data = db.export();
-    writeFileRestricted(dbPath, Buffer.from(data), { encrypt: true });
+      // #3785: zero the old cells as well as the live row. Without
+      // secure_delete, UPDATE leaves the previous text in SQLite free pages,
+      // so the "deleted" value is still recoverable from the file image.
+      db.run('PRAGMA secure_delete = ON');
 
-    db.close();
+      // Check if entry exists first
+      const checkStmt = db.prepare(`
+        SELECT id FROM memory_entries
+        WHERE ${ACTIVE_MEMORY_ROW_SQL}
+          AND key = ?
+          AND namespace = ?
+        LIMIT 1
+      `);
+      checkStmt.bind([key, namespace]);
+      const checkRows: unknown[][] = [];
+      while (checkStmt.step()) {
+        checkRows.push(checkStmt.get());
+      }
+      checkStmt.free();
+      const checkResult = checkRows.length > 0 ? [{ values: checkRows }] : [];
 
-    // Clean up in-memory HNSW index so ghost vectors don't appear in searches.
-    // Remove the entry from the HNSW entries map and invalidate the index.
-    // The next search will rebuild the HNSW index from the remaining DB rows.
-    if (hnswIndex?.entries) {
-      hnswIndex.entries.delete(entryId);
-      saveHNSWMetadata();
-      // Invalidate the HNSW index so it rebuilds from DB on next search.
-      // We can't surgically remove a vector from the HNSW graph, so we
-      // clear the entire index; it will be lazily rebuilt from SQLite.
-      rebuildSearchIndex();
-    }
+      if (!checkResult[0]?.values?.[0]) {
+        // Get remaining count before closing
+        const countResult = db.exec(`SELECT COUNT(*) FROM memory_entries WHERE ${ACTIVE_MEMORY_ROW_SQL}`);
+        const remainingEntries = countResult[0]?.values?.[0]?.[0] as number || 0;
+        db.close();
+        return {
+          success: true,
+          deleted: false,
+          key,
+          namespace,
+          remainingEntries,
+          error: `Key '${key}' not found in namespace '${namespace}'`
+        };
+      }
 
-    return {
-      success: true,
-      deleted: true,
-      key,
-      namespace,
-      remainingEntries
-    };
+      // Soft delete by setting status to 'deleted'. Scrub the payload, not
+      // only the vector: a tombstone that keeps `content` on disk still
+      // exposes deleted data to anyone who opens the SQLite file. `content`
+      // is NOT NULL, so use the empty string rather than SQL NULL.
+      db.run(`
+        UPDATE memory_entries
+        SET status = 'deleted',
+            content = '',
+            embedding = NULL,
+            embedding_model = NULL,
+            embedding_dimensions = NULL,
+            tags = NULL,
+            metadata = NULL,
+            updated_at = strftime('%s', 'now') * 1000
+        WHERE key = ?
+          AND namespace = ?
+          AND ${ACTIVE_MEMORY_ROW_SQL}
+      `, [key, namespace]);
+
+      // Get remaining count
+      const countResult = db.exec(`SELECT COUNT(*) FROM memory_entries WHERE ${ACTIVE_MEMORY_ROW_SQL}`);
+      const remainingEntries = countResult[0]?.values?.[0]?.[0] as number || 0;
+
+      // Save updated database
+      const data = db.export();
+      writeDbImagePreservingFormat(dbPath, data, { encrypt: options.encryptWrites ?? true });
+
+      db.close();
+
+      // Clean up in-memory HNSW index so ghost vectors don't appear in searches.
+      // Remove the entry from the HNSW entries map and invalidate the index.
+      // The next search will rebuild the HNSW index from the remaining DB rows.
+      if (hnswIndex?.entries) removeHNSWEntriesByKey(key, namespace);
+
+      return {
+        success: true,
+        deleted: true,
+        key,
+        namespace,
+        remainingEntries
+      };
+    });
   } catch (error) {
     return {
       success: false,
@@ -2891,6 +4128,196 @@ export async function deleteEntry(options: {
       error: error instanceof Error ? error.message : String(error)
     };
   }
+}
+
+// #2666 — Namespace reconciliation ("reaping"). `deleteEntry` above only ever
+// soft-deletes (UPDATE ... SET status='deleted'), and the row's (namespace,
+// key) stays occupied against the UNIQUE(namespace, key) constraint — a
+// caller that needs a namespace to be genuinely empty (e.g. a plugin
+// rebuilding its whole index after a source file was deleted, so a stale
+// row would otherwise survive forever with no dangling-ref/cycle signal to
+// ever catch it) has no way to get there through the public CLI/MCP surface.
+// `purgeNamespace` is a real `DELETE FROM memory_entries WHERE namespace = ?`
+// — irreversible, namespace-scoped, and lock-protected against a second
+// concurrent purge/delete on the same db file (see withMemoryDbLock below).
+//
+// This does NOT fully close #2621 (a concurrent daemon/MCP server already
+// mid read-modify-write on the sql.js fallback path can still flush an
+// older in-memory image after this purge commits, resurrecting rows) — that
+// requires every memory.db writer to respect the same lock, which is a
+// larger change than this namespace-reconcile primitive. The lock here
+// bounds the race to "another purge/delete running at the same instant",
+// which is the concrete case this feature needs to be safe against.
+
+const MEMORY_DB_LOCK_STALE_MS = 10_000;
+const MEMORY_DB_LOCK_ACQUIRE_TIMEOUT_MS = 15_000;
+
+function delayMs(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+/**
+ * Locks this call stack already holds, keyed by resolved db path. #2878: the
+ * mutators below call each other (every one runs `ensureSchemaColumns`, which
+ * takes the same lock), and an O_EXCL lock is not reentrant — a nested
+ * acquire would spin against our own lock file until the acquire timeout and
+ * then throw. AsyncLocalStorage lets a nested acquire recognise the lock as
+ * already held and run inline, while genuinely independent callers (separate
+ * `Promise.all` branches, separate processes) still contend normally.
+ */
+const heldMemoryDbLocks = new AsyncLocalStorage<ReadonlySet<string>>();
+
+/**
+ * Advisory O_EXCL lock scoped to a single memory.db file (`<dbPath>.lock`),
+ * same stale-takeover pattern as services/global-ai-budget.ts.
+ *
+ * #2878: sql.js persists by rewriting the whole database image, so every
+ * `load → mutate → export → write` sequence is a read-modify-write that a
+ * concurrent writer can clobber — both callers report success and the loser's
+ * rows vanish, with `PRAGMA integrity_check` still clean. Every such sequence
+ * in this module now runs inside this lock. It is advisory, so it still
+ * cannot coordinate against a writer that bypasses this module entirely
+ * (a native WAL connection — see hasNativeWalSidecars).
+ */
+export async function withMemoryDbLock<T>(dbPath: string, fn: () => Promise<T> | T): Promise<T> {
+  // Callers spell the same file both ways (`storeEntry` resolves, `getEntry`
+  // does not). Normalise, or two spellings would take two different locks and
+  // serialize against nothing.
+  const resolved = path.resolve(dbPath);
+  const held = heldMemoryDbLocks.getStore();
+  if (held?.has(resolved)) return await fn();
+
+  const nested = new Set(held ?? []);
+  nested.add(resolved);
+
+  const lockFile = `${resolved}.lock`;
+  const deadline = Date.now() + MEMORY_DB_LOCK_ACQUIRE_TIMEOUT_MS;
+  for (;;) {
+    let fd: number;
+    try {
+      fd = fs.openSync(lockFile, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600);
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e;
+      try {
+        const st = fs.lstatSync(lockFile);
+        if (Date.now() - st.mtimeMs > MEMORY_DB_LOCK_STALE_MS) {
+          fs.unlinkSync(lockFile);
+          continue;
+        }
+      } catch { /* raced — retry */ }
+      if (Date.now() > deadline) {
+        throw new Error(`timed out acquiring memory.db lock: ${lockFile}`);
+      }
+      await delayMs(25);
+      continue;
+    }
+
+    fs.writeSync(fd, String(process.pid));
+    fs.closeSync(fd);
+    try {
+      return await heldMemoryDbLocks.run(nested, fn);
+    } finally {
+      try { fs.unlinkSync(lockFile); } catch { /* already gone */ }
+    }
+  }
+}
+
+export async function purgeNamespace(options: {
+  namespace: string;
+  dbPath?: string;
+  /** Internal native-mirror writes must remain plaintext, including schema migration. */
+  encryptWrites?: boolean;
+}): Promise<{
+  success: boolean;
+  deletedCount: number;
+  remainingEntries: number;
+  error?: string;
+}> {
+  const { namespace, dbPath: customPath } = options;
+
+  // #3570: the same validator store, import and export use, so any namespace
+  // that can be written can also be purged (`team:alice` included).
+  const vNs = validateIdentifier(namespace, 'namespace');
+  if (!vNs.valid) {
+    return { success: false, deletedCount: 0, remainingEntries: 0, error: `Invalid namespace: ${vNs.error}` };
+  }
+
+  const swarmDir = getMemoryRoot();
+  const dbPath = customPath ? path.resolve(customPath) : path.join(swarmDir, 'memory.db');
+
+  return withMemoryDbLock(dbPath, async () => {
+    // ADR-053: try the AgentDB v3 bridge first — a real SQLite handle, so
+    // the DELETE is a genuine transactional statement, not a whole-file
+    // read/mutate/rewrite.
+    const bridge = await getBridge();
+    if (bridge) {
+      const bridgeResult = await bridge.bridgePurgeNamespace({ namespace, dbPath });
+      if (bridgeResult) {
+        if (bridgeResult.deletedCount > 0 && hnswIndex?.entries) {
+          for (const [id, entry] of hnswIndex.entries) {
+            if (((entry as any)?.namespace ?? 'default') === namespace) hnswIndex.entries.delete(id);
+          }
+          saveHNSWMetadata();
+          rebuildSearchIndex();
+        }
+        return bridgeResult;
+      }
+    }
+
+    // Fallback: raw sql.js, same whole-file read/mutate/rewrite shape as
+    // deleteEntry's fallback path above (and the same encryption handling).
+    try {
+      if (!fs.existsSync(dbPath)) {
+        return { success: false, deletedCount: 0, remainingEntries: 0, error: 'Database not found' };
+      }
+
+      // Recheck at mutation time even when the CLI already read a preview.
+      await releaseOwnNativeHandle(dbPath);
+      if (await hasNativeWalSidecars(dbPath)) {
+        return { success: false, deletedCount: 0, remainingEntries: 0, error: await walRefusalError('write') };
+      }
+
+      await ensureSchemaColumns(dbPath, options);
+
+      const initSqlJs = (await import('sql.js')).default;
+      const SQL = await initSqlJs();
+
+      const fileBuffer = readFileMaybeEncrypted(dbPath, null);
+      const db = new SQL.Database(fileBuffer);
+
+      // #3785: purge is advertised as irreversible; zero free pages too.
+      db.run('PRAGMA secure_delete = ON');
+
+      const beforeResult = db.exec(`SELECT COUNT(*) FROM memory_entries WHERE namespace = ?`, [namespace]);
+      const deletedCount = (beforeResult[0]?.values?.[0]?.[0] as number) || 0;
+
+      db.run(`DELETE FROM memory_entries WHERE namespace = ?`, [namespace]);
+
+      const countResult = db.exec(`SELECT COUNT(*) FROM memory_entries WHERE status = 'active'`);
+      const remainingEntries = (countResult[0]?.values?.[0]?.[0] as number) || 0;
+
+      const data = db.export();
+      writeDbImagePreservingFormat(dbPath, data, { encrypt: options.encryptWrites ?? true });
+      db.close();
+
+      if (deletedCount > 0 && hnswIndex?.entries) {
+        for (const [id, entry] of hnswIndex.entries) {
+          if (((entry as any)?.namespace ?? 'default') === namespace) hnswIndex.entries.delete(id);
+        }
+        saveHNSWMetadata();
+        rebuildSearchIndex();
+      }
+
+      return { success: true, deletedCount, remainingEntries };
+    } catch (error) {
+      return {
+        success: false,
+        deletedCount: 0,
+        remainingEntries: 0,
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+  });
 }
 
 export default {
@@ -2907,6 +4334,8 @@ export default {
   listEntries,
   getEntry,
   deleteEntry,
+  purgeNamespace,
+  withMemoryDbLock,
   rebuildSearchIndex,
   MEMORY_SCHEMA_V3,
   getInitialMetadata

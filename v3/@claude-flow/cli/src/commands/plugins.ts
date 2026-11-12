@@ -6,8 +6,6 @@
  * Created with ❤️ by ruv.io
  */
 
-import * as fs from 'fs';
-import * as path from 'path';
 import type { Command, CommandContext, CommandResult } from '../types.js';
 import { output } from '../output.js';
 import {
@@ -22,70 +20,12 @@ import {
   type PluginType,
 } from '../plugins/store/index.js';
 import { getPluginManager, type InstalledPlugin } from '../plugins/manager.js';
+import { DEFAULT_PLUGIN_PERMISSIONS, isStrictPluginMode } from '../plugins/trust-policy.js';
 import { getBulkRatings } from '../services/registry-api.js';
-
-/**
- * Marketplace entry (from .claude-plugin/marketplace.json)
- */
-interface MarketplacePlugin {
-  name: string;
-  source: string;
-  description: string;
-}
-
-interface MarketplaceRecord {
-  name: string;
-  owner: string;
-  repo: string;
-  description?: string;
-  plugins: MarketplacePlugin[];
-  addedAt: string;
-}
-
-interface PersistedMarketplaces {
-  [registryName: string]: MarketplaceRecord;
-}
-
-function getMarketplacesPath(): string {
-  return path.join(process.cwd(), '.claude-flow', 'plugins', 'marketplaces.json');
-}
-
-function loadMarketplaces(): PersistedMarketplaces {
-  try {
-    const data = fs.readFileSync(getMarketplacesPath(), 'utf8');
-    return JSON.parse(data) as PersistedMarketplaces;
-  } catch {
-    return {};
-  }
-}
-
-function saveMarketplaces(marketplaces: PersistedMarketplaces): void {
-  const filePath = getMarketplacesPath();
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  fs.writeFileSync(filePath, JSON.stringify(marketplaces, null, 2));
-}
-
-/**
- * Parse plugin name with optional @registry qualifier.
- * Examples:
- *   "ruflo-core@ruflo"      -> { name: "ruflo-core", registry: "ruflo" }
- *   "@claude-flow/neural"   -> { name: "@claude-flow/neural", registry: undefined }
- *   "my-plugin"             -> { name: "my-plugin", registry: undefined }
- */
-function parsePluginRef(ref: string): { name: string; registry: string | undefined } {
-  // Scoped npm packages start with @, e.g. "@claude-flow/neural"
-  // They may still have a trailing @registry: "@claude-flow/neural@ruflo"
-  const lastAt = ref.lastIndexOf('@');
-  if (lastAt <= 0) {
-    return { name: ref, registry: undefined };
-  }
-  const registryPart = ref.slice(lastAt + 1);
-  // If the part after @ looks like a semver (starts with digit or ^ ~ *), treat as version
-  if (/^[\d^~*]/.test(registryPart)) {
-    return { name: ref, registry: undefined };
-  }
-  return { name: ref.slice(0, lastAt), registry: registryPart };
-}
+import { scanLocalPluginBeforeInstall, verifyCommand } from './plugins-verify.js';
+import { acceptRiskFrom } from '../plugins/marketplace-trust/scan.js';
+import { pathsCommand } from './plugins-paths.js';
+import { hostCommand } from './plugins-host.js';
 
 // List subcommand - Now uses IPFS-based registry
 const listCommand: Command = {
@@ -172,7 +112,22 @@ const listCommand: Command = {
         return { success: false, exitCode: 1 };
       }
 
-      spinner.succeed(`Registry discovered: ${result.registry.totalPlugins} plugins available`);
+      if (result.demo) {
+        // The signed registry was unavailable or failed verification (see ruvnet/ruflo#3211):
+        // say so instead of reporting a successful discovery over the built-in list.
+        spinner.stop(
+          output.warning(
+            `Signed plugin registry unavailable or unverified; showing the built-in list ` +
+              `(${result.registry.totalPlugins} plugins)`,
+          ),
+        );
+      } else if (result.verified !== true) {
+        spinner.stop(
+          output.warning(`Registry discovered but not verified: ${result.registry.totalPlugins} plugins available`),
+        );
+      } else {
+        spinner.succeed(`Registry discovered: ${result.registry.totalPlugins} plugins available`);
+      }
 
       output.writeln();
 
@@ -190,6 +145,9 @@ const listCommand: Command = {
       if (official) {
         plugins = getOfficialPlugins(result.registry);
         title = 'Official Plugins';
+        if (result.verified !== true) {
+          output.writeln(output.warning('No plugin is shown as official: only a verified registry can say which are.'));
+        }
       } else if (featured) {
         plugins = getFeaturedPlugins(result.registry);
         title = 'Featured Plugins';
@@ -257,6 +215,22 @@ const listCommand: Command = {
         output.writeln(output.dim('(ratings: cached — cloud unavailable)'));
       }
       output.writeln(output.dim(`Source: ${result.source}${result.fromCache ? ' (cached)' : ''}`));
+      if (result.demo) {
+        output.writeln(
+          output.warning(
+            'Not from the signed registry: download counts and ratings are the ' +
+              "CLI's built-in defaults, not verified registry data.",
+          ),
+        );
+      }
+      if (result.verified !== true) {
+        output.writeln(
+          output.warning(
+            `Registry not verified (${result.unverifiedReason ?? 'unknown reason'}): every entry is ` +
+              'shown as Unverified and installs get no registry trust.',
+          ),
+        );
+      }
       if (result.cid) {
         output.writeln(output.dim(`Registry CID: ${result.cid.slice(0, 30)}...`));
       }
@@ -270,36 +244,56 @@ const listCommand: Command = {
   },
 };
 
-// Install subcommand - Now fetches from IPFS registry or named marketplace
+// Install subcommand - Now fetches from IPFS registry
 const installCommand: Command = {
   name: 'install',
-  description: 'Install a plugin from IPFS registry, marketplace, or local path',
+  description: 'Install a plugin from IPFS registry or local path',
   options: [
-    { name: 'name', short: 'n', type: 'string', description: 'Plugin name or path (supports name@registry)', required: true },
+    { name: 'name', short: 'n', type: 'string', description: 'Plugin name or path', required: true },
     { name: 'version', short: 'v', type: 'string', description: 'Specific version to install' },
     { name: 'global', short: 'g', type: 'boolean', description: 'Install globally' },
     { name: 'dev', short: 'd', type: 'boolean', description: 'Install as dev dependency' },
-    { name: 'verify', type: 'boolean', description: 'Verify checksum (default: true)', default: true },
+    {
+      name: 'verify',
+      type: 'boolean',
+      description:
+        'Verify before registering (default: true). Registry installs must match the registry sha256 checksum. ' +
+        'Hooks and commands are withheld from a plugin that declares trustLevel "untrusted"/"unverified" or ' +
+        `permissions beyond the default set (${DEFAULT_PLUGIN_PERMISSIONS.join(', ')}) unless --trust is given. ` +
+        '--no-verify skips all of this.',
+      default: true,
+    },
+    { name: 'trust', type: 'boolean', description: 'Register hooks and commands even if the plugin is untrusted or declares elevated permissions', default: false },
+    { name: 'accept-risk', type: 'string', description: 'Install a local plugin (its directory name) even though the pre-install scan found a high-severity issue in its .mcp.json, hooks/hooks.json or hook modules (ADR-509)' },
+    {
+      name: 'allow-unverified',
+      type: 'boolean',
+      description:
+        'With CLAUDE_FLOW_STRICT_PLUGINS=true, install from npm even though the plugin registry is not verified. ' +
+        'The plugin still gets no registry trust. Strict mode gates on the registry, not the package: while the ' +
+        'registry is unverified every npm install is refused, listed or not; once it verifies, a package it does ' +
+        'not list installs without this flag, but also without registry trust.',
+      default: false,
+    },
     { name: 'registry', short: 'r', type: 'string', description: 'Registry to use' },
   ],
   examples: [
     { command: 'claude-flow plugins install -n community-analytics', description: 'Install plugin from IPFS' },
     { command: 'claude-flow plugins install -n ./my-plugin --dev', description: 'Install local plugin' },
-    { command: 'claude-flow plugins install -n ruflo-core@ruflo', description: 'Install from named marketplace' },
+    { command: 'claude-flow plugins install -n ./my-plugin --trust', description: 'Install a local plugin that declares elevated permissions, registering its hooks' },
   ],
   action: async (ctx: CommandContext): Promise<CommandResult> => {
-    const rawName = ctx.flags.name as string;
+    const name = ctx.flags.name as string;
     const version = ctx.flags.version as string || 'latest';
+    const registryName = ctx.flags.registry as string;
     const verify = ctx.flags.verify !== false;
+    const trust = ctx.flags.trust === true;
+    const allowUnverified = ctx.flags.allowUnverified === true || ctx.flags['allow-unverified'] === true;
 
-    if (!rawName) {
+    if (!name) {
       output.printError('Plugin name is required');
       return { success: false, exitCode: 1 };
     }
-
-    // Parse name@registry qualifier
-    const { name, registry: qualifiedRegistry } = parsePluginRef(rawName);
-    const registryName = (ctx.flags.registry as string) || qualifiedRegistry;
 
     // Check if it's a local path
     const isLocalPath = name.startsWith('./') || name.startsWith('/') || name.startsWith('../');
@@ -307,10 +301,6 @@ const installCommand: Command = {
     output.writeln();
     output.writeln(output.bold('Installing Plugin'));
     output.writeln(output.dim('─'.repeat(50)));
-
-    if (qualifiedRegistry) {
-      output.writeln(output.dim(`Registry: ${qualifiedRegistry}`));
-    }
 
     const spinner = output.createSpinner({
       text: isLocalPath ? `Installing from ${name}...` : `Discovering ${name} in registry...`,
@@ -333,51 +323,21 @@ const installCommand: Command = {
 
       let result;
       let plugin: PluginEntry | undefined;
+      const registryWarnings: string[] = [];
 
       if (isLocalPath) {
+        // ADR-509 §2.2: static scan before anything is registered; a high finding stops the install.
+        const blocked = scanLocalPluginBeforeInstall(name, acceptRiskFrom(ctx.flags));
+        if (blocked) {
+          spinner.fail(`Refusing to install ${blocked}`);
+          return { success: false, exitCode: 1 };
+        }
         // Install from local path
         spinner.setText(`Installing from ${name}...`);
-        result = await manager.installFromLocal(name);
-      } else if (registryName) {
-        // Look up plugin in named marketplace registry
-        spinner.setText(`Looking up ${name} in ${registryName} marketplace...`);
-
-        const marketplaces = loadMarketplaces();
-        const marketplace = marketplaces[registryName];
-
-        if (!marketplace) {
-          spinner.fail(`Marketplace '${registryName}' not found`);
-          output.writeln();
-          output.writeln(output.dim(`Add it first: claude-flow plugins marketplace add <owner>/${registryName}`));
-          return { success: false, exitCode: 1 };
-        }
-
-        const entry = marketplace.plugins.find(p => p.name === name);
-        if (!entry) {
-          spinner.fail(`Plugin '${name}' not found in ${registryName} marketplace`);
-          output.writeln();
-          output.writeln(output.dim(`Available: ${marketplace.plugins.map(p => p.name).join(', ')}`));
-          return { success: false, exitCode: 1 };
-        }
-
-        spinner.setText(`Found ${entry.name} in ${registryName}: ${entry.description}`);
-
-        // Resolve source path relative to cwd
-        const resolvedSource = path.resolve(process.cwd(), entry.source);
-        const sourceExists = fs.existsSync(resolvedSource);
-
-        if (sourceExists) {
-          // Install from local resolved path
-          spinner.setText(`Installing ${name} from local path...`);
-          result = await manager.installFromLocal(resolvedSource);
-        } else {
-          // Fall back to npm install
-          spinner.setText(`Installing ${name} from npm...`);
-          result = await manager.installFromNpm(name, version !== 'latest' ? version : undefined);
-        }
+        result = await manager.installFromLocal(name, { verify, trust });
       } else {
-        // First, try to find in IPFS registry for metadata
-        spinner.setText(`Discovering ${name} in IPFS registry...`);
+        // First, try to find in registry for metadata
+        spinner.setText(`Discovering ${name} in registry...`);
         const discovery = createPluginDiscoveryService();
         const registryResult = await discovery.discoverRegistry(registryName);
 
@@ -385,13 +345,44 @@ const installCommand: Command = {
           plugin = registryResult.registry.plugins.find(p => p.name === name || p.id === name);
         }
 
+        // Only a verified registry may vouch for a plugin (trust level, permissions, checksum).
+        // An unverified or built-in list is just a claim, so its entries install like any npm
+        // package: no install scripts and no permission vouching without --trust.
+        const registryVerified = registryResult.success && registryResult.verified === true;
+        if (!registryVerified) {
+          const reason = registryResult.unverifiedReason ?? registryResult.error ?? 'registry not verified';
+          if (isStrictPluginMode() && !allowUnverified) {
+            spinner.fail(`Refusing to install ${name}: plugin registry is not verified (${reason})`);
+            output.writeln();
+            output.writeln(output.dim(
+              'CLAUDE_FLOW_STRICT_PLUGINS=true requires a verified registry. Pass --allow-unverified to install it ' +
+              'from npm anyway, without registry trust.',
+            ));
+            return { success: false, exitCode: 1 };
+          }
+          if (plugin) {
+            registryWarnings.push(
+              `${name} is listed only in an unverified registry (${reason}); it was installed without registry trust.`,
+            );
+          }
+        }
+
         if (plugin) {
           spinner.setText(`Found ${plugin.displayName} v${plugin.version}`);
         }
 
-        // Install from npm (since IPFS is demo mode)
         spinner.setText(`Installing ${name} from npm...`);
-        result = await manager.installFromNpm(name, version !== 'latest' ? version : undefined);
+        result = await manager.installFromNpm(name, version !== 'latest' ? version : undefined, {
+          verify,
+          trust,
+          ...(registryVerified && plugin
+            ? {
+                expectedChecksum: plugin.checksum,
+                registryTrustLevel: plugin.trustLevel,
+                registryPermissions: plugin.permissions,
+              }
+            : {}),
+        });
       }
 
       if (!result.success) {
@@ -404,26 +395,44 @@ const installCommand: Command = {
 
       output.writeln();
 
+      if (result.decision?.verificationSkipped) {
+        output.printWarning('Verification skipped (--no-verify): hooks and commands were registered without a trust or checksum check.');
+      }
+      for (const warning of [...registryWarnings, ...(result.warnings ?? [])]) {
+        output.printWarning(warning);
+      }
+
       const boxContent = [
         `Plugin: ${installed.name}`,
         `Version: ${installed.version}`,
         `Source: ${installed.source}`,
         `Path: ${installed.path || 'N/A'}`,
         ``,
+        `Trust: ${installed.trustLevel ?? 'not declared'}`,
+        `Permissions: ${installed.permissions?.join(', ') || 'none declared'}`,
+        `Verification: ${installed.verification ?? 'n/a'}`,
+        `Install scripts: ${installed.source === 'local' ? 'n/a (local link)' : installed.scriptsRun ? 'ran' : 'skipped (use --trust to run)'}`,
+        ``,
         `Hooks registered: ${installed.hooks?.length || 0}`,
         `Commands added: ${installed.commands?.length || 0}`,
       ];
 
-      if (plugin) {
-        boxContent.push(`Trust: ${plugin.trustLevel}`);
-        boxContent.push(`Permissions: ${plugin.permissions.join(', ') || 'none'}`);
-      }
-
-      if (qualifiedRegistry) {
-        boxContent.push(`Registry: ${qualifiedRegistry}`);
-      }
-
       output.printBox(boxContent.join('\n'), 'Installation Complete');
+
+      if (installed.withheld) {
+        output.writeln();
+        output.printWarning(
+          `Withheld ${installed.withheld.hooks.length} hook(s) and ${installed.withheld.commands.length} command(s) ` +
+          `from ${installed.name} because it ${installed.withheld.reasons.join('; ')}.`,
+        );
+        if (installed.withheld.hooks.length > 0) {
+          output.writeln(output.dim(`  Hooks not registered: ${installed.withheld.hooks.join(', ')}`));
+        }
+        if (installed.withheld.commands.length > 0) {
+          output.writeln(output.dim(`  Commands not added: ${installed.withheld.commands.join(', ')}`));
+        }
+        output.writeln(output.dim(`  To register them, uninstall and reinstall with --trust.`));
+      }
 
       return { success: true, data: installed };
     } catch (error) {
@@ -589,6 +598,7 @@ const infoCommand: Command = {
 
       if (!result.success || !result.registry) {
         spinner.fail('Failed to discover registry');
+        if (result.error) output.printError(result.error);
         return { success: false, exitCode: 1 };
       }
 
@@ -625,6 +635,7 @@ const infoCommand: Command = {
           { field: 'Author', value: plugin.author.displayName || plugin.author.id },
           { field: 'Trust Level', value: plugin.trustLevel },
           { field: 'Verified', value: plugin.verified ? '✓ Yes' : '✗ No' },
+          { field: 'Registry', value: result.verified === true ? 'verified' : `unverified (${result.unverifiedReason ?? 'unknown reason'})` },
         ],
       });
 
@@ -794,6 +805,23 @@ const upgradeCommand: Command = {
   options: [
     { name: 'name', short: 'n', type: 'string', description: 'Plugin name', required: true },
     { name: 'version', short: 'v', type: 'string', description: 'Target version (default: latest)' },
+    {
+      name: 'verify',
+      type: 'boolean',
+      description:
+        'Re-apply the install trust policy to the new version (default: true). Its hooks and commands are withheld ' +
+        `if it declares trustLevel "untrusted"/"unverified" or permissions beyond the default set (${DEFAULT_PLUGIN_PERMISSIONS.join(', ')}) ` +
+        'unless --trust is given. --no-verify skips this.',
+      default: true,
+    },
+    {
+      name: 'trust',
+      type: 'boolean',
+      description:
+        "Run the new version's install scripts and register its hooks and commands even if it is untrusted or " +
+        'declares elevated permissions. Not carried over from the original install.',
+      default: false,
+    },
   ],
   examples: [
     { command: 'claude-flow plugins upgrade -n @claude-flow/neural', description: 'Upgrade to latest' },
@@ -802,6 +830,8 @@ const upgradeCommand: Command = {
   action: async (ctx: CommandContext): Promise<CommandResult> => {
     const name = ctx.flags.name as string;
     const version = ctx.flags.version as string;
+    const verify = ctx.flags.verify !== false;
+    const trust = ctx.flags.trust === true;
 
     if (!name) {
       output.printError('Plugin name is required');
@@ -826,7 +856,7 @@ const upgradeCommand: Command = {
       const oldVersion = existing.version;
       spinner.setText(`Upgrading ${name} from v${oldVersion}...`);
 
-      const result = await manager.upgrade(name, version);
+      const result = await manager.upgrade(name, version, { verify, trust });
 
       if (!result.success) {
         spinner.fail(`Upgrade failed: ${result.error}`);
@@ -835,6 +865,19 @@ const upgradeCommand: Command = {
 
       const plugin = result.plugin!;
       spinner.succeed(`Upgraded ${name}: v${oldVersion} -> v${plugin.version}`);
+
+      if (result.decision?.verificationSkipped) {
+        output.printWarning('Verification skipped (--no-verify): hooks and commands were registered without a trust check.');
+      }
+      for (const warning of result.warnings ?? []) {
+        output.printWarning(warning);
+      }
+      if (plugin.withheld) {
+        output.printWarning(
+          `Withheld ${plugin.withheld.hooks.length} hook(s) and ${plugin.withheld.commands.length} command(s) ` +
+          `from ${plugin.name} because it ${plugin.withheld.reasons.join('; ')}. Upgrade with --trust to register them.`,
+        );
+      }
 
       return { success: true, data: plugin };
     } catch (error) {
@@ -883,6 +926,7 @@ const searchCommand: Command = {
 
       if (!result.success || !result.registry) {
         spinner.fail('Failed to discover registry');
+        if (result.error) output.printError(result.error);
         return { success: false, exitCode: 1 };
       }
 
@@ -1000,188 +1044,11 @@ const rateCommand: Command = {
   },
 };
 
-// Marketplace subcommand - manage named plugin marketplaces
-
-const marketplaceAddCommand: Command = {
-  name: 'add',
-  description: 'Register a plugin marketplace (format: owner/repo)',
-  options: [
-    { name: 'source', short: 's', type: 'string', description: 'Marketplace source as owner/repo' },
-  ],
-  examples: [
-    { command: 'claude-flow plugins marketplace add ruvnet/ruflo', description: 'Add ruflo marketplace' },
-  ],
-  action: async (ctx: CommandContext): Promise<CommandResult> => {
-    const source = (ctx.flags.source as string) || (ctx.args?.[0] as string);
-
-    if (!source) {
-      output.printError('Marketplace source required (format: owner/repo)');
-      return { success: false, exitCode: 1 };
-    }
-
-    const slashIdx = source.indexOf('/');
-    if (slashIdx < 1) {
-      output.printError('Source must be in owner/repo format (e.g. ruvnet/ruflo)');
-      return { success: false, exitCode: 1 };
-    }
-
-    const owner = source.slice(0, slashIdx);
-    const repo = source.slice(slashIdx + 1);
-    const registryName = repo;
-
-    output.writeln();
-    output.writeln(output.bold('Adding Marketplace'));
-    output.writeln(output.dim('─'.repeat(50)));
-
-    const spinner = output.createSpinner({
-      text: `Loading marketplace from ${source}...`,
-      spinner: 'dots',
-    });
-    spinner.start();
-
-    try {
-      // Try local path first (for when we are inside the repo itself)
-      const localPath = path.join(process.cwd(), '.claude-plugin', 'marketplace.json');
-      let marketplaceData: { name?: string; description?: string; plugins: MarketplacePlugin[] } | null = null;
-
-      if (fs.existsSync(localPath)) {
-        try {
-          const raw = fs.readFileSync(localPath, 'utf8');
-          const parsed = JSON.parse(raw) as { name?: string; description?: string; plugins: MarketplacePlugin[] };
-          // Only use local if it matches the requested repo name
-          if (!parsed.name || parsed.name === repo) {
-            marketplaceData = parsed;
-            spinner.setText(`Loaded local marketplace (${parsed.plugins?.length ?? 0} plugins)`);
-          }
-        } catch {
-          // fall through to GitHub fetch
-        }
-      }
-
-      if (!marketplaceData) {
-        // Fetch from GitHub raw content
-        const githubUrl = `https://raw.githubusercontent.com/${owner}/${repo}/main/.claude-plugin/marketplace.json`;
-        spinner.setText(`Fetching from GitHub: ${githubUrl}`);
-
-        const response = await fetch(githubUrl, { signal: AbortSignal.timeout(10000) });
-        if (!response.ok) {
-          spinner.fail(`Failed to fetch marketplace: HTTP ${response.status}`);
-          return { success: false, exitCode: 1 };
-        }
-        marketplaceData = await response.json() as { name?: string; description?: string; plugins: MarketplacePlugin[] };
-      }
-
-      if (!marketplaceData?.plugins || !Array.isArray(marketplaceData.plugins)) {
-        spinner.fail('Invalid marketplace format: missing plugins array');
-        return { success: false, exitCode: 1 };
-      }
-
-      // Persist marketplace
-      const marketplaces = loadMarketplaces();
-      const record: MarketplaceRecord = {
-        name: registryName,
-        owner,
-        repo,
-        description: marketplaceData.description,
-        plugins: marketplaceData.plugins,
-        addedAt: new Date().toISOString(),
-      };
-      marketplaces[registryName] = record;
-      saveMarketplaces(marketplaces);
-
-      spinner.succeed(`Marketplace '${registryName}' registered (${record.plugins.length} plugins)`);
-      output.writeln();
-      output.writeln(output.bold('Available Plugins:'));
-      output.printTable({
-        columns: [
-          { key: 'name', header: 'Plugin', width: 28 },
-          { key: 'description', header: 'Description', width: 52 },
-        ],
-        data: record.plugins.map(p => ({
-          name: p.name,
-          description: p.description.slice(0, 49) + (p.description.length > 49 ? '...' : ''),
-        })),
-      });
-      output.writeln();
-      output.writeln(output.dim(`Install with: claude-flow plugins install -n <plugin>@${registryName}`));
-
-      return { success: true, data: record };
-    } catch (error) {
-      spinner.fail('Failed to add marketplace');
-      output.printError(`Error: ${String(error)}`);
-      return { success: false, exitCode: 1 };
-    }
-  },
-};
-
-const marketplaceListCommand: Command = {
-  name: 'list',
-  description: 'List registered marketplaces',
-  options: [],
-  examples: [
-    { command: 'claude-flow plugins marketplace list', description: 'List all registered marketplaces' },
-  ],
-  action: async (): Promise<CommandResult> => {
-    const marketplaces = loadMarketplaces();
-    const entries = Object.values(marketplaces);
-
-    output.writeln();
-    output.writeln(output.bold('Registered Marketplaces'));
-    output.writeln(output.dim('─'.repeat(60)));
-
-    if (entries.length === 0) {
-      output.writeln(output.dim('No marketplaces registered.'));
-      output.writeln(output.dim('Add one with: claude-flow plugins marketplace add owner/repo'));
-      return { success: true };
-    }
-
-    output.printTable({
-      columns: [
-        { key: 'name', header: 'Name', width: 16 },
-        { key: 'source', header: 'Source', width: 24 },
-        { key: 'plugins', header: 'Plugins', width: 8, align: 'right' },
-        { key: 'added', header: 'Added', width: 12 },
-      ],
-      data: entries.map(m => ({
-        name: m.name,
-        source: `${m.owner}/${m.repo}`,
-        plugins: String(m.plugins.length),
-        added: m.addedAt.slice(0, 10),
-      })),
-    });
-
-    return { success: true, data: entries };
-  },
-};
-
-const marketplaceCommand: Command = {
-  name: 'marketplace',
-  description: 'Manage plugin marketplaces',
-  subcommands: [marketplaceAddCommand, marketplaceListCommand],
-  examples: [
-    { command: 'claude-flow plugins marketplace add ruvnet/ruflo', description: 'Add ruflo marketplace' },
-    { command: 'claude-flow plugins marketplace list', description: 'List registered marketplaces' },
-  ],
-  action: async (): Promise<CommandResult> => {
-    output.writeln();
-    output.writeln(output.bold('Plugin Marketplace Manager'));
-    output.writeln(output.dim('─'.repeat(50)));
-    output.writeln('Subcommands:');
-    output.printList([
-      `${output.highlight('add')}   - Register a marketplace (owner/repo)`,
-      `${output.highlight('list')}  - List registered marketplaces`,
-    ]);
-    output.writeln();
-    output.writeln(output.dim('Example: claude-flow plugins marketplace add ruvnet/ruflo'));
-    return { success: true };
-  },
-};
-
 // Main plugins command - Now with IPFS-based registry
 export const pluginsCommand: Command = {
   name: 'plugins',
   description: 'Plugin management with IPFS-based decentralized registry',
-  subcommands: [listCommand, searchCommand, installCommand, uninstallCommand, upgradeCommand, toggleCommand, infoCommand, createCommand, rateCommand, marketplaceCommand],
+  subcommands: [listCommand, searchCommand, installCommand, uninstallCommand, upgradeCommand, toggleCommand, infoCommand, createCommand, rateCommand, verifyCommand, pathsCommand, hostCommand],
   examples: [
     { command: 'claude-flow plugins list', description: 'List plugins from IPFS registry' },
     { command: 'claude-flow plugins search -q neural', description: 'Search for plugins' },
@@ -1195,15 +1062,17 @@ export const pluginsCommand: Command = {
     output.writeln();
     output.writeln('Subcommands:');
     output.printList([
-      `${output.highlight('list')}        - List plugins from IPFS registry`,
-      `${output.highlight('search')}      - Search plugins by query`,
-      `${output.highlight('install')}     - Install a plugin (supports name@registry)`,
-      `${output.highlight('uninstall')}   - Remove an installed plugin`,
-      `${output.highlight('upgrade')}     - Upgrade an installed plugin`,
-      `${output.highlight('toggle')}      - Enable or disable a plugin`,
-      `${output.highlight('info')}        - Show detailed plugin information`,
-      `${output.highlight('create')}      - Scaffold a new plugin project`,
-      `${output.highlight('marketplace')} - Manage plugin marketplaces`,
+      `${output.highlight('list')}      - List plugins from IPFS registry`,
+      `${output.highlight('search')}    - Search plugins by query`,
+      `${output.highlight('install')}   - Install a plugin from npm or local path`,
+      `${output.highlight('uninstall')} - Remove an installed plugin`,
+      `${output.highlight('upgrade')}   - Upgrade an installed plugin`,
+      `${output.highlight('toggle')}    - Enable or disable a plugin`,
+      `${output.highlight('info')}      - Show detailed plugin information`,
+      `${output.highlight('verify')}    - Check ruflo marketplace plugins against their release signatures`,
+      `${output.highlight('paths')}     - Local folders of ruflo plugins (claude -p --plugin-dir, Agent SDK)`,
+      `${output.highlight('host')}      - Install/sync ruflo marketplace plugins in Claude Code and Codex together`,
+      `${output.highlight('create')}    - Scaffold a new plugin project`,
     ]);
     output.writeln();
     output.writeln(output.bold('IPFS-Based Features:'));

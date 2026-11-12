@@ -62,6 +62,11 @@ export interface PluginEntry {
 
 /**
  * Plugin types
+ *
+ * ADR-150 added 'harness' — a MetaHarness-generated standalone agent
+ * harness. Harnesses share the ruflo plugin registry shape (per
+ * `buildRegistryEntry()` from metaharness) so `npx ruflo plugins list
+ * --type harness` surfaces community harnesses alongside plugins.
  */
 export type PluginType =
   | 'agent'      // Adds new agent types
@@ -71,7 +76,8 @@ export type PluginType =
   | 'integration'// External integrations
   | 'theme'      // UI themes
   | 'core'       // Core functionality extensions
-  | 'hybrid';    // Multiple types
+  | 'hybrid'     // Multiple types
+  | 'harness';   // ADR-150 — MetaHarness-generated standalone harness
 
 /**
  * Plugin dependency
@@ -313,6 +319,11 @@ export interface PluginStoreConfig {
 
   // Security
   requireVerification: boolean;
+  /**
+   * Fall back to the built-in (unverified) plugin list when the signed registry can't be
+   * verified. Defaults to true, or false under `CLAUDE_FLOW_STRICT_PLUGINS=true`.
+   */
+  allowUnverifiedFallback?: boolean;
   requireSecurityAudit: boolean;
   minTrustLevel: TrustLevel;
   trustedAuthors: string[];

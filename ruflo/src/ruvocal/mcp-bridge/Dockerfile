@@ -1,4 +1,6 @@
-FROM node:20-slim
+# Node 24 is Active LTS through April 2028. Keep this pinned to a
+# supported LTS line; test-security-lock.js fails if it drifts to EOL.
+FROM node:24-slim
 
 WORKDIR /app
 
@@ -9,12 +11,13 @@ RUN npm install --production
 # Each installed separately so one failure doesn't block others
 RUN npm install -g ruvector || true
 RUN npm install -g ruflo || true
-RUN npm install -g agentic-flow@alpha || true
-RUN npm install -g gemini-mcp-server || true
+RUN npm install -g agentic-flow@3.5.4 || true
+RUN npm install -g gemini-mcp-server@1.2.2 || true
 RUN npm install -g @openai/codex || true
 
 COPY index.js ./
 COPY mcp-stdio-kernel.js ./
+COPY url-guard.js ./
 
 # Create writable directories for MCP backends (ruflo, ruvector, agentic-flow)
 # These tools write state/tasks/memory to the working directory at runtime

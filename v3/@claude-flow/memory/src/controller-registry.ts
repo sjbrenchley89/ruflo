@@ -10,6 +10,7 @@
  * @module @claude-flow/memory/controller-registry
  */
 
+import { withAgentdbLockRecovery, closeWithAgentdbLockRecovery, AgentdbLockError, isConcurrentModificationError } from './agentdb-lock-guard.js';
 import { EventEmitter } from 'node:events';
 import type {
   IMemoryBackend,
@@ -25,6 +26,8 @@ import { MemoryGraph } from './memory-graph.js';
 import type { MemoryGraphConfig } from './memory-graph.js';
 import { TieredCacheManager } from './cache-manager.js';
 import type { CacheConfig } from './types.js';
+import { TieredMemoryStore } from './tiered-memory.js';
+import { useHostSqliteDriver } from './agentdb-native-driver.js';
 
 // ===== Types =====
 
@@ -66,6 +69,25 @@ export type CLIControllerName =
   | 'rvfOptimizer'
   | 'mmrDiversityRanker'
   | 'guardedVectorBackend';
+
+/**
+ * Minimal surface the `hybridSearch` controller needs from a backend when
+ * falling back to `this.backend` (no `memoryService` supplied) — the same
+ * two methods `AgentDBAdapter` exposes and the only two this factory calls.
+ * A named guard instead of ad-hoc `typeof` checks so a future backend that
+ * happens to define same-named-but-differently-shaped methods is easier to
+ * catch and reason about at one call site (Dream Cycle 2026-08-18).
+ */
+interface HybridCapableBackend {
+  semanticSearch(query: string, k?: number, threshold?: number): Promise<unknown[]>;
+  searchKeyword(query: string, options?: { k?: number }): Promise<unknown[]>;
+}
+
+function isHybridCapableBackend(backend: unknown): backend is HybridCapableBackend {
+  if (!backend || typeof backend !== 'object') return false;
+  const b = backend as Record<string, unknown>;
+  return typeof b.semanticSearch === 'function' && typeof b.searchKeyword === 'function';
+}
 
 /**
  * All controller names
@@ -223,13 +245,40 @@ export const INIT_LEVELS: InitLevel[] = [
  * await registry.shutdown();
  * ```
  */
+/**
+ * Name the first backend failure, not just the last fallback's (#4622).
+ * A native vector store locked by another process makes AgentDB fall back to
+ * a backend that then rejects the same file as the wrong format; reporting
+ * only that error reads like corruption.
+ */
+export function describeAgentdbInitFailure(finalMessage: string, backendFailures: readonly string[]): string {
+  const final = finalMessage.split('\n')[0].slice(0, 300);
+  const first = backendFailures.find((r) => r && r !== final);
+  let text = first ? `${first} (fallback backend then failed: ${final})` : final;
+  const shareHint = ' Run one owner (ruflo mcp start --transport http) and point every client at it.';
+  if (/already open|Cannot acquire lock|database is locked/i.test(first ?? final)) {
+    text += '. Another process holds this memory store open; separate stdio MCP servers cannot share one store.' + shareHint;
+  } else if (!first && /not a database|file is encrypted/i.test(final)) {
+    // Without a logged first failure (AgentDB logs it only when it can try
+    // another native backend), a format rejection is often a fallback reading
+    // a store another backend wrote — and that backend may be held elsewhere.
+    text += '. If another process has this memory store open, its native vector store is locked and the fallback'
+      + ' cannot read it; this does not mean the file is corrupt.' + shareHint;
+  }
+  return text;
+}
+
 export class ControllerRegistry extends EventEmitter {
   private controllers: Map<ControllerName, ControllerEntry> = new Map();
   private agentdb: any = null;
+  private dbPath: string | undefined;
+  /** Why AgentDB failed to open on the last initialize(), or null (#4622). */
+  private agentdbInitError: string | null = null;
   private backend: IMemoryBackend | null = null;
   private config: RuntimeConfig = {};
   private initialized = false;
   private initTimeMs = 0;
+  private hierarchicalFallback: { reason: string; persistence: string } | null = null;
 
   /**
    * Initialize all controllers in level-based order.
@@ -273,6 +322,9 @@ export class ControllerRegistry extends EventEmitter {
           const errorMsg = result.reason instanceof Error
             ? result.reason.message
             : String(result.reason);
+
+          // #2432 — close any prior instance before replacing.
+          await this.closePriorIfAny(name);
 
           this.controllers.set(name, {
             name,
@@ -319,14 +371,30 @@ export class ControllerRegistry extends EventEmitter {
 
     // Shutdown AgentDB
     if (this.agentdb) {
+      let persistFailure: AgentdbLockError | null = null;
       try {
         if (typeof this.agentdb.close === 'function') {
-          await this.agentdb.close();
+          const closeFn = () => this.agentdb.close();
+          await closeWithAgentdbLockRecovery(this.dbPath, closeFn);
         }
-      } catch {
-        // Best-effort cleanup
+      } catch (error) {
+        // Best-effort cleanup for ordinary close errors, but a failed
+        // PERSIST (stale/live lock or concurrent writer) must never be
+        // swallowed: the caller has to know pending changes were not saved.
+        if (error instanceof AgentdbLockError || isConcurrentModificationError(error)) {
+          persistFailure = error instanceof AgentdbLockError
+            ? error
+            : new AgentdbLockError('AgentDB failed to persist on close; pending changes were NOT saved.', 'unverifiable', { cause: error });
+          this.emit('agentdb:persist-failed', { reason: persistFailure.message });
+        }
       }
       this.agentdb = null;
+      if (persistFailure) {
+        this.controllers.clear();
+        this.initialized = false;
+        this.emit('shutdown');
+        throw persistFailure;
+      }
     }
 
     this.controllers.clear();
@@ -389,6 +457,43 @@ export class ControllerRegistry extends EventEmitter {
   }
 
   /**
+   * Register an already-constructed controller instance directly, outside
+   * the level-based `initialize()` path.
+   *
+   * Dream Cycle 2026-10-28: this method did not exist until now, even though
+   * `memory-bridge.ts`'s post-init wiring (reasoningBank/learningSystem/
+   * skills/semanticRouter/gnnService/rvfOptimizer/mutationGuard/
+   * attestationLog/guardedVectorBackend) has called `typeof reg.set ===
+   * 'function'` and fallen through to a dead `reg._controllers` property —
+   * never read anywhere — on every call since that wiring was added. As a
+   * result `get('mutationGuard')`/`get('attestationLog')` always returned
+   * null, so `guardValidate()` always took its "no guard installed = allow"
+   * branch and `logAttestation()` was a permanent no-op. Same shape as the
+   * already-fixed #3327 Finding A (`reasoningBank.store` never existed, so
+   * its own `typeof ... === 'function'` guard was dead too).
+   *
+   * Dispatches #2432's `closePriorIfAny(name)` for whatever entry `name`
+   * currently holds *before* overwriting the map, same as `initController()`
+   * does, so a `set()` that replaces a resource-holding instance (one
+   * constructed via the normal `initialize()` path, or a prior `set()`
+   * call) doesn't silently orphan it. Intentionally not awaited — like
+   * every other post-init activation call site, `set()` stays synchronous
+   * so `get(name)` reflects the new instance immediately; the old
+   * instance's `close()`/`dispose()` (best-effort, errors swallowed) runs
+   * in the background.
+   */
+  set<T>(name: ControllerName, instance: T): void {
+    void this.closePriorIfAny(name);
+    this.controllers.set(name, {
+      name,
+      instance,
+      level: -1, // externally registered — not part of level-based init
+      initTimeMs: 0,
+      enabled: true,
+    });
+  }
+
+  /**
    * Aggregate health check across all controllers.
    */
   async healthCheck(): Promise<RegistryHealthReport> {
@@ -446,6 +551,17 @@ export class ControllerRegistry extends EventEmitter {
   }
 
   /**
+   * Why AgentDB failed to open on the last initialize(), or null when it
+   * opened (or was never asked to). The message keeps the first backend's
+   * own failure — e.g. a native vector store already locked by another
+   * process — which AgentDB's fallback chain otherwise replaces with the
+   * last fallback's unrelated error (#4622).
+   */
+  getAgentDBInitError(): string | null {
+    return this.agentdbInitError;
+  }
+
+  /**
    * Get the memory backend.
    */
   getBackend(): IMemoryBackend | null {
@@ -495,6 +611,11 @@ export class ControllerRegistry extends EventEmitter {
       return;
     }
 
+    this.agentdbInitError = null;
+    // AgentDB logs why each backend it tried failed, then tries the next one
+    // against the same file. Those lines are suppressed below as noise, but
+    // when every backend fails they hold the original cause (#4622).
+    const backendFailures: string[] = [];
     try {
       // Validate dbPath to prevent path traversal
       const dbPath = config.dbPath || ':memory:';
@@ -504,6 +625,7 @@ export class ControllerRegistry extends EventEmitter {
         const { resolve: resolvePath } = await import('node:path');
         const resolved = resolvePath(dbPath);
         if (resolved.includes('..')) {
+          this.agentdbInitError = 'Invalid dbPath';
           this.emit('agentdb:unavailable', { reason: 'Invalid dbPath' });
           return;
         }
@@ -513,11 +635,12 @@ export class ControllerRegistry extends EventEmitter {
       const AgentDBClass = agentdbModule.AgentDB || agentdbModule.default;
 
       if (!AgentDBClass) {
+        this.agentdbInitError = 'No AgentDB class found';
         this.emit('agentdb:unavailable', { reason: 'No AgentDB class found' });
         return;
       }
 
-      this.agentdb = new AgentDBClass({ dbPath });
+      this.dbPath = dbPath;
 
       // Suppress agentdb's noisy info-level output during init
       // using stderr redirect instead of monkey-patching console.log
@@ -528,18 +651,36 @@ export class ControllerRegistry extends EventEmitter {
                msg.includes('better-sqlite3') ||
                msg.includes('[AgentDB]');
       };
-      console.log = (...args: unknown[]) => {
-        if (!suppressFilter(args)) origLog.apply(console, args);
+      // agentdb 3.0.0 moved its diagnostics from stdout to stderr (a library
+      // must not write to a stdio MCP server's JSON-RPC stream), so capture the
+      // backend failure reason from either stream.
+      const origError = console.error;
+      const capture = (orig: (...a: unknown[]) => void) => (...args: unknown[]) => {
+        const reason = /^\[AgentDB\] Reason: (.+)$/.exec(String(args[0] ?? ''));
+        if (reason && backendFailures.length < 4) backendFailures.push(reason[1].slice(0, 300));
+        if (!suppressFilter(args)) orig.apply(console, args);
       };
+      console.log = capture(origLog);
+      console.error = capture(origError);
       try {
-        await this.agentdb.initialize();
+        // agentdb >= alpha.20 refuses sql.js saves while a `<db>.agentdb.lock`
+        // exists. A lock left by a dead writer is cleared (only when provably
+        // stale) and init retried once with a fresh instance.
+        await withAgentdbLockRecovery(dbPath, async () => {
+          this.agentdb = new AgentDBClass({ dbPath });
+          // Keep agentdb's nested better-sqlite3 11.x out of the process (Node 24 abort).
+          useHostSqliteDriver(this.agentdb);
+          await this.agentdb.initialize();
+        });
       } finally {
         console.log = origLog;
+        console.error = origError;
       }
       this.emit('agentdb:initialized');
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
-      this.emit('agentdb:unavailable', { reason: msg.substring(0, 200) });
+      this.agentdbInitError = describeAgentdbInitFailure(msg, backendFailures);
+      this.emit('agentdb:unavailable', { reason: this.agentdbInitError });
       this.agentdb = null;
     }
   }
@@ -619,10 +760,44 @@ export class ControllerRegistry extends EventEmitter {
   }
 
   /**
+   * Close any prior controller instance for `name` before it is replaced.
+   *
+   * #2432 fix — pre-fix, `controllers.set(name, ...)` silently orphaned the
+   * prior instance. For backends that allocate native / WASM resources
+   * (notably `SqlJsRvfBackend` which keeps an Emscripten MEMFS file ~11 MB
+   * per `new SQL.Database(buffer)` until `close()` runs), GC'ing the JS
+   * wrapper does NOT reclaim the underlying allocation. A long-running
+   * `mcp start` process that re-init'd controllers hundreds of times grew
+   * external memory by ~36 GB in production over 6 weeks.
+   *
+   * Best-effort close: catch and ignore errors — replacement must proceed
+   * even if the prior instance's close throws (it's already orphaned at
+   * this point either way).
+   */
+  private async closePriorIfAny(name: ControllerName): Promise<void> {
+    const prior = this.controllers.get(name);
+    if (!prior?.instance) return;
+    const inst = prior.instance as { close?: () => unknown; dispose?: () => unknown };
+    try {
+      if (typeof inst.close === 'function') {
+        await inst.close();
+      } else if (typeof inst.dispose === 'function') {
+        await inst.dispose();
+      }
+    } catch {
+      // Best-effort — leak is preferable to crashing init on a replacement.
+    }
+  }
+
+  /**
    * Initialize a single controller with error isolation.
    */
   private async initController(name: ControllerName, level: number): Promise<void> {
     const startTime = performance.now();
+
+    // #2432 — close any prior instance before replacing the map entry,
+    // otherwise its native/WASM resources leak (e.g. sql.js MEMFS files).
+    await this.closePriorIfAny(name);
 
     try {
       const instance = await this.createController(name);
@@ -711,16 +886,38 @@ export class ControllerRegistry extends EventEmitter {
       }
 
       case 'hybridSearch': {
-        // ADR-125 Phase 5 — real RRF + MMR hybrid search.
-        // Calls semanticSearch() (which degrades gracefully when embedder is
-        // unavailable) AND searchKeyword() independently, fuses via RRF, then
-        // diversifies via MMR (lambda=0.7).
+        // ADR-125 Phase 5 + ADR-147 P2 — three-arm RRF + MMR hybrid search.
+        // Runs semanticSearch() (dense, with graceful fallback),
+        // searchKeyword() (sparse FTS5), and a per-entity keyword search
+        // (entity arm, gated on extractEntities(query) returning anything)
+        // independently in parallel, fuses via RRF, diversifies via MMR.
+        // Results carry a `signals` field naming which arms surfaced each
+        // entry (provenance for debugging + downstream rerankers).
+        //
+        // Dream Cycle 2026-08-18: the auto-enable gate (`isControllerEnabled`)
+        // already honors an explicit `controllers: { hybridSearch: true }`
+        // override, but until now this factory unconditionally required
+        // `config.memoryService` regardless of that override — so explicitly
+        // opting in without also hand-building a `UnifiedMemoryService`
+        // silently produced a disabled controller (no error, no signal why).
+        // When no `memoryService` was supplied, fall back to `this.backend`
+        // if it duck-types as AgentDBAdapter-compatible (has `semanticSearch`
+        // + `searchKeyword`) — the same two methods this factory already
+        // calls below. Only reachable when a caller explicitly requests
+        // `hybridSearch`; the default (memoryService-only) auto-enable
+        // condition and its behavior are unchanged.
         const memSvc = this.config.memoryService;
-        if (!memSvc) return null;
-        const adapter = typeof memSvc.getAdapter === 'function' ? memSvc.getAdapter() : null;
+        const directBackend =
+          !memSvc && isHybridCapableBackend(this.backend) ? this.backend : null;
+        const adapter = memSvc
+          ? typeof memSvc.getAdapter === 'function'
+            ? memSvc.getAdapter()
+            : null
+          : directBackend;
         if (!adapter) return null;
 
         const { applyRRF, applyMMR } = await import('./smart-retrieval.js');
+        const { extractEntities } = await import('./entity-tagger.js');
 
         return {
           /**
@@ -738,23 +935,6 @@ export class ControllerRegistry extends EventEmitter {
             const fanOutK = opts.fanOutK ?? Math.max(limit * 3, 20);
             const mmrLambda = opts.mmrLambda ?? 0.7;
 
-            // Dense arm — may internally fall back to keyword if embedder is
-            // missing, but that's still a valid signal to fuse.
-            let dense: any[] = [];
-            try {
-              dense = await adapter.semanticSearch(query, fanOutK);
-            } catch {
-              dense = [];
-            }
-
-            // Sparse arm — FTS5 / keyword search.
-            let sparse: any[] = [];
-            try {
-              sparse = await adapter.searchKeyword(query, { k: fanOutK });
-            } catch {
-              sparse = [];
-            }
-
             // Adapt SearchResult[] → SearchCandidate[] expected by RRF
             const toCands = (results: any[]) =>
               results.map((r: any) => ({
@@ -766,16 +946,68 @@ export class ControllerRegistry extends EventEmitter {
                 createdAt: r.entry.createdAt,
                 updatedAt: r.entry.updatedAt,
                 score: r.score,
+                // Dream Cycle 2026-09-03: `r.entry.embedding` is already
+                // populated by the adapter (agentdb-backend.ts) — was
+                // stashed in `_entry` but never copied to `.embedding`, so
+                // applyMMR below fell back to token-Jaccard here too.
+                // Float32Array→number[] to match smart-retrieval's shape.
+                embedding: r.entry.embedding ? Array.from(r.entry.embedding as ArrayLike<number>) : undefined,
                 _entry: r.entry,
               }));
 
-            const fused = applyRRF([toCands(dense), toCands(sparse)], 60);
+            // Entity arm — only fire if the query actually contains
+            // extractable entities. Empty arm is dropped from RRF input
+            // so it doesn't dilute the fusion.
+            const entities = extractEntities(query);
+            const entityFanOut = entities.length > 0
+              ? Math.max(1, Math.ceil(fanOutK / entities.length))
+              : 0;
+
+            // Run all three arms in parallel. Per-arm try/catch (via the
+            // .catch(...) tails) keeps one failing backend from blanking
+            // the other arms — the same defensive shape used pre-ADR-147.
+            const [dense, sparse, entityHits] = await Promise.all([
+              adapter.semanticSearch(query, fanOutK).catch(() => [] as any[]),
+              adapter.searchKeyword(query, { k: fanOutK }).catch(() => [] as any[]),
+              entities.length > 0
+                ? Promise.all(
+                    entities.map((e: string) =>
+                      adapter.searchKeyword(e, { k: entityFanOut }).catch(() => [] as any[]),
+                    ),
+                  ).then((perEntity: any[][]) => perEntity.flat())
+                : Promise.resolve([] as any[]),
+            ]);
+
+            const denseCands = toCands(dense);
+            const sparseCands = toCands(sparse);
+            const entityCands = toCands(entityHits);
+
+            // Build signal-provenance sets keyed by candidate id BEFORE
+            // RRF so we can stamp `signals` onto the fused output.
+            const candKey = (c: { id?: string; key?: string; content: string }) =>
+              c.id || c.key || c.content.slice(0, 128);
+            const denseIds = new Set(denseCands.map(candKey));
+            const sparseIds = new Set(sparseCands.map(candKey));
+            const entityIds = new Set(entityCands.map(candKey));
+
+            const arms = [denseCands, sparseCands];
+            if (entityCands.length > 0) arms.push(entityCands);
+
+            const fused = applyRRF(arms, 60);
             const diverse = applyMMR(fused, mmrLambda, limit);
 
-            return diverse.map((s: any) => ({
-              entry: s.candidate._entry,
-              score: s.score,
-            }));
+            return diverse.map((s: any) => {
+              const key = candKey(s.candidate);
+              const signals: ('vector' | 'bm25' | 'entity')[] = [];
+              if (denseIds.has(key)) signals.push('vector');
+              if (sparseIds.has(key)) signals.push('bm25');
+              if (entityIds.has(key)) signals.push('entity');
+              return {
+                entry: s.candidate._entry,
+                score: s.score,
+                signals,
+              };
+            });
           },
           source: 'hybrid-rrf-mmr' as const,
         };
@@ -785,18 +1017,13 @@ export class ControllerRegistry extends EventEmitter {
         // Agent memory scope — placeholder, activated when explicitly enabled
         return null;
 
-      case 'semanticRouter': {
-        // SemanticRouter exported from agentdb 3.0.0-alpha.10 (ADR-062)
-        // Constructor: () — requires initialize() after construction
-        try {
-          const agentdbModule: any = await import('agentdb');
-          const SR = agentdbModule.SemanticRouter;
-          if (!SR) return null;
-          const router = new SR();
-          await router.initialize();
-          return router;
-        } catch { return null; }
-      }
+      case 'semanticRouter':
+        // SemanticRouter was exported by agentdb 3.0.0-alpha.10 (ADR-062) but
+        // dropped from every installable range (`^3.0.0-alpha.17`) — issue
+        // #2977. No fallback implementation exists for this controller;
+        // returning null directly instead of attempting a dynamic import
+        // that never resolves.
+        return null;
 
       case 'sonaTrajectory':
         // Delegate to AgentDB's SonaTrajectoryService if available
@@ -810,42 +1037,32 @@ export class ControllerRegistry extends EventEmitter {
         return null;
 
       case 'hierarchicalMemory': {
-        // HierarchicalMemory exported from agentdb 3.0.0-alpha.10 (ADR-066 Phase P2-3)
-        // Constructor: (db, embedder, vectorBackend?, graphBackend?, config?)
-        if (!this.agentdb) return this.createTieredMemoryStub();
-        try {
-          const agentdbModule: any = await import('agentdb');
-          const HM = agentdbModule.HierarchicalMemory;
-          if (!HM) return this.createTieredMemoryStub();
-          const embedder = this.createEmbeddingService();
-          const hm = new HM(this.agentdb.database, embedder);
-          await hm.initializeDatabase();
-          return hm;
-        } catch {
-          return this.createTieredMemoryStub();
-        }
+        // HierarchicalMemory was exported by agentdb 3.0.0-alpha.10 (ADR-066
+        // Phase P2-3) and REMOVED again at alpha.17 — every installable range
+        // (`^3.0.0-alpha.17`) is missing it, and alpha.10 — the one version
+        // that DOES export it — throws `RangeError: Too few parameter values
+        // were provided` on the very first store() call (issue #2977), so
+        // there is no version of agentdb where the native path actually
+        // works. The dynamic-import/instantiate attempt is dead code on
+        // every install; the tiered fallback is the only implementation that
+        // has ever worked here, so it is promoted to first-class instead of
+        // being attempted-and-discarded on every init. Still records *why*
+        // it's in use, because taking a fallback silently is what made
+        // stores look successful while landing nowhere (#2887).
+        return this.tieredMemoryFallback(
+          this.agentdb ? 'agentdb-export-missing' : 'agentdb-unavailable',
+        );
       }
 
       case 'memoryConsolidation': {
-        // MemoryConsolidation exported from agentdb 3.0.0-alpha.10 (ADR-066 Phase P2-3)
-        // Constructor: (db, hierarchicalMemory, embedder, vectorBackend?, graphBackend?, config?)
-        if (!this.agentdb) return this.createConsolidationStub();
-        try {
-          const agentdbModule: any = await import('agentdb');
-          const MC = agentdbModule.MemoryConsolidation;
-          if (!MC) return this.createConsolidationStub();
-          // Get the HierarchicalMemory instance (must be initialized at level 1 before us at level 3)
-          const hm: any = this.get('hierarchicalMemory');
-          if (!hm || typeof hm.recall !== 'function' || typeof hm.store !== 'function') {
-            return this.createConsolidationStub();
-          }
-          const embedder = this.createEmbeddingService();
-          const mc = new MC(this.agentdb.database, hm, embedder);
-          await mc.initializeDatabase();
-          return mc;
-        } catch {
-          return this.createConsolidationStub();
-        }
+        // MemoryConsolidation was exported by agentdb 3.0.0-alpha.10 (ADR-066
+        // Phase P2-3) and removed at alpha.14 — no installable range exports
+        // it, and it requires a working HierarchicalMemory instance to
+        // construct, which is itself dead (see hierarchicalMemory above,
+        // #2977). The no-op stub is therefore the only implementation that
+        // has ever worked here; it is promoted to first-class instead of
+        // attempting a dynamic import that never resolves.
+        return this.createConsolidationStub();
       }
 
       case 'federatedSession':
@@ -861,7 +1078,31 @@ export class ControllerRegistry extends EventEmitter {
           const agentdbModule: any = await import('agentdb');
           const RB = agentdbModule.ReasoningBank;
           if (!RB) return null;
-          const embedder = this.createEmbeddingService();
+          // #3327 Finding A — ReasoningBank MUST get AgentDB's own embedder,
+          // not createEmbeddingService(). Two independent reasons, both fatal:
+          //
+          //   1. agentdb's ReasoningBank calls `embedder.embedPassage()` on
+          //      store and `embedder.embedQuery()` on search (asymmetric
+          //      query/passage embedding). createEmbeddingService() returns
+          //      only {embed, embedBatch, initialize}, so BOTH paths threw
+          //      `TypeError: this.embedder.embedPassage is not a function`.
+          //      The throw was swallowed by the bridge's catch, which is why
+          //      the controller reported `enabled: true` while every write and
+          //      read silently routed to bridge-fallback/substring instead.
+          //   2. Even with the names shimmed, the no-generator branch of
+          //      createEmbeddingService() returns ZERO vectors, so every
+          //      pattern would embed identically and rank meaninglessly.
+          //
+          // `this.agentdb.embedder` is normally the real Transformers.js
+          // service, which already implements the full contract. But when the
+          // model cannot load (offline, or agentdb's `sharp`/transformers
+          // optional dep fails to install) agentdb silently swaps in a MOCK
+          // embedder that exposes only `embed` — so taking it as-is
+          // reintroduces the exact crash this fixes. Adapt whatever we get,
+          // and fall back to the local service only when there is no embedder
+          // at all.
+          const embedder = this.adaptEmbedderForAgentdb(this.agentdb.embedder)
+            ?? this.createEmbeddingService();
           return new RB(this.agentdb.database, embedder);
         } catch { return null; }
       }
@@ -881,7 +1122,7 @@ export class ControllerRegistry extends EventEmitter {
           const agentdbModule: any = await import('agentdb');
           const CR = agentdbModule.CausalRecall;
           if (!CR) return null;
-          return new CR(this.agentdb.database);
+          return new CR(this.agentdb.database, this.agentdbEmbedder(), this.agentdb.vectorBackend ?? undefined);
         } catch { return null; }
       }
 
@@ -891,7 +1132,7 @@ export class ControllerRegistry extends EventEmitter {
           const agentdbModule: any = await import('agentdb');
           const LS = agentdbModule.LearningSystem;
           if (!LS) return null;
-          return new LS(this.agentdb.database);
+          return new LS(this.agentdb.database, this.agentdbEmbedder());
         } catch { return null; }
       }
 
@@ -901,7 +1142,7 @@ export class ControllerRegistry extends EventEmitter {
           const agentdbModule: any = await import('agentdb');
           const ER = agentdbModule.ExplainableRecall;
           if (!ER) return null;
-          return new ER(this.agentdb.database);
+          return new ER(this.agentdb.database, this.agentdbEmbedder());
         } catch { return null; }
       }
 
@@ -930,7 +1171,7 @@ export class ControllerRegistry extends EventEmitter {
           const agentdbModule: any = await import('agentdb');
           const NL = agentdbModule.NightlyLearner;
           if (!NL) return null;
-          return new NL(this.agentdb.database);
+          return new NL(this.agentdb.database, this.agentdbEmbedder());
         } catch { return null; }
       }
 
@@ -940,7 +1181,7 @@ export class ControllerRegistry extends EventEmitter {
           const agentdbModule: any = await import('agentdb');
           const GT = agentdbModule.CausalMemoryGraph;
           if (!GT) return null;
-          return new GT(this.agentdb.database);
+          return new GT(this.agentdb.database, undefined, this.agentdbEmbedder(), undefined, this.agentdb.vectorBackend ?? undefined);
         } catch { return null; }
       }
 
@@ -973,70 +1214,18 @@ export class ControllerRegistry extends EventEmitter {
         } catch { return null; }
       }
 
-      case 'mutationGuard': {
-        // MutationGuard exported from agentdb 3.0.0-alpha.10 (ADR-060)
-        // Constructor: (config?) where config.dimension, config.maxElements, config.enableWasmProofs
-        if (!this.agentdb) return null;
-        try {
-          const agentdbModule: any = await import('agentdb');
-          const MG = agentdbModule.MutationGuard;
-          if (!MG) return null;
-          return new MG({ dimension: this.config.dimension || 384 });
-        } catch { return null; }
-      }
-
-      case 'attestationLog': {
-        // AttestationLog exported from agentdb 3.0.0-alpha.10 (ADR-060)
-        // Constructor: (db) — uses database for append-only audit log
-        if (!this.agentdb) return null;
-        try {
-          const agentdbModule: any = await import('agentdb');
-          const AL = agentdbModule.AttestationLog;
-          if (!AL) return null;
-          return new AL(this.agentdb.database);
-        } catch { return null; }
-      }
-
-      case 'gnnService': {
-        // GNNService exported from agentdb 3.0.0-alpha.10 (ADR-062)
-        // Constructor: (config?) — requires initialize() after construction
-        try {
-          const agentdbModule: any = await import('agentdb');
-          const GNN = agentdbModule.GNNService;
-          if (!GNN) return null;
-          const gnn = new GNN({ inputDim: this.config.dimension || 384 });
-          await gnn.initialize();
-          return gnn;
-        } catch { return null; }
-      }
-
-      case 'rvfOptimizer': {
-        // RVFOptimizer exported from agentdb 3.0.0-alpha.10 (ADR-062/065)
-        // Constructor: (config?) — no-arg for defaults
-        try {
-          const agentdbModule: any = await import('agentdb');
-          const RVF = agentdbModule.RVFOptimizer;
-          if (!RVF) return null;
-          return new RVF();
-        } catch { return null; }
-      }
-
-      case 'guardedVectorBackend': {
-        // GuardedVectorBackend exported from agentdb 3.0.0-alpha.10 (ADR-060)
-        // Constructor: (innerBackend, mutationGuard, attestationLog?)
-        // Requires vectorBackend and mutationGuard to be initialized first (level 2)
-        if (!this.agentdb) return null;
-        try {
-          const vb = this.get('vectorBackend');
-          const guard = this.get('mutationGuard');
-          if (!vb || !guard) return null;
-          const agentdbModule: any = await import('agentdb');
-          const GVB = agentdbModule.GuardedVectorBackend;
-          if (!GVB) return null;
-          const log = this.get('attestationLog');
-          return new GVB(vb, guard, log || undefined);
-        } catch { return null; }
-      }
+      // MutationGuard, AttestationLog, GNNService, RVFOptimizer, and
+      // GuardedVectorBackend were all exported by agentdb 3.0.0-alpha.10
+      // (ADR-060/062/065) but dropped from every installable range
+      // (`^3.0.0-alpha.17`) — issue #2977. No fallback implementation exists
+      // for any of these five controllers; they return null directly instead
+      // of attempting a dynamic import that never resolves.
+      case 'mutationGuard':
+      case 'attestationLog':
+      case 'gnnService':
+      case 'rvfOptimizer':
+      case 'guardedVectorBackend':
+        return null;
 
       case 'vectorBackend':
       case 'graphAdapter': {
@@ -1102,75 +1291,143 @@ export class ControllerRegistry extends EventEmitter {
    * Create an EmbeddingService for controllers that need it.
    * Uses the config's embedding generator or creates a minimal local service.
    */
+  /**
+   * Adapt an arbitrary embedder to the contract agentdb's controllers call
+   * (#3327).
+   *
+   * ReasoningBank uses asymmetric query/passage embedding — `embedQuery()` on
+   * search, `embedPassage()` on store. Several embedders reaching here expose
+   * only `embed()`:
+   *   • agentdb's mock embedder, substituted whenever the Transformers.js
+   *     model fails to load (offline, or a failed `sharp` optional install);
+   *   • any host-supplied `embeddingGenerator` wrapper.
+   *
+   * Passing one of those through unchanged throws `... is not a function`
+   * deep inside the controller, where the bridge's catch converts it into a
+   * silent fallback — the failure this whole fix is about. Aliasing is
+   * semantically safe: a symmetric model returns the same vector for both
+   * roles, which is precisely what a single `embed()` implies.
+   *
+   * Returns null when there is nothing usable to adapt.
+   */
+  /**
+   * The embedder handed to directly constructed AgentDB controllers.
+   * CausalRecall, LearningSystem and NightlyLearner take `(db, embedder, …)`
+   * and call `embedder.embed*` on first use; constructing them with only the
+   * database left every recall/predict/discover call throwing a TypeError
+   * that the registry swallowed (same defect class as #3327 Finding A, which
+   * was fixed for ReasoningBank only). ADR-514.
+   */
+  private agentdbEmbedder(): any {
+    return this.adaptEmbedderForAgentdb(this.agentdb?.embedder) ?? this.createEmbeddingService();
+  }
+
+  private adaptEmbedderForAgentdb(embedder: any): any {
+    if (!embedder || typeof embedder.embed !== 'function') return null;
+    if (typeof embedder.embedQuery === 'function' && typeof embedder.embedPassage === 'function') {
+      return embedder; // already satisfies the contract — pass through untouched
+    }
+    const embed = embedder.embed.bind(embedder);
+    return Object.assign(Object.create(embedder), {
+      embed,
+      embedQuery: typeof embedder.embedQuery === 'function' ? embedder.embedQuery.bind(embedder) : embed,
+      embedPassage: typeof embedder.embedPassage === 'function' ? embedder.embedPassage.bind(embedder) : embed,
+      embedBatch: typeof embedder.embedBatch === 'function'
+        ? embedder.embedBatch.bind(embedder)
+        : async (texts: string[]) => Promise.all(texts.map((t) => embed(t))),
+    });
+  }
+
   private createEmbeddingService(): any {
-    // If user provided an embedding generator, wrap it
+    // #3327 — agentdb controllers call the asymmetric query/passage methods
+    // (`embedQuery` / `embedPassage`), not just `embed`. Anything handed this
+    // object must satisfy that wider contract or it throws at call time, deep
+    // inside a controller, where the bridge's catch turns it into a silent
+    // fallback. Alias them onto both branches.
     if (this.config.embeddingGenerator) {
+      const embed = async (text: string) => this.config.embeddingGenerator!(text);
       return {
-        embed: async (text: string) => this.config.embeddingGenerator!(text),
+        embed,
+        embedQuery: embed,
+        embedPassage: embed,
         embedBatch: async (texts: string[]) => Promise.all(texts.map(t => this.config.embeddingGenerator!(t))),
         initialize: async () => {},
       };
     }
-    // Return a minimal stub — HierarchicalMemory falls back to manualSearch without embeddings
+    // Zero-vector stub — HierarchicalMemory falls back to manualSearch without
+    // embeddings. NOTE: these vectors are all-zero and carry NO semantic
+    // signal; every pair scores identically. `isStubEmbedder` is exposed so a
+    // caller that needs real similarity can detect this and refuse, rather
+    // than ranking on noise (#3327).
+    const zero = async () => new Float32Array(this.config.dimension || 384);
     return {
-      embed: async () => new Float32Array(this.config.dimension || 384),
+      isStubEmbedder: true,
+      embed: zero,
+      embedQuery: zero,
+      embedPassage: zero,
       embedBatch: async (texts: string[]) => texts.map(() => new Float32Array(this.config.dimension || 384)),
       initialize: async () => {},
     };
   }
 
   /**
-   * Lightweight in-memory tiered store (fallback when HierarchicalMemory
-   * cannot be initialized from agentdb).
-   * Enforces per-tier size limits to prevent unbounded memory growth.
+   * Tiered store used when agentdb's HierarchicalMemory is unavailable.
+   *
+   * Since agentdb 3.0.0-alpha.17 dropped the `HierarchicalMemory` export
+   * entirely, this is the ONLY backing store for `agentdb_hierarchical-*`
+   * in practice — so it is handed AgentDB's SQLite connection and writes
+   * through to it. Without a connection it stays volatile and reports
+   * `isDurable() === false` so callers can refuse to claim success (#2887).
+   *
+   * Keeps the legacy duck-typed API — store(key, value, tier) /
+   * recall(query, topK) / getTierStats() — plus Zep/Graphiti-style temporal
+   * validity (validFrom / validUntil / supersededBy).
    */
-  private createTieredMemoryStub() {
-    const MAX_PER_TIER = 5000;
-    const tiers: Record<string, Map<string, { value: string; ts: number }>> = {
-      working: new Map(),
-      episodic: new Map(),
-      semantic: new Map(),
-    };
-    return {
-      store(key: string, value: string, tier = 'working') {
-        const t = tiers[tier] || tiers.working;
-        // Evict oldest if at capacity
-        if (t.size >= MAX_PER_TIER) {
-          const oldest = t.keys().next().value;
-          if (oldest !== undefined) t.delete(oldest);
-        }
-        t.set(key, { value: value.substring(0, 100_000), ts: Date.now() });
-      },
-      recall(query: string, topK = 5) {
-        const safeTopK = Math.min(Math.max(1, topK), 100);
-        const q = query.toLowerCase().substring(0, 10_000);
-        const results: Array<{ key: string; value: string; tier: string; ts: number }> = [];
-        for (const [tierName, map] of Object.entries(tiers)) {
-          for (const [key, entry] of map) {
-            if (key.toLowerCase().includes(q) || entry.value.toLowerCase().includes(q)) {
-              results.push({ key, value: entry.value, tier: tierName, ts: entry.ts });
-              if (results.length >= safeTopK * 3) break; // Early exit for large stores
-            }
-          }
-        }
-        return results.sort((a, b) => b.ts - a.ts).slice(0, safeTopK);
-      },
-      getTierStats() {
-        return Object.fromEntries(
-          Object.entries(tiers).map(([name, map]) => [name, map.size]),
-        );
-      },
-    };
+  private createTieredMemoryStub(): TieredMemoryStore {
+    const db = this.agentdb?.database ?? null;
+    const usable = db && typeof db.prepare === 'function' && typeof db.exec === 'function'
+      ? db
+      : null;
+    return new TieredMemoryStore({ db: usable });
+  }
+
+  /** Build the tiered fallback and record/emit why the native one was skipped. */
+  private tieredMemoryFallback(reason: string): TieredMemoryStore {
+    const store = this.createTieredMemoryStub();
+    this.hierarchicalFallback = { reason, persistence: store.getPersistence() };
+    this.emit('controller:degraded', {
+      name: 'hierarchicalMemory',
+      reason,
+      persistence: store.getPersistence(),
+    });
+    return store;
   }
 
   /**
-   * No-op consolidation stub (fallback when MemoryConsolidation
-   * cannot be initialized from agentdb).
+   * Why `hierarchicalMemory` is served by the tiered fallback, and whether
+   * that fallback is durable. Null when the native controller is in use.
+   */
+  getHierarchicalFallback(): { reason: string; persistence: string } | null {
+    return this.hierarchicalFallback;
+  }
+
+  /**
+   * No-op consolidation stub — the first-class implementation for
+   * `memoryConsolidation` since agentdb has never shipped a working native
+   * MemoryConsolidation on any installable range (#2977). `promoted: 0,
+   * pruned: 0` on its own reads as "ran and found nothing to do"; `source`
+   * and `note` make it explicit that consolidation never actually ran.
    */
   private createConsolidationStub() {
     return {
       consolidate() {
-        return { promoted: 0, pruned: 0, timestamp: Date.now() };
+        return {
+          promoted: 0,
+          pruned: 0,
+          timestamp: Date.now(),
+          source: 'stub' as const,
+          note: 'no-op: native MemoryConsolidation is unavailable (agentdb never exports a working implementation, #2977) — nothing was consolidated, this did not run',
+        };
       },
     };
   }

@@ -26,18 +26,18 @@ const section = (t) => console.log(`\n${t}`);
 
 console.log('Codex ↔ Ruflo integration audit (#1909)\n' + '─'.repeat(48));
 
-// ── 1. Codex MCP backend uses the real `mcp-server` subcommand ──────────────
-section('MCP backend registration (`codex` group):');
+// ── 1. The removed Codex MCP mode must not return as a dead backend ──────────
+section('Codex MCP backend retirement (#3509):');
 for (const p of ['ruflo/src/mcp-bridge/index.js', 'ruflo/src/ruvocal/mcp-bridge/index.js']) {
   if (!existsSync(resolve(ROOT, p))) { fail(`${p}: file missing`); continue; }
   const src = read(p);
-  const codexLine = (src.match(/.*@openai\/codex.*/g) ?? [])[0]?.trim() ?? '(no @openai/codex entry)';
-  check(/@openai\/codex"\s*,\s*"mcp-server"/.test(src),
-    `${p}: codex backend uses "mcp-server"`,
-    `${p}: codex backend must use "mcp-server" — found: ${codexLine}`);
-  check(!/@openai\/codex"\s*,\s*"mcp"\s*,\s*"serve"/.test(src),
-    `${p}: no invalid "mcp serve" subcommand`,
-    `${p}: still uses "mcp serve" (not a valid \`codex\` subcommand) — ${codexLine}`);
+  const codexGroup = src.match(/codex:\s*\{([^}]+)\}/)?.[1] ?? '';
+  check(/enabled:\s*false/.test(codexGroup),
+    `${p}: unsupported Codex MCP group stays disabled`);
+  check(!/\{\s*name:\s*"codex"\s*,\s*command:/.test(src),
+    `${p}: no backend launches the removed Codex MCP server`);
+  check(/MCP_GROUP_CODEX === "true"/.test(src) && /Codex CLI has no MCP server mode/.test(src),
+    `${p}: opt-in users receive a specific unsupported-mode diagnostic`);
 }
 
 // ── 2. @claude-flow/codex VERSION const tracks package.json ─────────────────
@@ -104,9 +104,14 @@ check(/version: "\$\{version\}"/.test(skillGen) && /author: \$\{author\}/.test(s
 // ── 8. config.toml generator emits a working `ruflo` MCP server ────────────
 section('config.toml generator MCP default:');
 const cfgGen = read('v3/@claude-flow/codex/src/generators/config-toml.ts');
-check(/name:\s*'ruflo'/.test(cfgGen) && /args:\s*\['-y',\s*'ruflo@latest',\s*'mcp',\s*'start'\]/.test(cfgGen),
-  `default MCP server is \`ruflo\` with \`mcp start\` subcommand`,
-  `default MCP server must be \`{ name: 'ruflo', args: ['-y','ruflo@latest','mcp','start'] }\` (was \`claude-flow\` w/o \`mcp start\`)`);
+const mcpConfig = read('v3/@claude-flow/codex/src/mcp-config.ts');
+check(/getRufloMcpServerConfig/.test(cfgGen)
+    && /RUFLO_MCP_SERVER_NAME\s*=\s*'ruflo'/.test(mcpConfig)
+    && /RUFLO_MCP_PACKAGE\s*=\s*'ruflo@latest'/.test(mcpConfig)
+    && /args:\s*\['\/c',\s*'npx',\s*\.\.\.args\]/.test(mcpConfig)
+    && /RUFLO_MCP_STARTUP_TIMEOUT_SEC\s*=\s*120/.test(mcpConfig),
+  `default MCP server is Windows-safe \`ruflo@latest mcp start\` with 120s startup timeout`,
+  `default MCP server must use the shared platform-aware Ruflo definition (cmd /c npx on Windows)`);
 
 console.log('\n' + '─'.repeat(48));
 if (failures > 0) {
