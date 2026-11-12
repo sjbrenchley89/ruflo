@@ -53,7 +53,7 @@ kg search <query>            # Semantic search across the graph
 
 ## Namespace coordination
 
-This plugin owns the `kg-graph` AgentDB namespace (kebab-case, follows the convention from [ruflo-agentdb ADR-0001 §"Namespace convention"](../ruflo-agentdb/docs/adrs/0001-agentdb-optimization.md)). Reserved namespaces (`pattern`, `claude-memories`, `default`) MUST NOT be shadowed.
+This plugin owns the `knowledge-graph` AgentDB namespace (kebab-case, follows the convention from [ruflo-agentdb ADR-0001 §"Namespace convention"](../ruflo-agentdb/docs/adrs/0001-agentdb-optimization.md)). Reserved namespaces (`pattern`, `claude-memories`, `default`) MUST NOT be shadowed.
 
 Entity nodes are stored via `agentdb_hierarchical-store`; relation edges via `agentdb_causal-edge`; semantic indexing via `embeddings_generate` (NOT `embeddings_embed` — that tool name doesn't exist; ADR-0001 fixes prior references).
 
@@ -97,3 +97,15 @@ bash plugins/ruflo-knowledge-graph/scripts/smoke.sh
 ## License
 
 MIT
+
+## As a mod
+
+This plugin ships a function-hook mod (ADR-445, `hooks/register.ts`). It makes no network call, spawns no process and makes no model call.
+
+- **Guard** (tighten-only, on by default): Refuses graph writes (`agentdb_causal-edge`, `agentdb_hierarchical-store`, `agentdb_pattern-store`) that hold a key, token or password, and `agentdb_causal-edge-delete` / `agentdb_causal-node-delete` unless the call carries `confirm: true`. A refusal never echoes the secret.
+- **`/kg-mod`**: `status`, `recent`, `tools` (which of this plugin's tools are connected) and `scan <text>` (would the guard refuse it). Answered locally.
+- **Status file**: `.claude-flow/kg-mod/status.json` (`{version: 1, updatedMs, guard, calls, total, blocked, recent}`, counters only, never tool input), written at session start and after every call to this plugin's tools.
+
+Options (`userConfig`): `guard` (on), `confirmDeletes` (on).
+
+Test it: `claude plugin validate plugins/ruflo-knowledge-graph`, `claude plugin test plugins/ruflo-knowledge-graph`, `bash plugins/ruflo-knowledge-graph/scripts/smoke.sh`.

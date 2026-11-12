@@ -249,13 +249,77 @@ describe('Memory Initializer', () => {
   });
 
   describe('HNSW status', () => {
-    it('should report unavailable when not initialized', async () => {
+    // #2356: `getHNSWStatus()` now separates "loaded in this process"
+    // (`initialized`) from "@ruvector/core capability present" (`available`).
+    // Previously `available` tracked the lazy in-process singleton, so a fresh
+    // `neural status` process always reported "Not loaded" even when the
+    // package was installed — a false negative. After clearing the index the
+    // contract is: not initialized, 0 entries, 384-dim; `available` reflects
+    // whether @ruvector/core is resolvable (env-dependent, so not hard-asserted).
+    it('should report not-initialized after the index is cleared', async () => {
       const { getHNSWStatus, clearHNSWIndex } = await import('../src/memory/memory-initializer.js');
       clearHNSWIndex();
       const status = getHNSWStatus();
-      expect(status.available).toBe(false);
+      expect(status.initialized).toBe(false);
+      expect(status.entryCount).toBe(0);
       expect(status.dimensions).toBe(384);
+      expect(typeof status.available).toBe('boolean');
     });
+  });
+
+  // AUDIT #3: generateEmbedding must expose a truthful `backend` field so an
+  // operator can distinguish real ONNX semantics from the deterministic hash
+  // fallback (inverted/meaningless semantics) even when `model` reports a
+  // real-looking name.
+  describe('generateEmbedding backend field', () => {
+    const prevDisableBridge = process.env.CLAUDE_FLOW_DISABLE_BRIDGE;
+
+    afterEach(() => {
+      vi.resetModules();
+      vi.doUnmock('@huggingface/transformers');
+      vi.doUnmock('@xenova/transformers');
+      vi.doUnmock('ruvector');
+      vi.doUnmock('agentic-flow');
+      vi.doUnmock('agentic-flow/reasoningbank');
+      if (prevDisableBridge === undefined) delete process.env.CLAUDE_FLOW_DISABLE_BRIDGE;
+      else process.env.CLAUDE_FLOW_DISABLE_BRIDGE = prevDisableBridge;
+    });
+
+    it("reports backend='mock' when no real embedding model is available", async () => {
+      // Force the raw fallback path (no AgentDB bridge) and make every real
+      // embedding provider import fail so loadEmbeddingModel lands on the
+      // hash fallback (model = null).
+      process.env.CLAUDE_FLOW_DISABLE_BRIDGE = '1';
+      vi.resetModules();
+      const fail = () => { throw new Error('unavailable in test'); };
+      vi.doMock('@huggingface/transformers', fail);
+      vi.doMock('@xenova/transformers', fail);
+      vi.doMock('ruvector', fail);
+      vi.doMock('agentic-flow', fail);
+      vi.doMock('agentic-flow/reasoningbank', fail);
+
+      const { generateEmbedding } = await import('../src/memory/memory-initializer.js');
+      const result = await generateEmbedding('audit-3 mock-backend assertion');
+
+      expect(result.backend).toBe('mock');
+      expect(result.model).toBe('hash-fallback');
+      expect(Array.isArray(result.embedding)).toBe(true);
+      expect(result.embedding.length).toBe(result.dimensions);
+    });
+
+    it("always sets backend, and 'mock' implies the hash-fallback model", async () => {
+      // Invariant check that holds regardless of which providers are installed:
+      // backend is one of the two known values, and mock <=> hash-fallback.
+      process.env.CLAUDE_FLOW_DISABLE_BRIDGE = '1';
+      vi.resetModules();
+      const { generateEmbedding } = await import('../src/memory/memory-initializer.js');
+      const result = await generateEmbedding('audit-3 backend invariant');
+
+      expect(['onnx', 'mock']).toContain(result.backend);
+      if (result.backend === 'mock') {
+        expect(result.model).toBe('hash-fallback');
+      }
+    }, 60000); // real ONNX model can be slow to cold-load when installed
   });
 });
 
@@ -644,6 +708,74 @@ describe('EWC Consolidation', () => {
     it('should update lambda parameter', () => {
       consolidator.setLambda(0.8);
       expect(consolidator.getLambda()).toBe(0.8);
+    });
+  });
+
+  // Dream Cycle 2026-08-27 (intelligence): computeConfidencePenalty() and
+  // updateFisherFromConfidences() are the scalar-confidence-shaped EWC methods
+  // documented as "used by SONA after distillLearning" — previously dead code,
+  // now wired into intelligence.ts's distillLearning(). Neither had a unit
+  // test before this fix.
+  describe('computeConfidencePenalty / updateFisherFromConfidences', () => {
+    it('scales with the average Fisher diagonal, not a single dimension', () => {
+      // High-magnitude embedding across every dimension -> high average Fisher.
+      consolidator.updateFisherFromConfidences([
+        { id: 'p1', embedding: [10, 10, 10, 10, 10, 10, 10, 10], oldConf: 0.5, newConf: 0.9 },
+      ]);
+      const highPenalty = consolidator.computeConfidencePenalty(0.5, 0.6);
+
+      consolidator.resetFisher();
+
+      // Near-zero embedding -> near-zero average Fisher.
+      consolidator.updateFisherFromConfidences([
+        { id: 'p2', embedding: [0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01], oldConf: 0.5, newConf: 0.9 },
+      ]);
+      const lowPenalty = consolidator.computeConfidencePenalty(0.5, 0.6);
+
+      expect(highPenalty).toBeGreaterThan(lowPenalty);
+      expect(lowPenalty).toBeGreaterThanOrEqual(0);
+    });
+
+    it('returns 0 when the confidence delta is 0, regardless of Fisher', () => {
+      consolidator.updateFisherFromConfidences([
+        { id: 'p1', embedding: [5, 5, 5, 5, 5, 5, 5, 5], oldConf: 0.2, newConf: 0.8 },
+      ]);
+      expect(consolidator.computeConfidencePenalty(0.7, 0.7)).toBe(0);
+    });
+
+    it('ignores confidence-change entries with zero delta when building Fisher', () => {
+      consolidator.updateFisherFromConfidences([
+        { id: 'p1', embedding: [9, 9, 9, 9, 9, 9, 9, 9], oldConf: 0.5, newConf: 0.5 },
+      ]);
+      const stats = consolidator.getConsolidationStats();
+      expect(stats.avgFisherValue).toBe(0);
+    });
+
+    // This is the exact defect the 2026-08-27 candidate fixes: getPenalty()
+    // called with 1-element weight arrays (as intelligence.ts's distillLearning
+    // did before this fix) only ever reads fisherDiag[0] — so a Fisher signal
+    // that is high everywhere EXCEPT dimension 0 is invisible to it, while
+    // computeConfidencePenalty() (which averages the full diagonal) correctly
+    // reflects it. Same globalFisher state, two different read paths, two very
+    // different verdicts about how much "forgetting protection" a pattern gets.
+    it('demonstrates the fixed defect: getPenalty([old],[new]) collapses to fisherDiag[0], computeConfidencePenalty does not', () => {
+      // Embedding with a zero in slot 0 and large values elsewhere.
+      consolidator.updateFisherFromConfidences([
+        { id: 'p1', embedding: [0, 8, 8, 8, 8, 8, 8, 8], oldConf: 0.5, newConf: 0.9 },
+      ]);
+
+      const oldConfidence = 0.5;
+      const newConfidence = 0.7;
+
+      // The call shape distillLearning() used to make: 1-element arrays, no
+      // explicit fisher argument -> falls back to globalFisher, but
+      // Math.min(1, 1, 384) collapses the read to globalFisher[0] alone.
+      const buggyPenalty = consolidator.getPenalty([oldConfidence], [newConfidence]);
+      expect(buggyPenalty).toBe(0); // globalFisher[0] is 0 -> zero protection, wrongly.
+
+      // The fixed call: averages the entire Fisher diagonal.
+      const fixedPenalty = consolidator.computeConfidencePenalty(oldConfidence, newConfidence);
+      expect(fixedPenalty).toBeGreaterThan(0); // correctly reflects the real importance signal.
     });
   });
 });

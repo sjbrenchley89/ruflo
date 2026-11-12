@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Structural smoke test for ruflo-core v0.2.0 (ADR-0001).
+# Structural smoke test for ruflo-core v0.2.15+ (ADR-0001).
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PASS=0
@@ -8,10 +8,10 @@ step() { printf "→ %s ... " "$1"; }
 ok()   { printf "PASS\n"; PASS=$((PASS+1)); }
 bad()  { printf "FAIL: %s\n" "$1"; FAIL=$((FAIL+1)); }
 
-step "1. plugin.json declares 0.2.0 with new keywords"
+step "1. plugin.json declares 0.2.15 or later with new keywords"
 v=$(grep -E '"version"' "$ROOT/.claude-plugin/plugin.json" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-if [[ "$v" != "0.2.0" ]]; then
-  bad "expected 0.2.0, got '$v'"
+if [[ -z "$v" || "$(printf "%s\n%s\n" 0.2.15 "$v" | sort -V | head -1)" != "0.2.15" ]]; then
+  bad "expected 0.2.15 or later, got '$v'"
 else
   miss=""
   for k in foundation mcp-server plugin-catalog discovery; do
@@ -28,9 +28,9 @@ else
   bad ".mcp.json missing or no ruflo server registration"
 fi
 
-step "3. all 3 agents present with valid frontmatter"
+step "3. all 4 agents present with valid frontmatter"
 miss=""
-for a in coder researcher reviewer; do
+for a in coder researcher reviewer witness-curator; do
   f="$ROOT/agents/$a.md"
   [[ -f "$f" ]] || { miss="$miss missing-$a"; continue; }
   for k in 'name:' 'description:'; do
@@ -39,9 +39,9 @@ for a in coder researcher reviewer; do
 done
 [[ -z "$miss" ]] && ok || bad "$miss"
 
-step "4. all 3 skills present with valid frontmatter"
+step "4. all 5 skills present with valid frontmatter"
 miss=""
-for s in init-project ruflo-doctor discover-plugins; do
+for s in init-project ruflo-doctor ruflo-status discover-plugins witness; do
   f="$ROOT/skills/$s/SKILL.md"
   [[ -f "$f" ]] || { miss="$miss missing-$s"; continue; }
   for k in 'name:' 'description:' 'allowed-tools:'; do
@@ -59,9 +59,14 @@ else
   bad "expected ≥25 distinct ruflo-* references, got $n"
 fi
 
-step "6. README pins @claude-flow/cli to v3.6"
-grep -qE "@claude-flow/cli.*v3\.6|v3\.6.*claude-flow/cli" "$ROOT/README.md" \
-  && ok || bad "Compatibility pin to v3.6 missing"
+# #3428: the launcher no longer pins to a fixed CLI minor line — it resolves a
+# built/installed @claude-flow/cli first and only falls back to `npx @latest`.
+# The compatibility contract now documents that resolution order instead of a
+# version pin; verify the README still describes it accurately.
+step "6. README documents the CLI resolution/fallback contract"
+grep -qE "RUFLO_MCP_CLI_OVERRIDE" "$ROOT/README.md" \
+  && grep -qE "RUFLO_MCP_SKIP_NPX" "$ROOT/README.md" \
+  && ok || bad "CLI resolution/fallback contract missing from README"
 
 step "7. README cross-references sibling contracts"
 F="$ROOT/README.md"
@@ -71,10 +76,10 @@ grep -qE "3-gate|3 gates|three gates" "$F" || miss="$miss 3-gate"
 grep -qE "4-step|4 step" "$F" || miss="$miss 4-step"
 [[ -z "$miss" ]] && ok || bad "missing cross-references:$miss"
 
-step "8. ADR-0001 exists with status Proposed"
+step "8. ADR-0001 exists with status Accepted"
 ADR="$ROOT/docs/adrs/0001-core-contract.md"
-[[ -f "$ADR" ]] && grep -qE "^status:[[:space:]]*Proposed" "$ADR" \
-  && ok || bad "ADR missing or status != Proposed"
+[[ -f "$ADR" ]] && grep -qE "^status:[[:space:]]*Accepted" "$ADR" \
+  && ok || bad "ADR missing or status != Accepted"
 
 step "9. /ruflo-status command invokes doctor + status"
 F="$ROOT/commands/ruflo-status.md"
@@ -90,6 +95,21 @@ for f in "$ROOT"/skills/*/SKILL.md; do
   grep -q '^allowed-tools:[[:space:]]*\*' "$f" && bad_skills="$bad_skills $(basename $(dirname "$f"))"
 done
 [[ -z "$bad_skills" ]] && ok || bad "wildcard:$bad_skills"
+
+step "11. every Claude command has a same-name Codex skill"
+miss=""
+# Explicit exemptions must be recorded here as "command: reason". None exist.
+command_skill_exemptions=()
+for command_file in "$ROOT"/commands/*.md; do
+  command_name="$(basename "$command_file" .md)"
+  [[ -f "$ROOT/skills/$command_name/SKILL.md" ]] && continue
+  exempt=""
+  for entry in "${command_skill_exemptions[@]}"; do
+    [[ "$entry" == "$command_name: "* ]] && exempt="$entry"
+  done
+  [[ -n "$exempt" ]] || miss="$miss $command_name"
+done
+[[ -z "$miss" ]] && ok || bad "commands missing same-name skills:$miss"
 
 printf "\n%s passed, %s failed\n" "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]] || exit 1

@@ -24,12 +24,25 @@
  *     identical).
  *
  * Detection:
- *   `SublinearAdapter.isMcpAvailable()` returns true iff the MCP tool
- *   `mcp__ruflo-sublinear__solve` can be resolved through the local MCP
- *   tool registry. The adapter falls back to the embedded CG kernel when
- *   the MCP path is unavailable, and emits a `path: 'cg-local' | 'cg-mcp'`
- *   tag in the result so the caller can correctly label the artifact
- *   metadata (`method: 'cg-sublinear' | 'cg-local'`).
+ *   `SublinearAdapter.detectSublinearTool()` returns true iff the native
+ *   `mcp__ruflo-sublinear__solve` dispatch surface is reachable from this
+ *   runtime. Two probes are tried, in order:
+ *     1) globalThis['mcp__ruflo-sublinear__solve'] is a function — this
+ *        is how the ruflo MCP harness mounts tools into the agent runtime.
+ *     2) process.env.RUFLO_SUBLINEAR_NATIVE === '1' — manual override for
+ *        environments where the tool surface is provided out-of-band
+ *        (e.g. a daemon-side spawn or a sidecar tool runner that's
+ *        addressed by the same name through a different transport).
+ *   When either probe passes, the adapter routes through `callMcpSolve`
+ *   and tags the result with `method: 'cg-sublinear-native'` and
+ *   `solver: 'sublinear-time-solver@1.7.0'`. Otherwise it falls back to
+ *   the embedded CG kernel and tags `method: 'cg-local'`, solver
+ *   `'local-js-cg'`. The legacy `isMcpAvailable()` static is preserved
+ *   as an alias for back-compat with the smoke contract.
+ *
+ *   The `path` field is kept (`'cg-local' | 'cg-mcp'`) for wire
+ *   compatibility with the Phase 3 baseline; `method` is the human-
+ *   readable label downstream callers should record in artifact metadata.
  *
  * SPD validation:
  *   Covariance matrices are SPD by construction (Cov(X,X) is a Gram matrix
@@ -64,8 +77,26 @@ export interface SolveResult {
   residual: number;
   /** Wall-clock latency of the solve in milliseconds. */
   latencyMs: number;
-  /** Which dispatch path was used. */
+  /**
+   * Which dispatch path was used (wire-compatible with Phase 3 baseline).
+   *  - `cg-mcp`   — native MCP dispatch (sublinear-time-solver kernel)
+   *  - `cg-local` — embedded JS CG fallback
+   */
   path: 'cg-local' | 'cg-mcp';
+  /**
+   * Human-readable method label for artifact provenance metadata. Downstream
+   * callers (e.g. trader-portfolio-cg) record this alongside the weights so
+   * the auditor can tell at a glance which solver produced the artifact.
+   *  - `cg-sublinear-native` — native dispatch via mcp__ruflo-sublinear__solve
+   *  - `cg-local`            — embedded JS CG fallback
+   */
+  method: 'cg-sublinear-native' | 'cg-local';
+  /**
+   * Identifies the actual kernel that produced the solution. Pinned to the
+   * upstream version that the native dispatch targets, or `'local-js-cg'`
+   * when the embedded fallback ran.
+   */
+  solver: 'sublinear-time-solver@1.7.0' | 'local-js-cg';
   /** True if input failed SPD sanity checks; caller should fall back. */
   degraded?: boolean;
   /** Human-readable reason when `degraded` is true. */
@@ -78,25 +109,48 @@ export interface SolveResult {
 
 export class SublinearAdapter {
   /**
-   * Detection — is `mcp__ruflo-sublinear__solve` resolvable in this runtime?
+   * Detection — is `mcp__ruflo-sublinear__solve` reachable in this runtime?
    *
-   * The detection is conservative: it only returns true when the global
-   * MCP tool registry exposes the tool name. In an agent task without the
-   * MCP daemon, this returns false and the adapter uses the local kernel.
+   * Two probes, in priority order:
+   *   1) globalThis['mcp__ruflo-sublinear__solve'] is a function. This is the
+   *      convention the ruflo MCP harness uses to mount native tools into the
+   *      agent runtime when the daemon is up and the plugin is registered.
+   *   2) process.env.RUFLO_SUBLINEAR_NATIVE === '1'. Manual override for
+   *      operator-controlled rollouts (canary, A/B) where the harness mount
+   *      happens out-of-band — the adapter will attempt `callMcpSolve` and
+   *      let that path fail loudly if the tool isn't actually there.
    *
-   * The detection deliberately does NOT spawn a child process or probe
-   * the npm cache — Phase 3 must be hot-path-safe.
+   * The probe is hot-path-safe: no child-process spawn, no filesystem walk,
+   * no npm-cache probe. Either the tool surface is mounted or it's not.
    */
-  static isMcpAvailable(): boolean {
+  static detectSublinearTool(): boolean {
     try {
       const g = globalThis as unknown as Record<string, unknown>;
-      // Convention used by ruflo-mcp tool injection: the harness mounts
-      // each callable tool as a property on globalThis with this exact name.
       const tool = g['mcp__ruflo-sublinear__solve'];
-      return typeof tool === 'function';
+      if (typeof tool === 'function') return true;
     } catch {
-      return false;
+      /* fall through to env probe */
     }
+    try {
+      // Manual override: operator declares the native surface is reachable.
+      const envFlag = typeof process !== 'undefined' && process.env
+        ? process.env.RUFLO_SUBLINEAR_NATIVE
+        : undefined;
+      if (envFlag === '1' || envFlag === 'true') return true;
+    } catch {
+      /* env unavailable (sandbox without process) — treat as no */
+    }
+    return false;
+  }
+
+  /**
+   * Legacy alias preserved for the smoke contract (#2068). New code should
+   * call `detectSublinearTool()` for clarity — `isMcpAvailable()` covers only
+   * the globalThis probe historically, but is now wired to the same two-probe
+   * detection so the env-var override is honoured everywhere.
+   */
+  static isMcpAvailable(): boolean {
+    return SublinearAdapter.detectSublinearTool();
   }
 
   /**
@@ -144,17 +198,22 @@ export class SublinearAdapter {
       return this.degrade(start, 'matrix not symmetric within 1e-9');
     }
 
-    // --- MCP path (preferred when available) ---
-    if (SublinearAdapter.isMcpAvailable()) {
+    // --- Native MCP path (preferred when reachable) ---
+    if (SublinearAdapter.detectSublinearTool()) {
       try {
         const result = await callMcpSolve(matrix, vector, opts);
         return {
           ...result,
           latencyMs: performance.now() - start,
           path: 'cg-mcp',
+          method: 'cg-sublinear-native',
+          solver: 'sublinear-time-solver@1.7.0',
         };
       } catch {
-        // Fall through to local kernel on any MCP error.
+        // Fall through to local kernel on any MCP error — the operator may
+        // have set RUFLO_SUBLINEAR_NATIVE=1 in an environment where the tool
+        // surface is not actually present. The artifact will record
+        // method='cg-local' so the regression is visible in the audit trail.
       }
     }
 
@@ -173,6 +232,8 @@ export class SublinearAdapter {
       residual,
       latencyMs: performance.now() - start,
       path: 'cg-local',
+      method: 'cg-local',
+      solver: 'local-js-cg',
     };
   }
 
@@ -183,6 +244,8 @@ export class SublinearAdapter {
       residual: Infinity,
       latencyMs: performance.now() - start,
       path: 'cg-local',
+      method: 'cg-local',
+      solver: 'local-js-cg',
       degraded: true,
       reason,
     };

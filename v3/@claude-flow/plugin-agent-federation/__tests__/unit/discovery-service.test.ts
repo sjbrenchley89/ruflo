@@ -142,12 +142,27 @@ describe('DiscoveryService', () => {
       expect(node.trustLevel).toBe(TrustLevel.UNTRUSTED);
     });
 
-    it('should add a peer with VERIFIED trust level when a valid manifest is provided', async () => {
+    it('should add a peer with VERIFIED trust level when a valid manifest carries the pinned key', async () => {
+      service = new DiscoveryService({ ...deps, pinnedKeyFor: (id) => (id === 'node-1' ? 'pk-1' : undefined) });
       const manifest = makeManifest({ signature: 'valid' });
       const node = await service.addStaticPeer('https://peer1.example.com', manifest);
 
       expect(node.trustLevel).toBe(TrustLevel.VERIFIED);
       expect(node.nodeId).toBe('node-1');
+    });
+
+    it('keeps a self-signed manifest UNTRUSTED when no key is pinned for the node', async () => {
+      const node = await service.addStaticPeer('https://peer1.example.com', makeManifest({ signature: 'valid' }));
+
+      expect(node.trustLevel).toBe(TrustLevel.UNTRUSTED);
+    });
+
+    it('rejects a manifest whose key is not the pinned one, however well it is signed', async () => {
+      service = new DiscoveryService({ ...deps, pinnedKeyFor: () => 'the-real-key' });
+
+      await expect(
+        service.addStaticPeer('https://peer1.example.com', makeManifest({ signature: 'valid' })),
+      ).rejects.toThrow(/pinned key/i);
     });
 
     it('should throw when provided an invalid manifest', async () => {
@@ -156,6 +171,14 @@ describe('DiscoveryService', () => {
       await expect(
         service.addStaticPeer('https://peer1.example.com', manifest),
       ).rejects.toThrow(/invalid manifest/i);
+    });
+
+    it('should reject a signed manifest for a different endpoint', async () => {
+      const manifest = makeManifest({ signature: 'valid' });
+
+      await expect(
+        service.addStaticPeer('https://other.example.com', manifest),
+      ).rejects.toThrow(/manifest endpoint mismatch/i);
     });
 
     it('should mark existing peer as seen and return it without creating a duplicate', async () => {

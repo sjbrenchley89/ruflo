@@ -95,6 +95,7 @@ export interface McpServerConfig {
   command: string;
   args?: string[];
   enabled?: boolean;
+  startupTimeout?: number;
   toolTimeout?: number;
   env?: Record<string, string>;
 }
@@ -111,6 +112,7 @@ export interface SkillConfig {
  * Configuration options for config.toml generation
  */
 export interface ConfigTomlOptions {
+  platform?: NodeJS.Platform;
   model?: string;
   approvalPolicy?: ApprovalPolicy;
   sandboxMode?: SandboxMode;
@@ -121,6 +123,22 @@ export interface ConfigTomlOptions {
   skills?: SkillConfig[];
   profiles?: Record<string, ConfigProfile>;
   historyPersistence?: 'none' | 'save-all';
+  policy?: PolicyConfig;
+  swarmAutomation?: SwarmAutomationConfig;
+}
+
+export interface PolicyConfig {
+  mode?: 'legacy' | 'observe' | 'enforce';
+}
+
+export interface SwarmAutomationConfig {
+  enabled?: boolean;
+  maxConcurrent?: number;
+  maxWriters?: number;
+  worktreeIsolation?: boolean;
+  dependencyFailure?: 'cancel' | 'skip';
+  agentTimeoutSeconds?: number;
+  maxOutputBytes?: number;
 }
 
 /**
@@ -145,12 +163,21 @@ export interface ConfigProfile {
 /**
  * Full initialization options
  */
+export type CodexTrust = 'standard' | 'full';
+
 export interface CodexInitOptions {
   projectPath: string;
   template?: AgentsMdTemplate;
   skills?: string[];
   force?: boolean;
   dual?: boolean;  // Generate both Claude Code and Codex configs
+  /**
+   * Trust level of the generated, gitignored `.codex/config.toml`.
+   * `standard` (default): workspace-write sandbox, on-request approvals, cached web search.
+   * `full`: danger-full-access sandbox, no approvals, live web search (explicit opt-in).
+   * Also settable with RUFLO_CODEX_TRUST=full; the option wins over the environment.
+   */
+  codexTrust?: CodexTrust;
   migrateFrom?: 'claude.md' | 'CLAUDE.md';
 }
 
@@ -234,7 +261,13 @@ export type BuiltInSkill =
   | 'sparc-methodology'
   | 'security-audit'
   | 'performance-analysis'
-  | 'github-automation';
+  | 'github-automation'
+  | 'vector-quantization'
+  | 'graph-mincut'
+  | 'sublinear-solver'
+  | 'injection-defense'
+  | 'fast-code-edits'
+  | 'lora-learning';
 
 /**
  * Codex undocumented features (from binary analysis)

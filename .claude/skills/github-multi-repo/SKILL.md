@@ -157,8 +157,7 @@ mcp__claude-flow__swarm_init({
     -f content="$(cat aligned-package.json | base64)"`)
 
   // Store sync state
-  mcp__claude-flow__memory_usage({
-    action: "store",
+  mcp__claude-flow__memory_store({
     key: "sync/packages/status",
     value: {
       timestamp: Date.now(),
@@ -184,8 +183,7 @@ mcp__claude-flow__swarm_init({
     -f content="$(cat /tmp/claude-source.md | base64)"`)
 
   // Track sync status
-  mcp__claude-flow__memory_usage({
-    action: "store",
+  mcp__claude-flow__memory_store({
     key: "sync/documentation/status",
     value: { status: "synchronized", files: ["CLAUDE.md"] }
   })
@@ -254,8 +252,7 @@ mcp__claude-flow__swarm_init({
     --order desc`)
 
   // Store analysis results
-  mcp__claude-flow__memory_usage({
-    action: "store",
+  mcp__claude-flow__memory_store({
     key: "architecture/analysis/results",
     value: {
       repositories_analyzed: ["claude-code-flow", "ruv-swarm"],
@@ -331,8 +328,8 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
-      - uses: actions/setup-node@v3
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with: { node-version: '20' }
       - run: npm install && npm test`,
       message: "ci: Standardize integration workflow",
@@ -404,9 +401,9 @@ Part of #$TRACKING_ISSUE"
   Task("Integration Tester", "Validate refactored code", "tester")
 
   // Execute refactoring
-  mcp__claude-flow__task_orchestrate({
-    task: "Rename OldAPI to NewAPI across all repositories",
-    strategy: "sequential",
+  mcp__claude-flow__task_create({
+    type: "refactor",
+    description: "Rename OldAPI to NewAPI across all repositories",
     priority: "high"
   })
 ```

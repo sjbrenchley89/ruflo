@@ -10,14 +10,27 @@
 
 import { randomUUID } from 'node:crypto';
 import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, renameSync } from 'node:fs';
-import { resolve, join } from 'node:path';
+import { resolve, join, dirname } from 'node:path';
+import { createRequire } from 'node:module';
+import { pathToFileURL } from 'node:url';
 import { homedir } from 'node:os';
+import { writeFileAtomic } from './fs-secure.js';
+import { getProjectRoot } from './services/project-root.js';
 
 // ── Constants ─────────────────────────────────────────────────
 
 export const STATE_DIR = '.claude-flow/data';
 export const STATE_FILE = `${STATE_DIR}/autopilot-state.json`;
 export const LOG_FILE = `${STATE_DIR}/autopilot-log.json`;
+
+/**
+ * #2633: resolve a state path against the Ruflo project root, not raw
+ * process.cwd(). The constants above stay relative; resolution happens per
+ * call so a drifted agent shell still finds the project's state.
+ */
+function statePath(rel: string): string {
+  return resolve(getProjectRoot(), rel);
+}
 
 /** Maximum entries kept in state.history (prevents unbounded growth) */
 const MAX_HISTORY_ENTRIES = 50;
@@ -115,6 +128,29 @@ export function validateTaskSources(sources: unknown): string[] {
   return valid.length > 0 ? valid : defaults;
 }
 
+export type TaskSourceValidation =
+  | { valid: true; sources: string[] }
+  | { valid: false; invalidSources: string[]; reason: string };
+
+/** Strictly validate user-supplied task sources without enabling defaults. */
+export function validateConfiguredTaskSources(sources: unknown): TaskSourceValidation {
+  if (!Array.isArray(sources) || sources.length === 0) {
+    return { valid: false, invalidSources: [], reason: 'At least one task source is required' };
+  }
+
+  const normalized = sources.map(source => typeof source === 'string' ? source.trim() : String(source));
+  const invalidSources = normalized.filter(source => !VALID_TASK_SOURCES.has(source));
+  if (invalidSources.length > 0) {
+    return {
+      valid: false,
+      invalidSources,
+      reason: `Unsupported task source(s): ${invalidSources.join(', ')}`,
+    };
+  }
+
+  return { valid: true, sources: [...new Set(normalized)] };
+}
+
 // ── State Management ──────────────────────────────────────────
 
 export function getDefaultState(): AutopilotState {
@@ -132,7 +168,7 @@ export function getDefaultState(): AutopilotState {
 }
 
 export function loadState(): AutopilotState {
-  const filePath = resolve(STATE_FILE);
+  const filePath = statePath(STATE_FILE);
   const defaults = getDefaultState();
   try {
     if (existsSync(filePath)) {
@@ -156,20 +192,28 @@ export function loadState(): AutopilotState {
 }
 
 export function saveState(state: AutopilotState): void {
-  const dir = resolve(STATE_DIR);
+  const dir = statePath(STATE_DIR);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
   // Cap history before saving
   if (state.history.length > MAX_HISTORY_ENTRIES) {
     state.history = state.history.slice(-MAX_HISTORY_ENTRIES);
   }
-  const tmpFile = resolve(STATE_FILE) + '.tmp';
-  writeFileSync(tmpFile, JSON.stringify(state, null, 2));
-  renameSync(tmpFile, resolve(STATE_FILE));
+  // ruvnet/ruflo#2782: use writeFileAtomic — its temp file is uniquified with
+  // pid + timestamp + random suffix, so two concurrent in-process saveState()
+  // calls can no longer collide on a shared `.tmp` basename and race one
+  // another's renameSync into ENOENT. Related to but distinct from #1637.
+  try {
+    writeFileAtomic(statePath(STATE_FILE), Buffer.from(JSON.stringify(state, null, 2)));
+  } catch {
+    // A losing concurrent writer may briefly see ENOENT/EEXIST — the winning
+    // writer's payload is on disk, so the state is not lost. Swallow rather
+    // than crash the caller (daemon tick, MCP handler).
+  }
 }
 
 export function appendLog(entry: AutopilotLogEntry): void {
-  const filePath = resolve(LOG_FILE);
-  const dir = resolve(STATE_DIR);
+  const filePath = statePath(LOG_FILE);
+  const dir = statePath(STATE_DIR);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
   let log: AutopilotLogEntry[] = [];
   try {
@@ -182,13 +226,19 @@ export function appendLog(entry: AutopilotLogEntry): void {
   }
   log.push(entry);
   if (log.length > MAX_LOG_ENTRIES) log = log.slice(-MAX_LOG_ENTRIES);
-  const tmpFile = filePath + '.tmp';
-  writeFileSync(tmpFile, JSON.stringify(log, null, 2));
-  renameSync(tmpFile, filePath);
+  // ruvnet/ruflo#2782: same shared `.tmp`-basename race as saveState() above —
+  // concurrent appendLog() calls would collide their sentinel temp files and
+  // renameSync into ENOENT. writeFileAtomic uses a uniquified temp so callers
+  // cannot step on each other.
+  try {
+    writeFileAtomic(filePath, Buffer.from(JSON.stringify(log, null, 2)));
+  } catch {
+    // Log write is best-effort — don't crash the caller on a losing race.
+  }
 }
 
 export function loadLog(): AutopilotLogEntry[] {
-  const filePath = resolve(LOG_FILE);
+  const filePath = statePath(LOG_FILE);
   try {
     if (existsSync(filePath)) {
       const result = safeJsonParse<AutopilotLogEntry[]>(readFileSync(filePath, 'utf-8'));
@@ -235,7 +285,7 @@ export function discoverTasks(sources: string[]): TaskInfo[] {
     }
 
     if (source === 'swarm-tasks') {
-      const swarmFile = resolve('.claude-flow/swarm-tasks.json');
+      const swarmFile = statePath('.claude-flow/swarm-tasks.json');
       try {
         if (existsSync(swarmFile)) {
           const data = safeJsonParse<Record<string, unknown> | unknown[]>(readFileSync(swarmFile, 'utf-8'));
@@ -256,7 +306,7 @@ export function discoverTasks(sources: string[]): TaskInfo[] {
     }
 
     if (source === 'file-checklist') {
-      const checklistFile = resolve('.claude-flow/data/checklist.json');
+      const checklistFile = statePath('.claude-flow/data/checklist.json');
       try {
         if (existsSync(checklistFile)) {
           const data = safeJsonParse<Record<string, unknown> | unknown[]>(readFileSync(checklistFile, 'utf-8'));
@@ -304,14 +354,43 @@ export function calculateReward(iterations: number, durationMs: number): number 
 
 // ── Learning Integration ──────────────────────────────────────
 
-export async function tryLoadLearning(): Promise<{ initialize: () => Promise<boolean>; [key: string]: unknown } | null> {
-  try {
-    const modPath = 'agentic-flow/dist/coordination/autopilot-learning.js';
-    const mod = await import(/* webpackIgnore: true */ modPath).catch(() => null);
-    if (mod?.AutopilotLearning) {
-      const instance = new mod.AutopilotLearning();
-      if (await instance.initialize()) return instance;
+let lastLearningLoadError: string | null = null;
+
+/** Why the last tryLoadLearning() returned null (null when it succeeded or was never called). */
+export function getLearningLoadError(): string | null {
+  return lastLearningLoadError;
+}
+
+/**
+ * agentic-flow's `exports` map does not expose dist/coordination/*, so a bare
+ * specifier import throws ERR_PACKAGE_PATH_NOT_EXPORTED (#4146). Resolve the
+ * package root through its exported entry point and import the file by URL.
+ */
+function resolveAutopilotLearningUrl(): string {
+  const req = createRequire(import.meta.url);
+  let dir = dirname(req.resolve('agentic-flow'));
+  for (let i = 0; i < 6; i++) {
+    if (existsSync(join(dir, 'package.json')) && existsSync(join(dir, 'dist', 'coordination', 'autopilot-learning.js'))) {
+      return pathToFileURL(join(dir, 'dist', 'coordination', 'autopilot-learning.js')).href;
     }
-  } catch { /* not available */ }
+    dir = dirname(dir);
+  }
+  throw new Error('agentic-flow does not ship dist/coordination/autopilot-learning.js');
+}
+
+export async function tryLoadLearning(): Promise<{ initialize: () => Promise<boolean>; [key: string]: unknown } | null> {
+  lastLearningLoadError = null;
+  try {
+    const mod = await import(/* webpackIgnore: true */ resolveAutopilotLearningUrl());
+    if (!mod?.AutopilotLearning) {
+      lastLearningLoadError = 'agentic-flow autopilot-learning module has no AutopilotLearning export';
+      return null;
+    }
+    const instance = new mod.AutopilotLearning();
+    if (await instance.initialize()) return instance;
+    lastLearningLoadError = 'AutopilotLearning.initialize() returned false (AgentDB not initialized)';
+  } catch (e) {
+    lastLearningLoadError = `Could not load agentic-flow autopilot learning: ${e instanceof Error ? e.message : String(e)}`;
+  }
   return null;
 }

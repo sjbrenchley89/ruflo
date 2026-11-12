@@ -69,6 +69,7 @@ export {
 } from './domain/services/discovery-service.js';
 export {
   HandshakeService,
+  HANDSHAKE_SIGNATURE_CONTEXT,
   type HandshakeChallenge,
   type HandshakeChallengeResponse,
   type HandshakeResult,
@@ -114,3 +115,58 @@ export {
   type PolicyEvaluationResult,
   type PolicyEngineDeps,
 } from './application/policy-engine.js';
+export {
+  createFederationClaimChecker,
+  type FederationAuthorizationMode,
+  type FederationClaimChecker,
+  type FederationClaimCheckerConfig,
+} from './application/claim-checker.js';
+export {
+  DEFAULT_ENVELOPE_SIGNATURE_MODE,
+  JCS_SIGNATURE_PROTOCOL,
+  canonicalizeEnvelopeForVerify,
+  isLegacyEnvelopeTypeAllowed,
+  selectEnvelopeSignatureVersion,
+  type EnvelopeSignatureMode,
+  type EnvelopeSignatureVersion,
+} from './application/inbound-dispatcher.js';
+export { FEDERATION_PLUGIN_VERSION } from './version.js';
+
+// A2A (Agent2Agent, Linux Foundation) Agent Card adapter — cards only.
+export {
+  A2A_PROTOCOL_VERSION,
+  A2A_WELL_KNOWN_PATH,
+  RUFLO_FEDERATION_BINDING,
+  RUFLO_FEDERATION_EXTENSION_URI,
+  toAgentCard,
+  fromAgentCard,
+  validateAgentCard,
+  type A2AAgentCard,
+  type A2AAgentInterface,
+  type A2AAgentSkill,
+  type A2AAgentCapabilities,
+  type A2AAgentExtension,
+  type A2AAgentProvider,
+  type ToAgentCardOptions,
+  type AgentCardValidation,
+} from './a2a/agent-card.js';
+export {
+  projectPlannerSafeAgentCard,
+  type PlannerCapabilityDefinition,
+  type PlannerDescriptorPolicy,
+  type PlannerSafeAgentDescriptor,
+  type PlannerDescriptorProjection,
+} from './a2a/planner-descriptor.js';
+export {
+  startAgentCardServer,
+  isLoopbackHost,
+  type AgentCardServerOptions,
+  type AgentCardServerHandle,
+} from './a2a/well-known.js';
+export {
+  fetchAgentCard,
+  consumeAgentCard,
+  resolveAgentCardUrl,
+  type FetchAgentCardOptions,
+  type FetchAgentCardResult,
+} from './a2a/consume.js';

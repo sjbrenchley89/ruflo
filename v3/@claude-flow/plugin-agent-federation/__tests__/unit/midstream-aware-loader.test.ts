@@ -4,9 +4,10 @@
  *
  * The loader's job is narrow: when MIDSTREAMER_QUIC_NATIVE=1 AND a
  * real (non-stub) midstreamer module is importable, return it.
- * Otherwise, fall through to the agentic-flow loader. These tests
- * verify both branches by stubbing the dynamic import / mocking the
- * agentic-flow loader where needed.
+ * Otherwise, fall through to the agentic-flow loader and then the
+ * plugin-owned WebSocket fallback if that loader is unavailable. These
+ * tests verify the branch selection by stubbing dynamic imports where
+ * needed.
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
@@ -22,6 +23,8 @@ vi.mock('agentic-flow/transport/loader', async () => {
   return {
     loadQuicTransport: vi.fn(async () => ({
       send: vi.fn(),
+      onMessage: vi.fn(),
+      listen: vi.fn(),
       receive: vi.fn(),
       request: vi.fn(),
       sendBatch: vi.fn(),
@@ -30,6 +33,29 @@ vi.mock('agentic-flow/transport/loader', async () => {
       // Marker so we can assert which branch resolved
       __mockSource: 'agentic-flow-mock',
     })),
+  };
+});
+
+const wsServerOptions = vi.hoisted(() => [] as Array<{ port?: number; host?: string }>);
+
+vi.mock('ws', async () => {
+  class MockWebSocket {
+    on() {}
+    send(_data: string, cb?: (err?: Error) => void) { cb?.(); }
+    close() {}
+  }
+  class MockWebSocketServer {
+    constructor(options: { port?: number; host?: string }) {
+      wsServerOptions.push(options);
+    }
+    on(event: string, handler: () => void) {
+      if (event === 'listening') queueMicrotask(handler);
+    }
+    close(cb?: () => void) { cb?.(); }
+  }
+  return {
+    default: MockWebSocket,
+    WebSocketServer: MockWebSocketServer,
   };
 });
 
@@ -97,12 +123,55 @@ describe('loadFederationTransport — ADR-120 Step 2', () => {
     );
   });
 
+  it('rejects an upstream transport that does not implement inbound delivery', async () => {
+    const mod = await import('agentic-flow/transport/loader');
+    const loaderFn = (mod as unknown as { loadQuicTransport: ReturnType<typeof vi.fn> })
+      .loadQuicTransport;
+    loaderFn.mockResolvedValueOnce({ send: vi.fn() });
+
+    const loaded = await loadFederationTransport();
+
+    expect(loaded.source).toBe('websocket-fallback');
+    expect(typeof loaded.transport.send).toBe('function');
+    expect(typeof loaded.transport.onMessage).toBe('function');
+  });
+
+  it('requires listen support when an inbound port is configured', async () => {
+    const mod = await import('agentic-flow/transport/loader');
+    const loaderFn = (mod as unknown as { loadQuicTransport: ReturnType<typeof vi.fn> })
+      .loadQuicTransport;
+    loaderFn.mockResolvedValueOnce({
+      send: vi.fn(),
+      onMessage: vi.fn(),
+    });
+
+    const loaded = await loadFederationTransport({ port: 0 });
+
+    expect(loaded.source).toBe('websocket-fallback');
+    expect(typeof loaded.transport.listen).toBe('function');
+  });
+
+  it('the fallback listener binds loopback unless a host is configured', async () => {
+    const mod = await import('agentic-flow/transport/loader');
+    const loaderFn = (mod as unknown as { loadQuicTransport: ReturnType<typeof vi.fn> })
+      .loadQuicTransport;
+    for (let i = 0; i < 3; i++) loaderFn.mockResolvedValueOnce({ send: vi.fn() });
+
+    wsServerOptions.length = 0;
+    for (const host of [undefined, '0.0.0.0', '']) {
+      const loaded = await loadFederationTransport({ port: 0, host });
+      await loaded.transport.listen!(0);
+    }
+
+    expect(wsServerOptions.map((o) => o.host)).toEqual(['127.0.0.1', '0.0.0.0', '127.0.0.1']);
+  });
+
   it('returned envelope has the documented LoadedFederationTransport shape', async () => {
     const loaded = await loadFederationTransport();
     expect(Object.keys(loaded).sort()).toEqual(
       expect.arrayContaining(['transport', 'source']),
     );
     // `source` must be one of the two documented values.
-    expect(['midstreamer-native', 'agentic-flow-loader']).toContain(loaded.source);
+    expect(['midstreamer-native', 'agentic-flow-loader', 'websocket-fallback']).toContain(loaded.source);
   });
 });

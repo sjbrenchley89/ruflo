@@ -1,12 +1,11 @@
 {
-  "model": "claude-opus-4-7",
-  "_comment_skillListingBudgetFraction": "#1834 — repo has 367 SKILL.md files (5x duplicates of common skills) across .agents/skills, .claude/skills, archive/v2/.claude/skills, v3/@claude-flow/{cli,mcp}/.claude/skills. With Claude Code's default 1% budget, ~378 descriptions get truncated. Bumping to 6% covers the actual usage (5.5%). Long-term fix is to prune the duplicates and archive paths (see #1834).",
   "skillListingBudgetFraction": 0.06,
   "customInstructions": "Follow the project's CLAUDE.md guidelines. Use concurrent execution for all operations. Prioritize v3 implementation with security-first development, 15-agent swarm coordination, phased performance optimization, and cross-platform helper automation.",
   "env": {
     "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1",
     "CLAUDE_FLOW_V3_ENABLED": "true",
-    "CLAUDE_FLOW_HOOKS_ENABLED": "true"
+    "CLAUDE_FLOW_HOOKS_ENABLED": "true",
+    "CLAUDE_CODE_ENABLE_FUNCTION_HOOKS": "1"
   },
   "permissions": {
     "allow": [
@@ -50,7 +49,8 @@
           {
             "type": "command",
             "command": "node \"$CLAUDE_PROJECT_DIR/.claude/helpers/hook-handler.cjs\" pre-bash",
-            "timeout": 5000
+            "timeout": 5000,
+            "onFailure": "block"
           }
         ]
       }
@@ -166,7 +166,7 @@
     "version": "3.6.11",
     "enabled": true,
     "modelPreferences": {
-      "default": "claude-opus-4-7",
+      "default": "claude-sonnet-5",
       "routing": "claude-haiku-4-5-20251001"
     },
     "agentTeams": {
@@ -175,7 +175,7 @@
       "taskListEnabled": true,
       "mailboxEnabled": true,
       "coordination": {
-        "autoAssignOnIdle": true,
+        "autoAssignOnIdle": false,
         "trainPatternsOnComplete": true,
         "notifyLeadOnComplete": true,
         "sharedMemoryNamespace": "agent-teams"
@@ -183,7 +183,7 @@
       "hooks": {
         "teammateIdle": {
           "enabled": true,
-          "autoAssign": true,
+          "autoAssign": false,
           "checkTaskList": true
         },
         "taskCompleted": {
@@ -281,5 +281,13 @@
   },
   "enabledMcpjsonServers": [
     "claude-flow"
-  ]
+  ],
+  "enabledPlugins": {
+    "ruflo-mods@ruflo": true,
+    "ruflo-swarm@ruflo": true,
+    "ruflo-console@ruflo": true
+  },
+  "extraKnownMarketplaces": {
+    "ruflo": { "source": { "source": "github", "repo": "ruvnet/ruflo" } }
+  }
 }

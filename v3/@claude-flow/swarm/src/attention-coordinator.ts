@@ -3,15 +3,15 @@
  *
  * Implements attention-based coordination mechanisms from agentic-flow@alpha:
  * - multi-head: Standard multi-head attention
- * - flash: 2.49x-7.47x speedup, 75% memory reduction
+ * - flash: approximate sparse attention; speedup unverified — see docs/reviews/intelligence-system-audit-2026-05-29.md
  * - linear: For long sequences
  * - hyperbolic: Hierarchical data
  * - moe: Mixture of Experts routing
  * - graph-rope: Graph-aware positional embeddings
  *
  * Performance Targets:
- * - Flash Attention: 2.49x-7.47x speedup
- * - Memory Reduction: 50-75%
+ * - Flash Attention: approximate sparse attention; speedup unverified — see docs/reviews/intelligence-system-audit-2026-05-29.md
+ * - Memory Reduction: unverified — see docs/reviews/intelligence-system-audit-2026-05-29.md
  * - MoE Routing: <5ms
  *
  * @module v3/swarm/attention-coordinator
@@ -28,7 +28,7 @@ import { EventEmitter } from 'events';
  */
 export type AttentionType =
   | 'multi-head'   // Standard multi-head attention
-  | 'flash'        // 2.49x-7.47x speedup, 75% memory reduction
+  | 'flash'        // approximate sparse attention; speedup unverified — see docs/reviews/intelligence-system-audit-2026-05-29.md
   | 'linear'       // For long sequences
   | 'hyperbolic'   // Hierarchical data
   | 'moe'          // Mixture of Experts
@@ -185,6 +185,9 @@ export class AttentionCoordinator extends EventEmitter {
     flashSpeedup: 0,
     memoryReduction: 0,
   };
+  // Identity-keyed: avoids rebuilding the O(content.length) hash embedding on
+  // every pairwise call in the O(n^2)/O(numHeads*n^2) coordination loops below.
+  private readonly syntheticEmbeddingCache = new WeakMap<AgentOutput, Float32Array>();
 
   constructor(config: Partial<AttentionCoordinatorConfig> = {}) {
     super();
@@ -374,7 +377,8 @@ export class AttentionCoordinator extends EventEmitter {
   // ===========================================================================
 
   /**
-   * Flash Attention - 2.49x-7.47x speedup
+   * Flash Attention - approximate sparse attention; speedup unverified
+   * — see docs/reviews/intelligence-system-audit-2026-05-29.md
    */
   private async flashAttentionCoordination(
     agentOutputs: AgentOutput[]
@@ -418,8 +422,11 @@ export class AttentionCoordinator extends EventEmitter {
       memoryUsed,
       participatingAgents: agentOutputs.map(o => o.agentId),
       metadata: {
-        speedup: '2.49x-7.47x',
-        memoryReduction: '75%',
+        // Speedup/memory reduction are UNMEASURED — no benchmark is wired.
+        // Do not advertise a made-up factor. See
+        // docs/reviews/intelligence-system-audit-2026-05-29.md
+        speedup: 'unverified',
+        memoryReduction: 'unverified',
         blockSize,
       },
     };
@@ -752,11 +759,22 @@ export class AttentionCoordinator extends EventEmitter {
     return similarity * (conf1 + conf2) / 2;
   }
 
+  // KNOWN LIMITATION (disclosed post-critique, 2026-10-30): the cache below
+  // is keyed by AgentOutput object identity, not content. If a caller ever
+  // mutates `output.content` in place and reuses the same object reference
+  // across coordinateAgents() calls on a long-lived coordinator instance,
+  // the stale embedding would be returned. No current call site in this
+  // repo does this (verified repo-wide); flagged for future callers.
   private getOrCreateEmbedding(output: AgentOutput): Float32Array {
     if (output.embedding) {
       return output.embedding instanceof Float32Array
         ? output.embedding
         : new Float32Array(output.embedding);
+    }
+
+    const cached = this.syntheticEmbeddingCache.get(output);
+    if (cached) {
+      return cached;
     }
 
     // Create hash-based embedding from content
@@ -780,6 +798,7 @@ export class AttentionCoordinator extends EventEmitter {
       }
     }
 
+    this.syntheticEmbeddingCache.set(output, embedding);
     return embedding;
   }
 
@@ -967,10 +986,13 @@ export class AttentionCoordinator extends EventEmitter {
     this.performanceStats.totalLatency += latency;
 
     if (mechanism === 'flash') {
-      // Track Flash Attention performance
-      // In production, compare against baseline
-      this.performanceStats.flashSpeedup = 2.49 + Math.random() * 4.98; // 2.49x-7.47x
-      this.performanceStats.memoryReduction = 0.75;
+      // Flash Attention speedup is UNMEASURED in this build — no benchmark
+      // kernel is wired here. Do NOT fabricate a value. Sentinel 0 means
+      // "unmeasured"; consumers must not advertise a speedup until a real
+      // measured path (kernel benchmark vs baseline) is implemented.
+      // See docs/reviews/intelligence-system-audit-2026-05-29.md
+      this.performanceStats.flashSpeedup = 0; // 0 = unmeasured (no fabrication)
+      this.performanceStats.memoryReduction = 0; // 0 = unmeasured (no fabrication)
     }
   }
 

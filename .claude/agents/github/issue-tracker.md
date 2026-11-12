@@ -33,9 +33,9 @@ Intelligent issue management and project coordination with ruv-swarm integration
 ```javascript
 // Initialize issue management swarm
 mcp__claude-flow__swarm_init { topology: "star", maxAgents: 3 }
-mcp__claude-flow__agent_spawn { type: "coordinator", name: "Issue Coordinator" }
-mcp__claude-flow__agent_spawn { type: "researcher", name: "Requirements Analyst" }
-mcp__claude-flow__agent_spawn { type: "coder", name: "Implementation Planner" }
+mcp__claude-flow__agent_spawn { agentType: "coordinator", name: "Issue Coordinator" }
+mcp__claude-flow__agent_spawn { agentType: "researcher", name: "Requirements Analyst" }
+mcp__claude-flow__agent_spawn { agentType: "coder", name: "Implementation Planner" }
 
 // Create comprehensive issue
 mcp__github__create_issue {
@@ -95,7 +95,7 @@ mcp__github__add_issue_comment {
   - Final validation and merge preparation
   
   ---
-  🤖 Generated with Claude Code using ruv-swarm coordination`
+  `
 }
 
 // Store progress in swarm memory
@@ -133,9 +133,9 @@ mcp__github__update_issue {
 [Single Message - Issue Lifecycle Management]:
   // Initialize issue coordination swarm
   mcp__claude-flow__swarm_init { topology: "mesh", maxAgents: 4 }
-  mcp__claude-flow__agent_spawn { type: "coordinator", name: "Issue Manager" }
-  mcp__claude-flow__agent_spawn { type: "analyst", name: "Progress Tracker" }
-  mcp__claude-flow__agent_spawn { type: "researcher", name: "Context Gatherer" }
+  mcp__claude-flow__agent_spawn { agentType: "coordinator", name: "Issue Manager" }
+  mcp__claude-flow__agent_spawn { agentType: "analyst", name: "Progress Tracker" }
+  mcp__claude-flow__agent_spawn { agentType: "researcher", name: "Context Gatherer" }
   
   // Create multiple related issues using gh CLI
   Bash(`gh issue create \
@@ -213,8 +213,9 @@ mcp__github__update_issue {
 Updates will be posted automatically by swarm agents during implementation.
 
 ---
-🤖 Generated with Claude Code
 ```
+
+<!-- last-updated: 2026-05-21 — ADR-127 -->
 
 ### Bug Report Template:
 ```markdown
@@ -251,7 +252,6 @@ Updates will be posted automatically by swarm agents during implementation.
 - **Tester**: Validation and testing
 
 ---
-🤖 Generated with Claude Code
 ```
 
 ## Best Practices

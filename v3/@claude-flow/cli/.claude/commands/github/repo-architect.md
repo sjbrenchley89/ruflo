@@ -25,10 +25,10 @@ Repository structure optimization and multi-repo management with ruv-swarm coord
 ```javascript
 // Initialize architecture analysis swarm
 mcp__claude-flow__swarm_init { topology: "mesh", maxAgents: 4 }
-mcp__claude-flow__agent_spawn { type: "analyst", name: "Structure Analyzer" }
-mcp__claude-flow__agent_spawn { type: "architect", name: "Repository Architect" }
-mcp__claude-flow__agent_spawn { type: "optimizer", name: "Structure Optimizer" }
-mcp__claude-flow__agent_spawn { type: "coordinator", name: "Multi-Repo Coordinator" }
+mcp__claude-flow__agent_spawn { agentType: "analyst", name: "Structure Analyzer" }
+mcp__claude-flow__agent_spawn { agentType: "architect", name: "Repository Architect" }
+mcp__claude-flow__agent_spawn { agentType: "optimizer", name: "Structure Optimizer" }
+mcp__claude-flow__agent_spawn { agentType: "coordinator", name: "Multi-Repo Coordinator" }
 
 // Analyze current repository structure
 LS("/workspaces/ruv-FANN/claude-code-flow/claude-code-flow")
@@ -113,9 +113,9 @@ mcp__github__push_files {
 
 ## Quick Start
 \`\`\`bash
-npx claude-flow init --sparc
+npx @claude-flow/cli@latest init --sparc
 npm install
-npx claude-flow start --ui
+npx @claude-flow/cli@latest start --ui
 \`\`\`
 
 ## Features
@@ -153,8 +153,8 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
-      - uses: actions/setup-node@v3
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with: { node-version: '20' }
       - run: npm install && npm test`,
     message: "ci: Standardize integration workflow across repositories",
@@ -170,11 +170,11 @@ jobs:
 [Single Message - Repository Architecture Review]:
   // Initialize comprehensive architecture swarm
   mcp__claude-flow__swarm_init { topology: "hierarchical", maxAgents: 6 }
-  mcp__claude-flow__agent_spawn { type: "architect", name: "Senior Architect" }
-  mcp__claude-flow__agent_spawn { type: "analyst", name: "Structure Analyst" }
-  mcp__claude-flow__agent_spawn { type: "optimizer", name: "Performance Optimizer" }
-  mcp__claude-flow__agent_spawn { type: "researcher", name: "Best Practices Researcher" }
-  mcp__claude-flow__agent_spawn { type: "coordinator", name: "Multi-Repo Coordinator" }
+  mcp__claude-flow__agent_spawn { agentType: "architect", name: "Senior Architect" }
+  mcp__claude-flow__agent_spawn { agentType: "analyst", name: "Structure Analyst" }
+  mcp__claude-flow__agent_spawn { agentType: "optimizer", name: "Performance Optimizer" }
+  mcp__claude-flow__agent_spawn { agentType: "researcher", name: "Best Practices Researcher" }
+  mcp__claude-flow__agent_spawn { agentType: "coordinator", name: "Multi-Repo Coordinator" }
   
   // Analyze current repository structures
   LS("/workspaces/ruv-FANN/claude-code-flow/claude-code-flow")

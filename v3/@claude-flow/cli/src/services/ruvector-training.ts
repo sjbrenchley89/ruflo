@@ -14,11 +14,19 @@
  * Created with ❤️ by ruv.io
  */
 
-import type {
-  WasmMicroLoRA,
-  WasmScopedLoRA,
-  WasmTrajectoryBuffer,
-} from '@ruvector/learning-wasm';
+// Optional dependency — `@ruvector/learning-wasm` is not always installed in
+// CI (install-safety / Build V3 configurations). A literal `import type … from
+// '@ruvector/learning-wasm'` triggers TS2307 at build time when absent, even
+// though every runtime callsite is behind try/catch. Alias the exported types
+// to `any` locally — matches the pattern already used a few lines below for
+// `@ruvector/attention` and preserves the runtime behaviour that the wasm
+// bridge lazy-loads via dynamic import (#2586 / #2608 pattern).
+// eslint-disable-next-line @typescript-eslint/no-explicit-any -- optional-dep type aliases
+type WasmMicroLoRA = any;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any -- optional-dep type aliases
+type WasmScopedLoRA = any;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any -- optional-dep type aliases
+type WasmTrajectoryBuffer = any;
 
 // @ruvector/attention types — use any since the NAPI exports vary across versions
 type FlashAttention = any;
@@ -317,10 +325,15 @@ export async function initializeTraining(config: TrainingConfig = {}): Promise<{
     const { createRequire } = await import('module');
     const require = createRequire(import.meta.url);
 
-    const wasmPath = require.resolve('@ruvector/learning-wasm/ruvector_learning_wasm_bg.wasm');
+    // Indirect the optional-dep specifier through a string variable so tsc
+    // doesn't statically resolve `@ruvector/learning-wasm` at build time
+    // (TS2307 when the optional dep is absent — #2586 pattern).
+    const learningWasmPkg: string = '@ruvector/learning-wasm';
+    const wasmPath = require.resolve(`${learningWasmPkg}/ruvector_learning_wasm_bg.wasm`);
     const wasmBuffer = fs.readFileSync(wasmPath);
 
-    const learningWasm = await import('@ruvector/learning-wasm');
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- optional-dep dynamic import
+    const learningWasm: any = await import(learningWasmPkg);
     learningWasm.initSync({ module: wasmBuffer });
 
     microLoRA = new learningWasm.WasmMicroLoRA(dim, alpha, lr);
@@ -578,7 +591,8 @@ export function computeFlashAttention(
     throw new Error('Flash attention not initialized');
   }
 
-  return flashAttention.computeRaw(query, keys, values);
+  // #4610: the @ruvector/attention classes expose compute(), not computeRaw().
+  return flashAttention.compute(query, keys, values);
 }
 
 /**
@@ -593,7 +607,7 @@ export function computeMoEAttention(
     throw new Error('MoE attention not initialized');
   }
 
-  return moeAttention.computeRaw(query, keys, values);
+  return moeAttention.compute(query, keys, values);
 }
 
 /**
@@ -608,7 +622,7 @@ export function computeHyperbolicAttention(
     throw new Error('Hyperbolic attention not initialized');
   }
 
-  return hyperbolicAttention.computeRaw(query, keys, values);
+  return hyperbolicAttention.compute(query, keys, values);
 }
 
 /**
@@ -623,8 +637,19 @@ export function computeContrastiveLoss(
     throw new Error('Contrastive loss not initialized');
   }
 
-  const loss = contrastiveLoss.compute(anchor, positives, negatives);
-  const gradient = contrastiveLoss.backward(anchor, positives, negatives);
+  // #4610: InfoNceLoss has no backward(); computeWithGradients(anchor, positive,
+  // negatives) takes one positive and returns { loss, gradients }. Average over
+  // the positives so the list signature keeps its meaning.
+  if (positives.length === 0) {
+    throw new Error('Contrastive loss needs at least one positive');
+  }
+  let loss = 0;
+  const gradient = new Float32Array(anchor.length);
+  for (const positive of positives) {
+    const result = contrastiveLoss.computeWithGradients(anchor, positive, negatives);
+    loss += result.loss / positives.length;
+    for (let i = 0; i < gradient.length; i++) gradient[i] += result.gradients[i] / positives.length;
+  }
 
   return { loss, gradient };
 }

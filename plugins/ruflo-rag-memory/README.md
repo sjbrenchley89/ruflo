@@ -4,7 +4,30 @@ Retrieval-Augmented Generation memory with HNSW vector search, AgentDB persisten
 
 ## Overview
 
-Provides semantic store/search/recall over AgentDB with HNSW-indexed vector search (150x-12,500x faster than brute force). Bridges Claude Code's native auto-memory into AgentDB with 384-dim ONNX embeddings for unified cross-session semantic retrieval.
+Provides semantic store/search/recall over AgentDB with HNSW-indexed vector search (measured ~1.9x at N=20k, ~3.2x–4.7x at N=5k vs brute force, recall@10 ~0.99; ANN wins above the index-size crossover). Bridges Claude Code's native auto-memory into AgentDB with 384-dim ONNX embeddings for unified cross-session semantic retrieval.
+
+## Quick Start
+
+Store and retrieve knowledge across sessions:
+
+```bash
+# Store a pattern you want to remember
+npx ruflo memory store --key "oauth-flow" --value "OAuth2 with pkce for SPAs, use refresh tokens" --namespace patterns
+
+# Search for it later (even across projects!)
+npx ruflo memory search -q "oauth single page app"
+
+# Retrieve exact entry
+npx ruflo memory retrieve --key "oauth-flow" --namespace patterns
+```
+
+Use with agents:
+
+```bash
+# In your Claude Code agent prompt:
+const context = await memory_search({ query: "authentication patterns", limit: 3 });
+// Returns top 3 semantic matches from all sessions
+```
 
 ## Installation
 
@@ -48,7 +71,7 @@ memory list --namespace patterns --limit 10
 memory delete --key "old-entry" --namespace patterns
 
 # Quick semantic recall across all namespaces
-recall "how did we handle rate limiting?"
+/recall how did we handle rate limiting?
 ```
 
 ## Architecture
@@ -70,7 +93,7 @@ Claude Code Auto-Memory (~/.claude/projects/*/memory/*.md)
         └── claude-memories namespace
         │
         ▼ (HNSW ANN index)
-    Semantic Search (150x-12,500x faster)
+    Semantic Search (HNSW ANN — measured ~1.9x at N=20k vs brute force; see docs/reviews/intelligence-system-audit-2026-05-29.md)
 ```
 
 ## Encryption at rest (ruflo 3.6.25+)
@@ -127,7 +150,7 @@ Results include source attribution: `claude-code`, `auto-memory`, or `agentdb`.
 npx @claude-flow/cli@latest memory search --query "auth patterns" --smart --limit 10
 
 # MCP
-mcp__claude-flow__memory_search({ query: "auth patterns", smart: true, limit: 10 })
+mcp__plugin_ruflo-core_ruflo__memory_search({ query: "auth patterns", smart: true, limit: 10 })
 ```
 
 Best for multi-session recall, temporal queries ("what did we decide last week?"), and diverse result sets.
@@ -144,20 +167,19 @@ npx @claude-flow/cli@latest memory search --query "auth security" --limit 5
 
 ## HNSW Performance
 
-| Operation | Latency | vs Brute Force |
-|-----------|---------|----------------|
-| Vector search (100 entries) | ~0.01ms | 150x faster |
-| Vector search (10k entries) | ~0.05ms | 2,500x faster |
-| Vector search (100k entries) | ~0.1ms | 12,500x faster |
-| Store + index | ~1ms | — |
+Measured numbers from [`docs/reviews/intelligence-system-audit-2026-05-29.md`](../../docs/reviews/intelligence-system-audit-2026-05-29.md) + [`scripts/benchmark-intelligence.mjs`](../../scripts/benchmark-intelligence.mjs):
 
-## Integration with ruvector
+| Operation | vs Brute Force | Notes |
+|-----------|----------------|-------|
+| Vector search (N=5k) | ~3.2x–4.7x faster | ruvector NAPI, recall@10 ~0.99 |
+| Vector search (N=20k) | ~1.9x faster | ANN wins above crossover |
+| Vector search (below crossover) | ties/loses | brute force preferred for small N |
 
-When `ruflo-ruvector` is also loaded, rag-memory delegates to ruvector's backend for advanced features:
-- FlashAttention-3 for O(N) memory attention
-- Graph RAG for multi-hop knowledge retrieval
-- Hybrid search (sparse + dense) with RRF fusion
-- DiskANN for large-scale persistent indexes
+The previously published "150x–12,500x" figures were brute-force fallback artifacts and are not reproduced under the audit harness.
+
+## Supported memory search
+
+The supported text-query interface for this plugin is Ruflo `memory search` or the registered `memory_search` MCP tool. `memory search --type hybrid` unions keyword and semantic hits; `--smart` requests query expansion, RRF across variants, recency weighting, and MMR when the installed memory package supports it. The `ruvector search` CLI requires a database and query vector and does not accept a text query with `--hybrid` or `--graph-rag`. Installing `ruflo-ruvector` alone does not turn these into memory-search commands.
 
 ## Compatibility
 
@@ -192,7 +214,7 @@ bash plugins/ruflo-rag-memory/scripts/smoke.sh
 
 ## Related Plugins
 
-- `ruflo-agentdb` — Full AgentDB controller bridge (15 `agentdb_*` MCP tools); namespace convention owner; owns the `claude-memories` reserved namespace
+- `ruflo-agentdb` — Full AgentDB controller bridge (20 `agentdb_*` MCP tools); namespace convention owner; owns the `claude-memories` reserved namespace
 - `ruflo-ruvector` — Advanced vector operations (FlashAttention-3, Graph RAG, hybrid search)
 - `ruflo-rvf` — Portable RVF memory format for cross-machine export/import
 - `ruflo-knowledge-graph` — Entity extraction and graph traversal over memory
@@ -200,3 +222,15 @@ bash plugins/ruflo-rag-memory/scripts/smoke.sh
 ## License
 
 MIT
+
+## As a mod
+
+Function-hook mod (ADR-445, pattern of `ruflo-agentdb`). It loads from `hooks/hooks.json` → `hooks/register.ts`.
+
+A write guard for memory: `memory_store`, `agentdb_hierarchical-store` and `agentdb_pattern-store` refuse secrets, so credentials never land in the vector store.
+
+- **Command**: `/rag-mod` answers locally with no model call. Verbs: `status`, `scan <text>` (would the guard refuse this?), `tools` (which memory tools are connected).
+- **Status file**: `.claude-flow/rag-mod/status.json` (`{version, updatedMs, ...counters}`), written at session start and as counters change.
+- **Safety**: no network, no process spawning; it only uses tools already connected.
+- **Option** `guard` (`on` by default, `off` to disable): a tighten-only `tool.call` guard. A call to one of the tools above whose input holds a key, token, private key or password is denied. The reason never repeats the secret.
+- **Test**: `claude plugin validate plugins/ruflo-rag-memory`, `claude plugin test plugins/ruflo-rag-memory`, `bash plugins/ruflo-rag-memory/scripts/smoke.sh`.

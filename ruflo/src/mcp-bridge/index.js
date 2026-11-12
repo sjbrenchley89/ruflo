@@ -1,6 +1,7 @@
 import express from "express";
 import { spawn } from "child_process";
-import { randomUUID } from "crypto";
+import { randomUUID, timingSafeEqual } from "crypto";
+import { assertPublicUrl } from "./url-guard.js";
 
 // =============================================================================
 // CONFIGURATION
@@ -12,6 +13,7 @@ const CLOUD_FUNCTIONS = {
 };
 
 const PORT = parseInt(process.env.PORT || "3001", 10);
+const BIND_HOST = process.env.MCP_BIND_HOST || "127.0.0.1";
 
 // =============================================================================
 // TOOL GROUPS — Enable/disable categories of tools independently
@@ -83,10 +85,10 @@ const TOOL_GROUPS = {
     prefixes: ["neural_", "daa_"],
   },
 
-  // --- Agentic Flow (agentic-flow@alpha) ---
+  // --- Agentic Flow (agentic-flow, pinned in BACKEND_VERSIONS) ---
   "agentic-flow": {
     enabled: process.env.MCP_GROUP_AGENTIC_FLOW === "true",
-    description: "Execute 66+ specialized agents, batch code editing, AgentDB patterns (agentic-flow)",
+    description: "Agent catalog lookup and AgentDB reasoning-pattern search (agentic-flow)",
     source: "agentic-flow",
     prefixes: ["agentic_flow_", "agent_booster_", "agentdb_"],
   },
@@ -105,17 +107,30 @@ const TOOL_GROUPS = {
     source: "gemini-mcp",
   },
 
-  // --- OpenAI Codex ---
+  // --- OpenAI Codex (MCP server mode removed from current CLI; #3509) ---
   codex: {
-    enabled: process.env.MCP_GROUP_CODEX === "true",
-    description: "OpenAI Codex coding agent — code generation and execution (requires OPENAI_API_KEY)",
+    enabled: false,
+    description: "Unavailable: Codex CLI has no MCP server mode. Use Codex dual-mode workers instead.",
     source: "codex",
   },
 };
 
+if (process.env.MCP_GROUP_CODEX === "true") {
+  console.warn("[codex] Codex CLI has no MCP server mode; MCP_GROUP_CODEX is disabled. Use Codex dual-mode workers (codex exec) instead.");
+}
+
 // =============================================================================
 // STDIO MCP CLIENT — Connects to external MCP servers via child process
 // =============================================================================
+
+// Backends inherit the provider keys they need, but not the bridge's own
+// bearer token: a backend has no use for it, and holding it would let a
+// compromised backend call the bridge as an authenticated client.
+function backendEnv() {
+  const env = { ...process.env };
+  delete env.MCP_AUTH_TOKEN;
+  return env;
+}
 
 class StdioMcpClient {
   constructor(name, command, args = []) {
@@ -134,7 +149,7 @@ class StdioMcpClient {
       try {
         this.process = spawn(this.command, this.args, {
           stdio: ["pipe", "pipe", "pipe"],
-          env: { ...process.env },
+          env: backendEnv(),
         });
 
         this.process.stdout.on("data", (data) => this._onData(data.toString()));
@@ -250,13 +265,21 @@ class StdioMcpClient {
 // BACKEND REGISTRY
 // =============================================================================
 
+// Exact versions for backends that are third-party or were tracking a
+// pre-release tag, so a new upload cannot change what the bridge executes.
+// ruvector and ruflo are first-party and follow `latest`. Keep these in step
+// with the Dockerfile's pre-install lines.
+const BACKEND_VERSIONS = {
+  "agentic-flow": "3.5.4", // stable; 3.0.0-alpha.2 pulled protobufjs@6 via @xenova/transformers (ADR-513)
+  "gemini-mcp-server": "1.2.2",
+};
+
 const BACKEND_DEFS = [
   { name: "ruvector",       command: "npx", args: ["-y", "ruvector", "mcp", "start"],   groups: ["intelligence"] },
   { name: "ruflo",          command: "npx", args: ["-y", "ruflo", "mcp", "start"],      groups: ["agents", "memory", "devtools", "security", "browser", "neural"] },
-  { name: "agentic-flow",   command: "npx", args: ["-y", "agentic-flow@alpha", "mcp", "start"], groups: ["agentic-flow"] },
+  { name: "agentic-flow",   command: "npx", args: ["-y", `agentic-flow@${BACKEND_VERSIONS["agentic-flow"]}`, "mcp", "start"], groups: ["agentic-flow"] },
   { name: "claude",         command: "claude", args: ["mcp", "serve"],                  groups: ["claude-code"] },
-  { name: "gemini-mcp",     command: "npx", args: ["-y", "gemini-mcp-server"],          groups: ["gemini"] },
-  { name: "codex",          command: "npx", args: ["-y", "@openai/codex", "mcp-server"], groups: ["codex"] },
+  { name: "gemini-mcp",     command: "npx", args: ["-y", `gemini-mcp-server@${BACKEND_VERSIONS["gemini-mcp-server"]}`],          groups: ["gemini"] },
 ];
 
 const mcpBackends = new Map();
@@ -550,22 +573,22 @@ Neural network operations and Decentralized Autonomous Agents.
 - Autonomous agent workflows
 - Knowledge transfer between agents`,
 
-    "agentic-flow": `# Agentic Flow Group (agentic-flow@alpha)
+    "agentic-flow": `# Agentic Flow Group (agentic-flow)
 
-Execute 66+ specialized agents with boosted code editing and AgentDB.
+Look up agentic-flow's agent catalog and search AgentDB reasoning patterns.
 
 ## Key Tools
-- **agentic-flow__agentic_flow_agent** — Execute any of 66+ specialized agents
 - **agentic-flow__agentic_flow_list_agents** — List available agent types
-- **agentic-flow__agent_booster_edit_file** — 352x faster code editing
-- **agentic-flow__agent_booster_batch_edit** — Multi-file refactoring
-- **agentic-flow__agentdb_pattern_store** — Store reasoning patterns
-- **agentic-flow__agentdb_pattern_search** — Search similar patterns
+- **agentic-flow__agentic_flow_list_all_agents** — List package and local custom agents, with source
+- **agentic-flow__agentic_flow_agent_info** — Show an agent's source, category and system-prompt preview
+- **agentic-flow__agentic_flow_check_conflicts** — Find local agents that shadow package agents
+- **agentic-flow__agentdb_pattern_search** — Search past reasoning patterns by task description
+- **agentic-flow__agentdb_pattern_stats** — Aggregated stats and critique summary for a task's patterns
+- **agentic-flow__agentdb_stats** — AgentDB table counts and memory usage
 
 ## When to Use
-- Complex code generation with specialized agents
-- Batch code refactoring across files
-- Agent selection when you need the right specialist`,
+- Choosing the right specialist agent for a task
+- Recalling how similar tasks were approached before`,
 
     "claude-code": `# Claude Code Group
 
@@ -601,19 +624,7 @@ Requires: GOOGLE_API_KEY environment variable (already set for Gemini models).
 
     codex: `# Codex Group
 
-OpenAI Codex coding agent.
-
-Requires: OPENAI_API_KEY environment variable (already set for OpenAI models).
-
-## Capabilities
-- Code generation and execution
-- Code completion
-- Code explanation
-
-## When to Use
-- Code generation tasks
-- Quick code completions
-- Code explanation and documentation`,
+Unavailable: current Codex CLI has no MCP server mode (#3509). This group is disabled even if MCP_GROUP_CODEX=true, so it exposes no tools. Use the separate Codex dual-mode worker through codex exec. A future MCP adapter requires its own execution and security design.`,
   };
 
   if (topic === "tool" && toolName) {
@@ -640,15 +651,28 @@ Requires: OPENAI_API_KEY environment variable (already set for OpenAI models).
 }
 
 // =============================================================================
+// SSRF GUARD — Reject requests to private/loopback ranges (CWE-918)
+// =============================================================================
+
+// Implemented in ./url-guard.js so it can be unit-tested (test-url-guard.mjs).
+
+// =============================================================================
 // HELPER — Call a backend Cloud Function / API
 // =============================================================================
 
 async function callCloudFunction(url, payload, timeoutMs = 25000) {
+  // Validate the URL, and what it resolves to, before any network request.
+  try {
+    await assertPublicUrl(url);
+  } catch (err) {
+    return { error: err.message };
+  }
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const resp = await fetch(url, {
       method: "POST",
+      redirect: "error", // a redirect could point somewhere the guard never saw
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
       signal: controller.signal,
@@ -747,7 +771,30 @@ async function executeGoapSearch(query, args) {
 // TOOL EXECUTOR
 // =============================================================================
 
+// ADR-166 §6 Phase 1d + 2a — server-side tool gate.
+// Enforced HERE (not just in the autopilot handler) so /mcp, /mcp/:group,
+// autopilot, and any future path share ONE denial gate. Was the missing
+// link that made the disclosed unauthenticated-RCE chain reach shell.
+const DANGEROUS_TOOLS = Object.freeze(new Set([
+  "terminal_execute",
+  "ruflo__terminal_execute",
+  "devtools__terminal_execute",
+]));
+function isTerminalTool(name) {
+  return DANGEROUS_TOOLS.has(name) || /terminal_execute/i.test(name);
+}
+const MCP_ENABLE_TERMINAL = process.env.MCP_ENABLE_TERMINAL === "true";
+
 async function executeTool(name, args) {
+  // Deny dangerous tools unless the operator explicitly opted in.
+  // Enforced on every path (not just autopilot) — root cause of ADR-166 V2/V3.
+  if (isTerminalTool(name) && !MCP_ENABLE_TERMINAL) {
+    return {
+      error:
+        `Tool "${name}" is disabled by default. Set MCP_ENABLE_TERMINAL=true to allow.`,
+      code: "TOOL_DISABLED",
+    };
+  }
   // Validate that search-like tools have a non-empty query to prevent 400 errors
   if (!args || typeof args !== "object") args = {};
   const rawQuery = args.query ?? args.q ?? args.input ?? "";
@@ -834,14 +881,89 @@ const GROUP_DISPLAY_NAMES = {
 const app = express();
 app.use(express.json({ limit: "10mb" }));
 
-// ---------- CORS middleware ----------
+// ---------- MCP Streamable HTTP session (#2425 djimit) ----------
+// Streamable-HTTP clients (Codex/RMCP) send `DELETE /mcp` with an
+// `Mcp-Session-Id` header at shutdown. We echo a stable session id back
+// on every /mcp* response so those clients can attach it to the DELETE
+// and to `notifications/initialized` handshakes.
+const MCP_SESSION_ID = randomUUID();
 app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  if (req.path.startsWith("/mcp")) {
+    res.setHeader("Mcp-Session-Id", MCP_SESSION_ID);
+  }
+  next();
+});
+
+// ---------- CORS middleware (ADR-166 §6 Phase 3b) ----------
+const CORS_ALLOWLIST = (process.env.MCP_CORS_ORIGIN || "*")
+  .split(",").map(s => s.trim()).filter(Boolean);
+const CORS_WILDCARD = CORS_ALLOWLIST.length === 1 && CORS_ALLOWLIST[0] === "*";
+app.use((req, res, next) => localBrowserGuard(req, res, next));
+app.use((req, res, next) => {
+  const origin = req.get("origin") || "";
+  if (CORS_WILDCARD) {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+  } else if (origin && CORS_ALLOWLIST.includes(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
+  }
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, Mcp-Session-Id");
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
 });
+
+// ---------- Auth middleware ----------
+// No-op in local-only mode (MCP_AUTH_TOKEN unset). Enforces 401 when token is set.
+const MCP_TOKEN = process.env.MCP_AUTH_TOKEN || "";
+
+// ---------- Local-only browser guard (#4226) ----------
+// Binding to loopback does not keep web pages out: any page the user opens
+// can send requests to 127.0.0.1, and a DNS-rebinding page can even make the
+// request look same-origin. CORS only decides whether the page may READ the
+// reply; a "simple" cross-origin POST runs without a preflight. So when there
+// is no MCP_AUTH_TOKEN, refuse requests that a browser sent on behalf of a
+// foreign page:
+//   - the Host header must name a loopback address (stops DNS rebinding);
+//   - a request carrying an Origin header must come from a loopback origin or
+//     from an origin listed explicitly in MCP_CORS_ORIGIN.
+// Native MCP clients (CLI, IDE, curl) send no Origin and a loopback Host.
+const LOOPBACK_HOSTNAMES = new Set(["localhost", "127.0.0.1", "[::1]", "::1"]);
+function hostnameOf(value) {
+  try {
+    return new URL(value.includes("://") ? value : `http://${value}`).hostname.toLowerCase();
+  } catch {
+    return "";
+  }
+}
+function isLoopbackHostname(hostname) {
+  return LOOPBACK_HOSTNAMES.has(hostname) || hostname.endsWith(".localhost");
+}
+function localBrowserGuard(req, res, next) {
+  if (MCP_TOKEN) return next();
+  if (!isLoopbackHostname(hostnameOf(req.get("host") || ""))) {
+    return res.status(403).json({ error: "forbidden host" });
+  }
+  const origin = req.get("origin");
+  if (origin !== undefined) {
+    const explicitlyAllowed = !CORS_WILDCARD && CORS_ALLOWLIST.includes(origin);
+    if (!explicitlyAllowed && !isLoopbackHostname(hostnameOf(origin))) {
+      return res.status(403).json({ error: "forbidden origin" });
+    }
+  }
+  next();
+}
+function requireAuth(req, res, next) {
+  if (req.path === "/health") return next();
+  if (!MCP_TOKEN) return next();
+  const expected = `Bearer ${MCP_TOKEN}`;
+  const got = req.get("authorization") || "";
+  const ok = got.length === expected.length &&
+    timingSafeEqual(Buffer.from(got), Buffer.from(expected));
+  if (!ok) return res.status(401).json({ error: "unauthorized" });
+  next();
+}
+app.use(requireAuth);
 
 // ---------- Shared MCP handler ----------
 function createMcpHandler(groupName) {
@@ -872,7 +994,9 @@ function createMcpHandler(groupName) {
           return res.json({ jsonrpc: "2.0", id, result: mcpResult });
         }
         case "notifications/initialized":
-          return res.json({ jsonrpc: "2.0", id, result: {} });
+          // MCP streamable-HTTP spec: notifications must return 202 Accepted
+          // with an empty body (no jsonrpc envelope).
+          return res.status(202).end();
         default:
           return res.json({ jsonrpc: "2.0", id, error: { code: -32601, message: `Method not found: ${method}` } });
       }
@@ -896,6 +1020,8 @@ function createMcpSseHandler(groupName) {
 for (const groupName of Object.keys(TOOL_GROUPS)) {
   app.post(`/mcp/${groupName}`, createMcpHandler(groupName));
   app.get(`/mcp/${groupName}`, createMcpSseHandler(groupName));
+  // #2425 djimit — streamable-HTTP session cleanup
+  app.delete(`/mcp/${groupName}`, (_, res) => res.sendStatus(204));
 }
 
 // ---------- Catch-all /mcp — serves ALL enabled tools (backwards-compatible) ----------
@@ -926,7 +1052,7 @@ app.post("/mcp", async (req, res) => {
         return res.json({ jsonrpc: "2.0", id, result: mcpResult });
       }
       case "notifications/initialized":
-        return res.json({ jsonrpc: "2.0", id, result: {} });
+        return res.status(202).end();
       default:
         return res.json({ jsonrpc: "2.0", id, error: { code: -32601, message: `Method not found: ${method}` } });
     }
@@ -942,6 +1068,9 @@ app.get("/mcp", (req, res) => {
   res.setHeader("Connection", "keep-alive");
   res.write(`data: ${JSON.stringify({ type: "endpoint", url: "/mcp" })}\n\n`);
 });
+
+// #2425 djimit — streamable-HTTP session cleanup on the catch-all route.
+app.delete("/mcp", (_, res) => res.sendStatus(204));
 
 // ---------- GET /mcp-servers — returns MCP_SERVERS JSON for Chat UI config ----------
 app.get("/mcp-servers", (_, res) => {
@@ -1652,10 +1781,30 @@ app.get("/groups", (_, res) => {
 // =============================================================================
 
 async function main() {
-  app.listen(PORT, () => {
-    console.log(`MCP Bridge v2.0.0 on port ${PORT}`);
+  const isPublic = BIND_HOST !== "127.0.0.1" && BIND_HOST !== "localhost";
+  if (isPublic && !process.env.MCP_AUTH_TOKEN) {
+    console.error(
+      "FATAL: refusing to bind a public interface without MCP_AUTH_TOKEN. " +
+      "Generate one with: MCP_AUTH_TOKEN=$(openssl rand -base64 32)"
+    );
+    process.exit(1);
+  }
+  app.listen(PORT, BIND_HOST, () => {
+    console.log(`MCP Bridge v2.0.0 on port ${PORT} (${BIND_HOST})`);
     const enabled = Object.entries(TOOL_GROUPS).filter(([, g]) => g.enabled).map(([n]) => n);
     console.log(`Active groups: ${enabled.join(", ")}`);
+    // ADR-166 §6 — startup posture banner
+    console.log(
+      `[security] bind=${BIND_HOST} auth=${process.env.MCP_AUTH_TOKEN ? "bearer" : "off (local-only)"} ` +
+      `terminal=${MCP_ENABLE_TERMINAL ? "ENABLED (⚠ opt-in)" : "disabled"}`,
+    );
+    if (MCP_ENABLE_TERMINAL) {
+      console.warn(
+        "[security] WARNING: terminal_execute is enabled. This tool grants shell access " +
+        "inside the bridge container to any client the auth layer accepts. Ensure " +
+        "MCP_AUTH_TOKEN is set on any non-loopback bind. See ADR-166 §6 Phase 1d.",
+      );
+    }
   });
 
   const anyBackendNeeded = BACKEND_DEFS.some(isBackendNeeded);

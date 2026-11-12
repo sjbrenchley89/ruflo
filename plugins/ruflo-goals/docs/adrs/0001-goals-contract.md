@@ -22,7 +22,7 @@ tags: [plugin, goals, goap, research, horizon, dossier, namespace, smoke-test]
 
 | Namespace | Used by | Convention compliance |
 |-----------|---------|----------------------|
-| `adr` | `dossier-investigator`, `dossier-collect` | **Non-compliant** — should reference the canonical `adr-patterns` from [ruflo-adr ADR-0001](../../ruflo-adr/docs/adrs/0001-adr-plugin-pattern.md) |
+| `adr` | `dossier-investigator`, `dossier-collect` | **Non-compliant** — should reference the canonical `adr-patterns` from [ruflo-adr ADR-0001](../../../ruflo-adr/docs/adrs/0001-adr-plugin-pattern.md) |
 | `dossier` | `dossier-investigator` writes here | **Documented exception** — base-name rule (cf. `federation` from ruflo-federation) |
 | `research` | `deep-researcher` | **Non-compliant** — should be `goals-research` per kebab-case `<plugin-stem>-<intent>` rule |
 | `research-sources` | `deep-researcher` | **Non-compliant** — should be `goals-research-sources` |
@@ -49,7 +49,7 @@ A future ADR can propose the rename + migration once the data-portability path i
 1. Add this ADR (Proposed).
 2. README augment: Compatibility (pin v3.6); Namespace coordination block with the legacy-vs-canonical mapping above; ADR-099 cross-link for dossier-collect; Verification + Architecture Decisions sections.
 3. Plugin metadata stays at `0.2.0` (already at the cadence). Keywords add `mcp`, `gop` (typo: `goap`), `legacy-namespaces`, `evidence-grading`. Actually skipping `gop` — already has `goap`.
-4. `scripts/smoke.sh` — 10 structural checks: version + new keywords; all 5 skills + all 4 agents + 1 command with valid frontmatter; selection guide present (4 task patterns); ADR-099 cross-link in README; v3.6 pin; namespace coordination block with legacy mapping; ADR Proposed; no wildcard tools.
+4. `scripts/smoke.sh` — 10 structural checks: version + new keywords; all 5 skills + all 4 agents + 1 command with valid frontmatter; selection guide present (4 task patterns); ADR-099 cross-link in README; v3.6 pin; namespace coordination block with legacy mapping; ADR Accepted; no wildcard tools.
 
 ## Consequences
 

@@ -32,11 +32,25 @@ interface ToolSearchOptions {
   cacheable?: boolean;
 }
 
+export interface ToolAuthorizationDecision {
+  allowed: boolean;
+  reason?: string;
+  receiptId?: string;
+}
+
+export type ToolAuthorizer = (
+  name: string,
+  input: Record<string, unknown>,
+  context: ToolContext,
+  tool: MCPTool,
+) => ToolAuthorizationDecision | Promise<ToolAuthorizationDecision>;
+
 export class ToolRegistry extends EventEmitter {
   private readonly tools: Map<string, ToolMetadata> = new Map();
   private readonly categoryIndex: Map<string, Set<string>> = new Map();
   private readonly tagIndex: Map<string, Set<string>> = new Map();
   private defaultContext?: ToolContext;
+  private authorizer?: ToolAuthorizer;
 
   private totalRegistrations = 0;
   private totalLookups = 0;
@@ -64,6 +78,9 @@ export class ToolRegistry extends EventEmitter {
         return false;
       }
     }
+
+    const previous = this.tools.get(tool.name);
+    if (previous) this.removeFromIndexes(previous.tool);
 
     const metadata: ToolMetadata = {
       tool,
@@ -136,29 +153,32 @@ export class ToolRegistry extends EventEmitter {
       return false;
     }
 
-    if (metadata.tool.category) {
-      const categoryTools = this.categoryIndex.get(metadata.tool.category);
-      categoryTools?.delete(name);
-      if (categoryTools?.size === 0) {
-        this.categoryIndex.delete(metadata.tool.category);
-      }
-    }
-
-    if (metadata.tool.tags) {
-      for (const tag of metadata.tool.tags) {
-        const tagTools = this.tagIndex.get(tag);
-        tagTools?.delete(name);
-        if (tagTools?.size === 0) {
-          this.tagIndex.delete(tag);
-        }
-      }
-    }
-
+    this.removeFromIndexes(metadata.tool);
     this.tools.delete(name);
     this.logger.debug('Tool unregistered', { name });
     this.emit('tool:unregistered', name);
 
     return true;
+  }
+
+  private removeFromIndexes(tool: MCPTool): void {
+    if (tool.category) {
+      const categoryTools = this.categoryIndex.get(tool.category);
+      categoryTools?.delete(tool.name);
+      if (categoryTools?.size === 0) {
+        this.categoryIndex.delete(tool.category);
+      }
+    }
+
+    if (tool.tags) {
+      for (const tag of tool.tags) {
+        const tagTools = this.tagIndex.get(tag);
+        tagTools?.delete(tool.name);
+        if (tagTools?.size === 0) {
+          this.tagIndex.delete(tag);
+        }
+      }
+    }
   }
 
   getTool(name: string): MCPTool | undefined {
@@ -303,6 +323,52 @@ export class ToolRegistry extends EventEmitter {
       ...this.defaultContext,
       ...context,
     };
+
+    if (this.authorizer) {
+      try {
+        const authorization = await this.authorizer(name, input, execContext, metadata.tool);
+        if (!authorization.allowed) {
+          const reason = authorization.reason || 'Denied by policy';
+          this.logger.warn('Tool authorization denied', {
+            name,
+            sessionId: execContext.sessionId,
+            receiptId: authorization.receiptId,
+            reason,
+          });
+          this.emit('tool:denied', {
+            name,
+            input,
+            sessionId: execContext.sessionId,
+            receiptId: authorization.receiptId,
+            reason,
+          });
+          return {
+            content: [{
+              type: 'text',
+              text: `Authorization denied: ${reason}`,
+            }],
+            isError: true,
+          };
+        }
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        this.logger.error('Tool authorization failed closed', { name, error });
+        this.emit('tool:denied', {
+          name,
+          input,
+          sessionId: execContext.sessionId,
+          reason,
+        });
+        return {
+          content: [{
+            type: 'text',
+            text: `Authorization unavailable: ${reason}`,
+          }],
+          isError: true,
+        };
+      }
+    }
+
     this.totalExecutions++;
     metadata.callCount++;
     metadata.lastCalled = new Date();
@@ -312,23 +378,30 @@ export class ToolRegistry extends EventEmitter {
 
       const result = await metadata.tool.handler(input, execContext);
 
+      // CLI handlers return validation/runtime failures in-band. Preserve their
+      // payload while exposing the failure in the MCP envelope and metrics.
+      // A recorded task outcome with success:false alone is still valid data.
+      const isError = result !== null && typeof result === 'object'
+        && typeof (result as { error?: unknown }).error === 'string'
+        && (result as { error: string }).error.trim().length > 0;
+      if (isError) metadata.errorCount++;
       const duration = performance.now() - startTime;
       this.updateAverageExecutionTime(metadata, duration);
 
       this.logger.debug('Tool executed', {
         name,
         duration: `${duration.toFixed(2)}ms`,
-        success: true,
+        success: !isError,
       });
 
-      this.emit('tool:completed', { name, duration, success: true });
+      this.emit('tool:completed', { name, duration, success: !isError });
 
       return {
         content: [{
           type: 'text',
           text: typeof result === 'string' ? result : JSON.stringify(result, null, 2),
         }],
-        isError: false,
+        isError,
       };
     } catch (error) {
       const duration = performance.now() - startTime;
@@ -349,6 +422,10 @@ export class ToolRegistry extends EventEmitter {
 
   setDefaultContext(context: ToolContext): void {
     this.defaultContext = context;
+  }
+
+  setAuthorizer(authorizer?: ToolAuthorizer): void {
+    this.authorizer = authorizer;
   }
 
   getMetadata(name: string): ToolMetadata | undefined {
@@ -412,10 +489,6 @@ export class ToolRegistry extends EventEmitter {
 
   private validateSchema(schema: JSONSchema, path = ''): string[] {
     const errors: string[] = [];
-
-    if (!schema.type) {
-      errors.push(`${path || 'schema'}: type is required`);
-    }
 
     if (schema.type === 'object' && schema.properties) {
       for (const [key, propSchema] of Object.entries(schema.properties)) {

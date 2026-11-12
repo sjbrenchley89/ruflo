@@ -5,26 +5,41 @@
  * Project-agnostic — works without ruflo CLI being installed.
  *
  * Usage:
- *   node verify.mjs --manifest <path> [--root <path>] [--json]
+ *   node verify.mjs --manifest <path> [--root <path>] [--source-only] [--json] [--strict] [--public-key <hex>]
  *
  * Exit codes:
- *   0  — signature valid + all fixes pass or drift (marker present)
- *   1  — signature invalid OR any fix regressed/missing (real failure)
+ *   0  — signature valid + all fixes pass or drift (marker present);
+ *        with --strict, all fixes must pass without drift
+ *   1  — signature invalid OR any fix regressed/missing, or drift with --strict
  *   2  — bad arguments / file not found OR precondition not met
- *        (e.g. @noble/ed25519 not installed, or dist files not built —
- *         source-only checkout without `npm ci && npm run build`).
+ *        (e.g. dist files not built during full-tree verification).
  *        Issue #1880: scheduled runners use this to distinguish a
  *        "needs install+build" environment from a real verification
  *        failure, so we stop filing recurring issues on every cron run.
+ *
+ * JSON output carries `status`: 'ok' | 'fail' | 'not-built' |
+ * 'no-source-entries'. 'not-built' (exit 2, `precondition: 'dist-not-built'`)
+ * is reported only when the signature is valid, no source entry regressed
+ * or is missing, and NONE of the manifest's dist/ entries exist on disk —
+ * i.e. the build never ran. If any dist/ entry exists, missing dist files
+ * are a real failure (exit 1), not a precondition (#4885).
  */
 
 import { readFileSync, existsSync } from 'node:fs';
-import { resolve, join, sep } from 'node:path';
-import { createHash } from 'node:crypto';
-import { createRequire } from 'node:module';
+import { resolve, join } from 'node:path';
+import {
+  createHash,
+  createPrivateKey,
+  createPublicKey,
+  verify as verifyEd25519,
+} from 'node:crypto';
 import { fileSha256, fileContains } from './lib.mjs';
 
 const args = parseArgs(process.argv.slice(2));
+if (args.help) {
+  console.log('Usage: node verify.mjs --manifest <path> [--root <path>] [--source-only] [--json] [--strict] [--public-key <hex>]');
+  process.exit(0);
+}
 if (!args.manifest) { console.error('--manifest <path> required'); process.exit(2); }
 
 const manifestPath = resolve(args.manifest);
@@ -32,28 +47,35 @@ if (!existsSync(manifestPath)) { console.error(`not found: ${manifestPath}`); pr
 
 const repoRoot = resolve(args.root ?? process.cwd());
 const asJson = !!args.json;
+const sourceOnly = !!args['source-only'];
+const strict = !!args.strict;
 
 const witness = JSON.parse(readFileSync(manifestPath, 'utf8'));
 
 // ─── signature ────────────────────────────────────────────────────
-const sig = await verifySignature(witness, repoRoot);
+const sig = verifySignature(witness, { publicKey: args['public-key'] });
 
-// Issue #1880 — if @noble/ed25519 isn't installed, this is a
-// precondition failure, not a verification failure. Exit 2 so the
-// scheduled runner can distinguish "install needed" from a real
-// regression and stop filing duplicate issues every 12 hours.
-if (sig.reason === 'noble-ed25519-not-installed') {
-  if (asJson) {
-    console.log(JSON.stringify(
-      { ok: false, precondition: 'noble-ed25519-not-installed', signature: sig },
-      null, 2
-    ));
-  }
+// ─── per-fix marker check ─────────────────────────────────────────
+const allFixes = witness.manifest.fixes;
+const selectedFixes = sourceOnly
+  ? allFixes.filter((fix) => !isGeneratedDistPath(fix.file))
+  : allFixes;
+const skippedGenerated = allFixes.length - selectedFixes.length;
+
+if (sourceOnly && selectedFixes.length === 0) {
+  const result = {
+    ok: false,
+    status: 'no-source-entries',
+    scope: 'source-only',
+    precondition: 'no-source-entries',
+    signature: sig,
+  };
+  if (asJson) console.log(JSON.stringify(result, null, 2));
+  else console.error('verify.mjs: manifest contains no source entries to verify');
   process.exit(2);
 }
 
-// ─── per-fix marker check ─────────────────────────────────────────
-const fileResults = witness.manifest.fixes.map((fix) => {
+const fileResults = selectedFixes.map((fix) => {
   const installed = join(repoRoot, fix.file);
   if (!existsSync(installed)) {
     return { ...fix, status: 'missing', sha256Match: false, markerPresent: false };
@@ -71,48 +93,94 @@ const summary = {
   drift: fileResults.filter(r => r.status === 'drift').length,
   regressed: fileResults.filter(r => r.status === 'regressed').length,
   missing: fileResults.filter(r => r.status === 'missing').length,
+  skippedGenerated,
 };
 
-// Issue #1880 — heuristic: if *every* manifest entry is missing AND at
-// least one references a `/dist/` path, the checkout was source-only
-// (no `npm run build`). That's a precondition failure, not a regression.
-// Anything more nuanced (partial dist build, real regressions, etc.)
-// still lands in the normal exit-1 path.
-const allMissing = fileResults.length > 0
-                && summary.missing === fileResults.length;
-const referencesDist = fileResults.some(r => r.file && r.file.includes(`${sep}dist${sep}`)
-                                          || (r.file && r.file.includes('/dist/')));
-if (allMissing && referencesDist) {
+// Issue #1880 / #2528 / #4885 — a checkout where the build never ran is a
+// precondition failure (exit 2), not an integrity failure. That verdict is
+// narrow on purpose so it can never mask a real one:
+//   - the signature block must be fully valid (a tampered manifest on an
+//     unbuilt checkout still fails with exit 1);
+//   - no source (non-dist) entry may be regressed or missing;
+//   - NO dist/ entry may exist on disk. One deleted or renamed dist file in
+//     an otherwise built tree is a missing artifact (exit 1), not "not built".
+const sigOk = sig.signatureValid && sig.manifestHashOk && sig.publicKeyReproducible;
+const distResults = fileResults.filter(r => isGeneratedDistPath(r.file));
+const distMissing = distResults.filter(r => r.status === 'missing').length;
+const sourceMissing = summary.missing - distMissing;
+const notBuilt = !sourceOnly
+  && sigOk
+  && distResults.length > 0
+  && distMissing === distResults.length
+  && sourceMissing === 0
+  && summary.regressed === 0;
+
+if (notBuilt) {
+  const notBuiltInfo = {
+    distEntries: distResults.length,
+    sourceEntries: fileResults.length - distResults.length,
+    distDirs: [...new Set(distResults.map(r => distDirOf(r.file)))].sort(),
+  };
   if (asJson) {
     console.log(JSON.stringify(
-      { ok: false, precondition: 'dist-not-built', signature: sig, summary },
+      {
+        ok: false,
+        status: 'not-built',
+        scope: 'full',
+        precondition: 'dist-not-built',
+        notBuilt: notBuiltInfo,
+        signature: sig,
+        summary,
+        results: fileResults,
+      },
       null, 2
     ));
   } else {
     console.error(
-      `verify.mjs: every manifest entry is missing and the manifest references\n` +
-      `dist/ artifacts. The checkout appears to be source-only (no build run).\n` +
+      `verify.mjs: NOT BUILT — precondition not met, this is not an integrity failure.\n` +
       `\n` +
-      `Fix: from the repo root, run \`npm ci && npm run build\` (or the\n` +
-      `equivalent for the workspaces witness markers reference) before\n` +
-      `invoking this script. See #1880 for the full diagnosis.`
+      `  manifest signature:  valid\n` +
+      `  source entries:      ${notBuiltInfo.sourceEntries} checked — pass=${summary.pass} drift=${summary.drift} regressed=0 missing=0\n` +
+      `  dist/ entries:       ${notBuiltInfo.distEntries} not verified — none of them exist on disk\n` +
+      `  unbuilt dist dirs:   ${notBuiltInfo.distDirs.join(', ')}\n` +
+      `\n` +
+      `The dist/ layer cannot be verified until it is built. Build it, then re-run:\n` +
+      `  (cd v3 && pnpm install --frozen-lockfile && pnpm --recursive run build)\n` +
+      `To verify only the source layer without building, pass --source-only.\n` +
+      `Exit 2 = precondition (not built); exit 1 = verification failure. See #1880, #4885.`
     );
   }
   process.exit(2);
 }
 
 const ok = sig.signatureValid && sig.manifestHashOk && sig.publicKeyReproducible
-        && summary.regressed === 0 && summary.missing === 0;
+        && summary.regressed === 0 && summary.missing === 0
+        && (!strict || summary.drift === 0);
 
 if (asJson) {
-  console.log(JSON.stringify({ ok, signature: sig, summary, results: fileResults }, null, 2));
+  console.log(JSON.stringify(
+    { ok, status: ok ? 'ok' : 'fail', scope: sourceOnly ? 'source-only' : 'full', signature: sig, summary, results: fileResults },
+    null,
+    2
+  ));
 } else {
+  console.log(`Verification scope: ${sourceOnly ? 'source-only' : 'full'}`);
   console.log('Manifest signature:');
   console.log(`  hash matches:                    ${sig.manifestHashOk ? 'yes' : 'NO'}`);
   console.log(`  public key reproducible:         ${sig.publicKeyReproducible ? 'yes' : 'NO'}`);
   console.log(`  Ed25519 signature valid:         ${sig.signatureValid ? 'yes' : 'NO'}`);
+  console.log(`  authenticity:                    ${sig.authenticity}${sig.pinnedKeyConfigured ? ' (pinned key)' : ''}`);
+  if (sig.authenticity === 'self-attested' && !sig.pinnedKeyConfigured) {
+    console.log('  WARNING: the signing seed is derived from the public git commit, so this');
+    console.log('           signature proves integrity, not authorship. Set');
+    console.log('           --public-key or RUFLO_WITNESS_PUBLIC_KEY to pin a release key.');
+  }
+  if (sig.authenticity === 'external-key' && !sig.pinnedKeyConfigured) {
+    console.log('  WARNING: manifest was signed with an external key; verification fails closed');
+    console.log('           until --public-key or RUFLO_WITNESS_PUBLIC_KEY pins the matching public key.');
+  }
   console.log('');
-  console.log(`Summary: pass=${summary.pass} drift=${summary.drift} regressed=${summary.regressed} missing=${summary.missing}`);
+  console.log(`Summary: pass=${summary.pass} drift=${summary.drift} regressed=${summary.regressed} missing=${summary.missing} skipped-generated=${summary.skippedGenerated}`);
   if (summary.regressed > 0) {
     console.log('\nRegressed:');
     for (const r of fileResults.filter(r => r.status === 'regressed')) {
@@ -130,68 +198,96 @@ if (asJson) {
 process.exit(ok ? 0 : 1);
 
 // ─── ed25519 helpers ─────────────────────────────────────────────
-async function verifySignature(witness, repoRoot) {
-  // Probe multiple plausible install roots — pnpm's isolated linker
-  // doesn't hoist transitive deps to v3/node_modules, so we also check
-  // workspace packages that declare @noble/ed25519 directly. A user's
-  // flat npm install satisfies the first probe; pnpm satisfies the latter.
-  let ed;
-  let probeErr;
-  const probes = [
-    repoRoot,
-    join(repoRoot, 'v3'),
-    join(repoRoot, 'v3/@claude-flow/cli'),
-    join(repoRoot, 'v3/@claude-flow/plugin-agent-federation'),
-  ];
-  for (const root of probes) {
-    try { ed = createRequire(join(root, 'noop.js'))('@noble/ed25519'); break; }
-    catch (e) { probeErr = e; }
-  }
-  if (!ed) {
-    // ruflo#1880 — the scheduled 12h verification has bounced off this
-    // 6+ times. Spell out the fix in the error message instead of
-    // leaving the operator to chase it.
-    console.error(
-      `verify.mjs: could not load @noble/ed25519 from any of:\n` +
-      `  ${probes.join('\n  ')}\n` +
-      `  last error: ${probeErr?.message ?? '?'}\n` +
-      `\n` +
-      `Fix: from the repo root, run \`npm install\` (the dep is declared\n` +
-      `in the root package.json under @noble/ed25519). If your runner\n` +
-      `is a source-only checkout, your verification pipeline must run\n` +
-      `\`npm ci && npm run build\` before invoking this script. See #1880\n` +
-      `for the full diagnosis.`
+function verifySignature(witness, options = {}) {
+  try {
+    const recomputed = createHash('sha256').update(JSON.stringify(witness.manifest)).digest('hex');
+    const manifestHashOk = recomputed === witness.integrity.manifestHash;
+    const authenticity = witness.integrity.authenticity ?? 'self-attested';
+    const declaredPublicKey = String(witness.integrity.publicKey ?? '').toLowerCase();
+    // --public-key takes precedence over the RUFLO_WITNESS_PUBLIC_KEY env var.
+    const pinnedKey = String(options.publicKey ?? process.env.RUFLO_WITNESS_PUBLIC_KEY ?? '').trim().toLowerCase();
+    const pinnedKeyConfigured = pinnedKey.length > 0;
+    const pinnedKeyMatches = pinnedKeyConfigured ? declaredPublicKey === pinnedKey : undefined;
+
+    // For a legacy self-attested manifest, the public key is reproducible from
+    // the commit. For an external-key manifest, only a caller-supplied pinned
+    // key can establish authenticity; without one verification fails closed.
+    let publicKeyReproducible = false;
+    if (pinnedKeyConfigured) {
+      publicKeyReproducible = pinnedKeyMatches === true;
+    } else if (authenticity === 'self-attested') {
+      const seed = createHash('sha256')
+        .update(witness.manifest.gitCommit + ':ruflo-witness/v1')
+        .digest();
+
+      // RFC 8410 DER wrappers let Node/OpenSSL derive and verify Ed25519 keys
+      // without a package install. The witness format remains byte-compatible
+      // with manifests produced by @noble/ed25519.
+      const privateKey = createPrivateKey({
+        key: Buffer.concat([
+          Buffer.from('302e020100300506032b657004220420', 'hex'),
+          seed,
+        ]),
+        format: 'der',
+        type: 'pkcs8',
+      });
+      const reproducedKey = createPublicKey(privateKey)
+        .export({ format: 'der', type: 'spki' })
+        .subarray(-32);
+      publicKeyReproducible = reproducedKey.toString('hex') === declaredPublicKey;
+    }
+
+    const declaredKey = createPublicKey({
+      key: Buffer.concat([
+        Buffer.from('302a300506032b6570032100', 'hex'),
+        Buffer.from(witness.integrity.publicKey, 'hex'),
+      ]),
+      format: 'der',
+      type: 'spki',
+    });
+    const signatureValid = verifyEd25519(
+      null,
+      Buffer.from(witness.integrity.manifestHash, 'hex'),
+      declaredKey,
+      Buffer.from(witness.integrity.signature, 'hex'),
     );
+    return {
+      manifestHashOk,
+      publicKeyReproducible,
+      signatureValid,
+      authenticity,
+      pinnedKeyConfigured,
+      pinnedKeyMatches,
+      verifier: 'node:crypto',
+    };
+  } catch (error) {
     return {
       manifestHashOk: false,
       publicKeyReproducible: false,
       signatureValid: false,
-      // Machine-parseable hint for the scheduled runner so it can
-      // distinguish "missing dep" from a real signature failure.
-      reason: 'noble-ed25519-not-installed',
+      authenticity: witness?.integrity?.authenticity ?? 'self-attested',
+      pinnedKeyConfigured: Boolean(options.publicKey ?? process.env.RUFLO_WITNESS_PUBLIC_KEY),
+      verifier: 'node:crypto',
+      reason: 'signature-verification-error',
+      error: error instanceof Error ? error.message : String(error),
     };
   }
+}
 
-  ed.etc.sha512Sync = (...m) => { const h = createHash('sha512'); for (const x of m) h.update(x); return h.digest(); };
+function distDirOf(file) {
+  const parts = file.split(/[\\/]/);
+  return parts.slice(0, parts.indexOf('dist') + 1).join('/');
+}
 
-  const recomputed = createHash('sha256').update(JSON.stringify(witness.manifest)).digest('hex');
-  const manifestHashOk = recomputed === witness.integrity.manifestHash;
-  const seed = createHash('sha256').update(witness.manifest.gitCommit + ':ruflo-witness/v1').digest();
-  const reKey = ed.getPublicKey(seed);
-  const publicKeyReproducible = Buffer.from(reKey).toString('hex') === witness.integrity.publicKey;
-  const signatureValid = ed.verify(
-    Buffer.from(witness.integrity.signature, 'hex'),
-    Buffer.from(witness.integrity.manifestHash, 'hex'),
-    Buffer.from(witness.integrity.publicKey, 'hex'),
-  );
-  return { manifestHashOk, publicKeyReproducible, signatureValid };
+function isGeneratedDistPath(file) {
+  return typeof file === 'string' && file.split(/[\\/]/).includes('dist');
 }
 
 function parseArgs(argv) {
   const out = {};
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    if (a === '--json' || a === '--help') { out[a.slice(2)] = true; continue; }
+    if (a === '--json' || a === '--help' || a === '--strict') { out[a.slice(2)] = true; continue; }
     if (a.startsWith('--')) {
       const key = a.slice(2);
       const next = argv[i + 1];

@@ -1,6 +1,6 @@
 # ruflo-browser
 
-Session-as-skill browser automation. Playwright-backed via 23 `mcp__claude-flow__browser_*` tools, with each session captured as a first-class **RVF cognitive container** holding manifest + trajectory + screenshots + sanitized cookies + findings, indexed in AgentDB and gated by AIDefence.
+Session-as-skill browser automation. Playwright-backed via 23 `mcp__plugin_ruflo-core_ruflo__browser_*` tools, with each session captured as a first-class **RVF cognitive container** holding manifest + trajectory + screenshots + sanitized cookies + findings, indexed in AgentDB and gated by AIDefence.
 
 > **v0.2.0 architecture** — every browser session is now an addressable, replayable, federatable artifact. Status is **Proposed** per [ADR-0001](./docs/adrs/0001-browser-skills-architecture.md); the load-bearing replay assumption requires a pre-Accept spike (see ADR Verification §4).
 >
@@ -57,7 +57,7 @@ Re-open with `rvf ingest <id>`, fork with `rvf derive`, federate with `rvf expor
 | `browser-auth-flow` | Probe an auth flow for redirect leaks, missing CSRF, weak session cookies. |
 | `browser-test` | UI test recipe — composes `browser-record` + `browser-replay`. |
 
-`browser-scrape` is a deprecation shim that delegates to `browser-extract`. Removed in v0.3.0.
+`browser-scrape` is a deprecation shim that delegates to `browser-extract`. Kept as a shim; slated for removal in the next minor release.
 
 ## Memory layer (AgentDB)
 
@@ -78,7 +78,7 @@ Raw cookies and tokens never enter AgentDB unwrapped — see ADR §3.
 
 ## MCP surface
 
-23 existing `mcp__claude-flow__browser_*` tools (interaction primitive) **+ 5 new `browser_session_*` lifecycle tools (implemented in v0.2.0)**:
+18 existing `mcp__plugin_ruflo-core_ruflo__browser_*` interaction primitives (in [`browser-tools.ts`](../../v3/@claude-flow/cli/src/mcp-tools/browser-tools.ts): open/close/click/type/fill/select/check/uncheck/hover/press/scroll/screenshot/snapshot/eval/wait/reload/back/forward) **+ 5 new `browser_session_*` lifecycle tools (implemented in v0.2.0)** for a total of 23:
 
 | Tool | Purpose |
 |------|---------|
@@ -88,7 +88,7 @@ Raw cookies and tokens never enter AgentDB unwrapped — see ADR §3.
 | `browser_template_apply` | Fetch a recipe from `browser-templates` AgentDB namespace. |
 | `browser_cookie_use` | Fetch an opaque vault handle from `browser-cookies`; raw values never returned. |
 
-Implementation: [`v3/@claude-flow/cli/src/mcp-tools/browser-session-tools.ts`](../../v3/@claude-flow/cli/src/mcp-tools/browser-session-tools.ts), registered in `mcp-client.ts`. Each handler shells out to the pinned `ruvector@0.2.25` CLI for trajectory + RVF, the existing `agent-browser` CLI for browser actions, and the bridged `claude-flow memory` for AgentDB. Missing dependencies degrade with structured `success: false` errors instead of crashing.
+Implementation: [`v3/@claude-flow/cli/src/mcp-tools/browser-session-tools.ts`](../../v3/@claude-flow/cli/src/mcp-tools/browser-session-tools.ts), registered in `mcp-client.ts`. Each handler shells out to the pinned `ruvector@0.3.12` CLI for trajectory + RVF, the existing `agent-browser` CLI for browser actions, and the bridged `claude-flow memory` for AgentDB. Missing dependencies degrade with structured `success: false` errors instead of crashing.
 
 `browser_session_replay` is deliberately a primitive: it derives a child RVF container and surfaces the source trajectory so the caller dispatches each step through the appropriate `browser_*` tool. That keeps the replay engine out of the MCP layer and makes the load-bearing assumption (replay-fidelity across DOM drift) testable via the spike harness below rather than buried in tool internals.
 
@@ -113,7 +113,7 @@ bash plugins/ruflo-browser/scripts/replay-spike.sh
 
 Records + replays a baseline session against each URL in `scripts/SITES.txt` (10 sites by default, varying drift profiles). Writes `spike-results/<timestamp>/STATUS.md` with per-site verdicts and the aggregate replay rate. The ADR threshold is **≥80%**; meeting it is the gate to flip ADR-0001 from `Proposed` → `Accepted`. Below the threshold, the proposal degrades to "session as audit log" (replay and screenshot-diff become best-effort).
 
-The spike requires `agent-browser` (or `npx --yes agent-browser`), `ruvector@0.2.25` (auto-fetched via `npx`), and network access. It is **not** part of the smoke test — running it is a deliberate audit step.
+The spike requires `agent-browser` (or `npx --yes agent-browser`), `ruvector@0.3.12` (auto-fetched via `npx`), and network access. It is **not** part of the smoke test — running it is a deliberate audit step.
 
 ## Architecture Decisions
 
@@ -129,3 +129,15 @@ The spike requires `agent-browser` (or `npx --yes agent-browser`), `ruvector@0.2
 ## License
 
 MIT
+
+## As a mod
+
+Function hooks (ADR-445 pattern, `hooks/register.ts`) that need no model call, no network and no process:
+
+- **Tool guard** (default on, tighten-only: it can only deny). Refuses browser_open to file/javascript/data/chrome URLs, URLs with embedded credentials or cloud-metadata hosts, and Chrome launch flags that drop page isolation or open a debug port; refuses browser_eval scripts that read cookies/storage and can also send them off the page. A refusal never echoes the offending value.
+- **`/browser-mod`** answers locally: `status`, `scan <js>` and `url <url>` (would the guard refuse this?). (A distinct name from the plugin's own commands/skills, which no hook can answer.)
+- **Status file** `.claude-flow/browser-mod/status.json` (`version`, `updatedMs`, `checked`, `blocked`, `byRule`) is written at session start and after each refusal; the console reads it.
+
+Options (`userConfig`): `guard` (on/off, default on), `strictUrls` (default off: also refuse plain http outside localhost).
+
+Test: `claude plugin validate plugins/ruflo-browser && claude plugin test plugins/ruflo-browser && bash plugins/ruflo-browser/scripts/smoke.sh`.

@@ -16,13 +16,34 @@
 // Reference: ADR-126 Phase 3 + ADR-123 Wedge 8.
 
 export class SublinearAdapter {
-  static isMcpAvailable() {
+  /**
+   * Two-probe detection (kept in sync with sublinear-adapter.ts):
+   *   1) globalThis['mcp__ruflo-sublinear__solve'] is a function
+   *   2) process.env.RUFLO_SUBLINEAR_NATIVE === '1' (manual override)
+   * Either probe passing triggers the native dispatch; failure of the call
+   * itself falls back to the local JS CG kernel.
+   */
+  static detectSublinearTool() {
     try {
       const tool = globalThis['mcp__ruflo-sublinear__solve'];
-      return typeof tool === 'function';
+      if (typeof tool === 'function') return true;
     } catch {
-      return false;
+      /* fall through */
     }
+    try {
+      const envFlag = typeof process !== 'undefined' && process.env
+        ? process.env.RUFLO_SUBLINEAR_NATIVE
+        : undefined;
+      if (envFlag === '1' || envFlag === 'true') return true;
+    } catch {
+      /* no process */
+    }
+    return false;
+  }
+
+  /** Back-compat alias for the smoke contract (#2068). */
+  static isMcpAvailable() {
+    return SublinearAdapter.detectSublinearTool();
   }
 
   async solveCG(matrix, vector, opts = {}) {
@@ -41,12 +62,20 @@ export class SublinearAdapter {
       return degrade(start, 'matrix not symmetric within 1e-9');
     }
 
-    if (SublinearAdapter.isMcpAvailable()) {
+    if (SublinearAdapter.detectSublinearTool()) {
       try {
         const result = await callMcpSolve(matrix, vector, opts);
-        return { ...result, latencyMs: performance.now() - start, path: 'cg-mcp' };
+        return {
+          ...result,
+          latencyMs: performance.now() - start,
+          path: 'cg-mcp',
+          method: 'cg-sublinear-native',
+          solver: 'sublinear-time-solver@1.7.0',
+        };
       } catch {
-        // fall through
+        // Native dispatch failed (env-var set without harness mount, or
+        // tool errored). Fall through to local CG; the artifact records
+        // method='cg-local' so the regression is auditable.
       }
     }
 
@@ -60,6 +89,8 @@ export class SublinearAdapter {
       residual,
       latencyMs: performance.now() - start,
       path: 'cg-local',
+      method: 'cg-local',
+      solver: 'local-js-cg',
     };
   }
 }
@@ -71,6 +102,8 @@ function degrade(start, reason) {
     residual: Infinity,
     latencyMs: performance.now() - start,
     path: 'cg-local',
+    method: 'cg-local',
+    solver: 'local-js-cg',
     degraded: true,
     reason,
   };
@@ -118,36 +151,45 @@ export function neumannSeries(A, b, opts) {
   const maxIter = opts.maxIterations ?? 1000;
   const diag = new Float64Array(n);
   for (let i = 0; i < n; i++) diag[i] = A[i][i] || 1;
-  const x = new Float64Array(n);
+  // Ping-pong buffers: avoid allocating a fresh Float64Array(n) every iter.
+  // Before this change a typical 5-iter solve at n=256 allocated 5×2KB of
+  // garbage per call — measurable GC pressure under sustained workload.
+  // The two-buffer swap keeps the same algorithm (Jacobi-style update from
+  // `cur` into `next`, convergence check, swap) with zero per-iter alloc.
+  // ADR-126 follow-up #49 — bench-driven perf note.
+  let cur = new Float64Array(n);
+  let next = new Float64Array(n);
   let iterations = 0;
   for (let k = 0; k < maxIter; k++) {
     iterations++;
-    const next = new Float64Array(n);
     for (let i = 0; i < n; i++) {
       let off = 0;
       const row = A[i];
       for (let j = 0; j < n; j++) {
-        if (j !== i) off += row[j] * x[j];
+        if (j !== i) off += row[j] * cur[j];
       }
       next[i] = (b[i] - off) / diag[i];
     }
-    // Convergence check on inf-norm of (next - x).
+    // Convergence check on inf-norm of (next - cur).
     let d = 0;
     for (let i = 0; i < n; i++) {
-      const e = Math.abs(next[i] - x[i]);
+      const e = Math.abs(next[i] - cur[i]);
       if (e > d) d = e;
     }
-    for (let i = 0; i < n; i++) x[i] = next[i];
+    // Swap: next becomes the new cur; the old cur is reused as next-scratch.
+    const tmp = cur;
+    cur = next;
+    next = tmp;
     if (d < tol) break;
   }
-  // Residual ||A·x − b||₂
-  const Ax = matVec(A, x);
+  // Residual ||A·x − b||₂ where x is the latest cur after the swap.
+  const Ax = matVec(A, cur);
   let r2 = 0;
   for (let i = 0; i < n; i++) {
     const d = Ax[i] - b[i];
     r2 += d * d;
   }
-  return { solution: Array.from(x), iterations, residual: Math.sqrt(r2) };
+  return { solution: Array.from(cur), iterations, residual: Math.sqrt(r2) };
 }
 
 function matVec(A, x) {
