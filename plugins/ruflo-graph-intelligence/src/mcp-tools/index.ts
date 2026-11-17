@@ -42,7 +42,7 @@ export const graphIntelligenceTools: MCPTool[] = [
   {
     name: 'sublinear/page-rank-entry',
     description:
-      'Single-entry personalized PageRank over a registered RuFlo graph. O(log n) on DD inputs. Returns score + observed complexity-class + coherence margin. Accepts maxComplexityClass budget gate (default linear) and coherenceThreshold (default 0 = disabled).',
+      'Single-entry personalized PageRank over a registered RuFlo graph. O(log n) on DD inputs. Returns score + observed complexity-class + coherence margin. Accepts maxComplexityClass budget gate (default linear) and coherenceThreshold (default 0 = disabled). Use when you need a relevance/centrality score for ONE node (e.g. "how important is this agent/file/memory relative to a seed set?") without computing the full PR vector.',
     category: 'graph-intelligence',
     inputSchema: {
       type: 'object',
@@ -86,7 +86,7 @@ export const graphIntelligenceTools: MCPTool[] = [
   {
     name: 'sublinear/solve',
     description:
-      'Full linear solve A·x = b over a registered graph. CG (symmetric PD) or Neumann (general DD). Returns x + residual + observed complexity-class + coherence margin.',
+      'Full linear solve A·x = b over a registered graph. CG (symmetric PD) or Neumann (general DD). Returns x + residual + observed complexity-class + coherence margin. Use when you need the full solution vector (all nodes), not a single-entry score — for batch ranking, flow propagation, or trust-vector materialization. Prefer sublinear/page-rank-entry for single-node queries.',
     category: 'graph-intelligence',
     inputSchema: {
       type: 'object',
@@ -118,7 +118,7 @@ export const graphIntelligenceTools: MCPTool[] = [
   {
     name: 'sublinear/solve-on-change',
     description:
-      'Incremental solve A·dx = δ then x_new = x_prev + dx (Wedge 12, ADR-123). For event-driven streaming systems (federation trust deltas, span streams, append-only causal breaks). Sparse δ → asymptotically faster than full re-solve.',
+      'Incremental solve A·dx = δ then x_new = x_prev + dx (Wedge 12, ADR-123). For event-driven streaming systems (federation trust deltas, span streams, append-only causal breaks). Sparse δ → asymptotically faster than full re-solve. Use when you already have a prevSolution from sublinear/solve and only a few entries of b changed — avoids recomputing the full vector.',
     category: 'graph-intelligence',
     inputSchema: {
       type: 'object',
@@ -192,7 +192,7 @@ export const graphIntelligenceTools: MCPTool[] = [
   {
     name: 'sublinear/feasibility',
     description:
-      'Packing/covering LP feasibility check (Kyng-Sachdeva style). Wedge 9 — pre-flight check before invoking A* / heavy planners.',
+      'Packing/covering LP feasibility check (Kyng-Sachdeva style). Wedge 9 — pre-flight check before invoking A* / heavy planners. Use when a planner/scheduler has resource constraints (A·x ≤ b) and you want to cheaply check satisfiability before committing to a full search; returns witness x if feasible.',
     category: 'graph-intelligence',
     inputSchema: {
       type: 'object',
@@ -271,7 +271,7 @@ export const graphIntelligenceTools: MCPTool[] = [
   {
     name: 'sublinear/jl-embed',
     description:
-      'Johnson-Lindenstrauss projection. Maps vectors to a target dimension with ε-distortion. Replaces @claude-flow/embeddings hand-rolled JL (closes ADR-121 Phase 4 follow-up).',
+      'Johnson-Lindenstrauss projection. Maps vectors to a target dimension with ε-distortion. Replaces @claude-flow/embeddings hand-rolled JL (closes ADR-121 Phase 4 follow-up). Use when you need to downscale a batch of high-dim embeddings (e.g. 768→64) while preserving pairwise distances within ε — cheaper than PCA and randomized.',
     category: 'graph-intelligence',
     inputSchema: {
       type: 'object',

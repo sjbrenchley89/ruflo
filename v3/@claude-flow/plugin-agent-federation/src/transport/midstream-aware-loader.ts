@@ -28,19 +28,47 @@
  * surface from agentic-flow so consumers only import from one place.
  */
 
-// Type-only imports are erased at compile time — they do not force the
-// installation of `agentic-flow`. The value import (`loadQuicTransport`)
-// is now lazy via `loadAgenticFlowQuicTransport()` below so the
-// federation plugin can install + boot in environments that block the
-// koa transitive chain that agentic-flow pulls in (e.g. hardened npm
-// registries that block `cookies@0.9.1` per issue #1949).
-import type {
-  AgentTransport,
-  AgentMessage,
-  QuicTransportConfig,
-} from 'agentic-flow/transport/loader';
+// Minimal locally-declared type surface. Previously imported as
+// `import type { … } from 'agentic-flow/transport/loader'`, but that
+// subpath is not part of agentic-flow's published `exports` map — a
+// strict `moduleResolution: bundler` build or an external verifier
+// that literally does `import 'agentic-flow/transport/loader'` fails
+// with `ERR_MODULE_NOT_FOUND` (issue #2578). agentic-flow remains an
+// OPTIONAL peer dep, so the loader must compile without touching its
+// exports map at all.
+export interface AgentMessage {
+  id: string;
+  type: 'task' | 'result' | 'status' | 'coordination' | 'heartbeat' | string;
+  payload: unknown;
+  metadata?: Record<string, unknown>;
+  [key: string]: unknown;
+}
+export interface AgentTransport {
+  send: (address: string, message: AgentMessage) => Promise<void>;
+  onMessage: (handler: (address: string, message: AgentMessage) => void) => void;
+  listen?: (port: number, host?: string) => Promise<void>;
+  close?: () => Promise<void> | void;
+  [key: string]: unknown;
+}
+export interface QuicTransportConfig {
+  port?: number;
+  host?: string;
+  serverName?: string;
+  [key: string]: unknown;
+}
 
-export type { AgentTransport, AgentMessage, QuicTransportConfig };
+function isCompatibleTransport(
+  value: unknown,
+  requireListen = false,
+): value is AgentTransport {
+  if (!value || typeof value !== 'object') return false;
+  const transport = value as Partial<AgentTransport>;
+  return (
+    typeof transport.send === 'function' &&
+    typeof transport.onMessage === 'function' &&
+    (!requireListen || typeof transport.listen === 'function')
+  );
+}
 
 /**
  * Lazy loader for agentic-flow's `loadQuicTransport`. Returns `null`
@@ -68,7 +96,13 @@ async function loadAgenticFlowQuicTransport(
     };
   };
   try {
-    mod = (await import('agentic-flow/transport/loader')) as typeof mod;
+    // Cast through `unknown` because upstream's exported AgentTransport /
+    // AgentMessage carry a richer surface (InboundMessageHandler with an
+    // options bag, extra fields) that intentionally differs from our
+    // locally-declared minimal shim. The shim exists so the plugin can
+    // compile without importing agentic-flow's exports map at all
+    // (#2578). Downstream code (`plugin.ts`) uses our shim types.
+    mod = (await import('agentic-flow/transport/loader')) as unknown as typeof mod;
   } catch {
     return null;
   }
@@ -80,7 +114,10 @@ async function loadAgenticFlowQuicTransport(
     return null;
   }
   try {
-    return await fn(config);
+    const transport = await fn(config);
+    return isCompatibleTransport(transport, typeof config?.port === 'number')
+      ? transport
+      : null;
   } catch {
     return null;
   }
@@ -91,9 +128,103 @@ export interface LoadedFederationTransport {
   /** The live transport. Send/receive against this. */
   transport: AgentTransport;
   /** Which loader branch resolved. Useful for logs/metrics. */
-  source: 'midstreamer-native' | 'agentic-flow-loader';
+  source: 'midstreamer-native' | 'agentic-flow-loader' | 'websocket-fallback';
   /** Free-form note when a probe failed (helps explain a fallback). */
   fallbackReason?: string;
+}
+
+type WebSocketLike = {
+  on: (event: string, handler: (...args: unknown[]) => void) => void;
+  send: (data: string, cb?: (err?: Error) => void) => void;
+  close: () => void;
+};
+
+type WebSocketServerLike = {
+  on: (event: string, handler: (...args: unknown[]) => void) => void;
+  close: (cb?: () => void) => void;
+};
+
+/**
+ * Plugin-owned ADR-104 WebSocket fallback. This closes issue #2618's
+ * failure mode: current `agentic-flow` releases do not export
+ * `agentic-flow/transport/loader`, so the federation plugin must not
+ * depend on that subpath for its baseline wire transport.
+ */
+class WebSocketFallbackTransport implements AgentTransport {
+  [key: string]: unknown;
+
+  private handlers: Array<(address: string, message: AgentMessage) => void> = [];
+  private server: WebSocketServerLike | null = null;
+  private sockets = new Set<WebSocketLike>();
+
+  constructor(private readonly config: QuicTransportConfig = {}) {}
+
+  async send(address: string, message: AgentMessage): Promise<void> {
+    const { default: WebSocket } = await import('ws');
+    const url = address.includes('://') ? address : `ws://${address}`;
+    const socket = new WebSocket(url) as WebSocketLike;
+
+    await new Promise<void>((resolve, reject) => {
+      socket.on('open', () => {
+        socket.send(JSON.stringify(message), (err?: Error) => {
+          socket.close();
+          if (err) reject(err);
+          else resolve();
+        });
+      });
+      socket.on('error', (err: unknown) => reject(err instanceof Error ? err : new Error(String(err))));
+    });
+  }
+
+  onMessage(handler: (address: string, message: AgentMessage) => void): void {
+    this.handlers.push(handler);
+  }
+
+  // Loopback unless a host is configured, like the plugin listener; an empty
+  // host would bind every interface, so it counts as unset.
+  async listen(port = Number(this.config.port ?? 0), host = this.config.host || '127.0.0.1'): Promise<void> {
+    const { WebSocketServer } = await import('ws');
+    const server = new WebSocketServer({ port, host }) as WebSocketServerLike;
+    this.server = server;
+
+    await new Promise<void>((resolve, reject) => {
+      server.on('listening', () => resolve());
+      server.on('error', (err: unknown) => reject(err instanceof Error ? err : new Error(String(err))));
+      server.on('connection', (socket: unknown, request: unknown) => {
+        const ws = socket as WebSocketLike;
+        this.sockets.add(ws);
+        const remoteAddress = ((request as { socket?: { remoteAddress?: string; remotePort?: number } })?.socket);
+        const address = remoteAddress?.remoteAddress
+          ? `${remoteAddress.remoteAddress}${remoteAddress.remotePort ? `:${remoteAddress.remotePort}` : ''}`
+          : 'unknown';
+
+        ws.on('message', (data: unknown) => {
+          try {
+            const raw = typeof data === 'string'
+              ? data
+              : Buffer.isBuffer(data)
+                ? data.toString('utf8')
+                : String(data);
+            const message = JSON.parse(raw) as AgentMessage;
+            for (const handler of this.handlers) handler(address, message);
+          } catch {
+            // Drop malformed frames. Signature/envelope validation happens
+            // above this layer in inbound-dispatcher.
+          }
+        });
+        ws.on('close', () => this.sockets.delete(ws));
+      });
+    });
+  }
+
+  async close(): Promise<void> {
+    for (const socket of this.sockets) socket.close();
+    this.sockets.clear();
+    if (this.server) {
+      await new Promise<void>((resolve) => this.server?.close(resolve));
+      this.server = null;
+    }
+  }
 }
 
 /**
@@ -181,7 +312,12 @@ async function probeMidstreamerTransport(
 
   try {
     const transport = await surface.loadQuicTransport(config);
-    return { transport };
+    return isCompatibleTransport(transport, typeof config?.port === 'number')
+      ? { transport }
+      : {
+          transport: null as unknown as AgentTransport,
+          reason: 'midstreamer transport does not implement the federation send/onMessage/listen contract',
+        };
   } catch (err) {
     return {
       transport: null as unknown as AgentTransport,
@@ -198,8 +334,9 @@ async function probeMidstreamerTransport(
  *
  * Failure mode: if midstreamer is requested but rejects (stub, init
  * error, missing package), this function falls through to the
- * agentic-flow loader silently — the federation peer always gets a
- * transport (WebSocket fallback in the worst case, per ADR-104).
+ * agentic-flow loader. If current agentic-flow does not export its
+ * historical loader subpath, the plugin-owned WebSocket fallback is
+ * used directly (ADR-104, #2618).
  */
 export async function loadFederationTransport(
   config?: QuicTransportConfig,
@@ -210,17 +347,17 @@ export async function loadFederationTransport(
   }
 
   const transport = await loadAgenticFlowQuicTransport(config);
-  if (!transport) {
-    throw new Error(
-      'No federation transport available. Install `agentic-flow` ' +
-        '(default) or `midstreamer` and set `MIDSTREAMER_QUIC_NATIVE=1` ' +
-        '(per ADR-120). Both are now optional peer dependencies — at ' +
-        'least one must be present at runtime.',
-    );
+  if (transport) {
+    return {
+      transport,
+      source: 'agentic-flow-loader',
+      fallbackReason: probe?.reason,
+    };
   }
+
   return {
-    transport,
-    source: 'agentic-flow-loader',
-    fallbackReason: probe?.reason,
+    transport: new WebSocketFallbackTransport(config),
+    source: 'websocket-fallback',
+    fallbackReason: probe?.reason ?? 'agentic-flow transport loader unavailable; using plugin-owned WebSocket fallback',
   };
 }

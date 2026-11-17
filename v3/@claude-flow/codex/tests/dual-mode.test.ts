@@ -6,9 +6,25 @@
  * No real workers are spawned — only pure logic is exercised.
  */
 import { describe, it, expect } from 'vitest';
-import { parseWorkerSpecs, createDualModeCommand } from '../src/dual-mode/cli.js';
-import { DualModeOrchestrator, CollaborationTemplates } from '../src/dual-mode/index.js';
+import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import {
+  parseWorkerSpecs,
+  createDualModeCommand,
+  loadWorkerConfig,
+} from '../src/dual-mode/cli.js';
+import {
+  DualModeOrchestrator,
+  CollaborationTemplates,
+  loadSwarmAutomationConfig,
+} from '../src/dual-mode/index.js';
 import type { WorkerConfig } from '../src/dual-mode/index.js';
+import {
+  decodeTokenEnvelope,
+  publicKeyFromHex,
+  verifyInvocationToken,
+} from '@claude-flow/security';
 
 describe('parseWorkerSpecs', () => {
   it('parses a single spec into a WorkerConfig', () => {
@@ -61,6 +77,26 @@ describe('parseWorkerSpecs', () => {
   });
 });
 
+describe('loadWorkerConfig', () => {
+  it('loads a relative JSON config without import assertions (#2766)', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'ruflo-dual-config-'));
+    writeFileSync(join(root, 'workers.json'), JSON.stringify({
+      taskContext: 'JSON collaboration',
+      workers: [{ id: 'reader', platform: 'codex', role: 'reader', prompt: 'inspect' }],
+    }));
+    await expect(loadWorkerConfig('workers.json', root)).resolves.toMatchObject({
+      taskContext: 'JSON collaboration',
+      workers: [{ id: 'reader', platform: 'codex' }],
+    });
+  });
+
+  it('rejects configs without a workers array', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'ruflo-dual-config-invalid-'));
+    writeFileSync(join(root, 'workers.json'), '{}');
+    await expect(loadWorkerConfig('workers.json', root)).rejects.toThrow('workers array');
+  });
+});
+
 describe('CollaborationTemplates', () => {
   it('featureDevelopment: architect -> coder -> tester -> reviewer', () => {
     const ws = CollaborationTemplates.featureDevelopment('Add OAuth');
@@ -108,6 +144,58 @@ describe('dual command wiring', () => {
 });
 
 describe('DualModeOrchestrator', () => {
+  it('loads enforceable swarm automation ceilings from config.toml', () => {
+    const root = mkdtempSync(join(tmpdir(), 'ruflo-codex-config-'));
+    mkdirSync(join(root, '.agents'));
+    writeFileSync(join(root, '.agents', 'config.toml'), [
+      '[swarm.automation]',
+      'enabled = true',
+      'max_concurrent = 3',
+      'max_writers = 1',
+      'worktree_isolation = true',
+      'agent_timeout_seconds = 60',
+      'max_output_bytes = 4096',
+    ].join('\n'));
+    expect(loadSwarmAutomationConfig(root)).toEqual({
+      enabled: true,
+      maxConcurrent: 3,
+      maxWriters: 1,
+      worktreeIsolation: true,
+      agentTimeoutSeconds: 60,
+      maxOutputBytes: 4096,
+      dependencyFailure: 'cancel',
+    });
+  });
+
+  it('loads existing Codex project configuration from .codex', () => {
+    const root = mkdtempSync(join(tmpdir(), 'ruflo-codex-config-'));
+    mkdirSync(join(root, '.codex'));
+    writeFileSync(join(root, '.codex', 'config.toml'), [
+      '[swarm.automation]',
+      'enabled = true',
+      'max_concurrent = 2',
+    ].join('\n'));
+    expect(loadSwarmAutomationConfig(root)).toMatchObject({
+      enabled: true,
+      maxConcurrent: 2,
+    });
+  });
+
+  it('rejects invalid concurrency and output ceilings', () => {
+    expect(() => new DualModeOrchestrator({
+      projectPath: '/tmp',
+      maxConcurrent: 0,
+    })).toThrow('maxConcurrent must be a positive integer');
+    expect(() => new DualModeOrchestrator({
+      projectPath: '/tmp',
+      maxOutputBytes: 0,
+    })).toThrow('maxOutputBytes must be positive');
+    expect(() => new DualModeOrchestrator({
+      projectPath: '/tmp',
+      maxWriters: 0,
+    })).toThrow('maxWriters must be a positive integer');
+  });
+
   const orch = () => new DualModeOrchestrator({ projectPath: '/tmp' });
 
   it('uses safe defaults (codex command, not claude)', () => {
@@ -116,6 +204,149 @@ describe('DualModeOrchestrator', () => {
     expect(o.config.claudeCommand).toBe('claude');
     expect(o.config.maxConcurrent).toBe(4);
     expect(o.config.sharedNamespace).toBe('collaboration');
+    expect(o.config.memoryDbPath).toBe('/tmp/.claude-flow/dual-mode-memory.db');
+  });
+
+  it('pins bootstrap and workers to one shared memory database (#2766)', () => {
+    const root = mkdtempSync(join(tmpdir(), 'ruflo-dual-memory-'));
+    const memoryDbPath = join(root, 'state', 'shared.db');
+    const orchestrator = new DualModeOrchestrator({
+      projectPath: root,
+      memoryDbPath,
+    }) as unknown as {
+      sharedEnvironment(): NodeJS.ProcessEnv;
+      workerEnvironment(worker: WorkerConfig): NodeJS.ProcessEnv;
+    };
+    const worker: WorkerConfig = {
+      id: 'memory-worker',
+      platform: 'codex',
+      role: 'researcher',
+      prompt: 'search memory',
+      readOnly: true,
+    };
+
+    expect(orchestrator.sharedEnvironment().CLAUDE_FLOW_DB_PATH).toBe(memoryDbPath);
+    expect(orchestrator.workerEnvironment(worker).CLAUDE_FLOW_DB_PATH).toBe(memoryDbPath);
+  });
+
+  it('preserves an existing CLAUDE_FLOW_DB_PATH by default', () => {
+    const previous = process.env.CLAUDE_FLOW_DB_PATH;
+    const root = mkdtempSync(join(tmpdir(), 'ruflo-dual-memory-env-'));
+    const configured = join(root, 'existing.db');
+    process.env.CLAUDE_FLOW_DB_PATH = configured;
+    try {
+      const orchestrator = new DualModeOrchestrator({ projectPath: root }) as unknown as {
+        config: { memoryDbPath: string };
+      };
+      expect(orchestrator.config.memoryDbPath).toBe(configured);
+    } finally {
+      if (previous === undefined) delete process.env.CLAUDE_FLOW_DB_PATH;
+      else process.env.CLAUDE_FLOW_DB_PATH = previous;
+    }
+  });
+
+  it('does not pass policy or provider secrets to workers', () => {
+    process.env.CLAUDE_FLOW_POLICY_SIGNING_KEY = 'do-not-leak';
+    process.env.OPENROUTER_API_KEY = 'do-not-leak';
+    try {
+      const environment = (orch() as unknown as {
+        workerEnvironment(worker: WorkerConfig): NodeJS.ProcessEnv;
+      }).workerEnvironment({
+        id: 'safe-worker',
+        platform: 'codex',
+        role: 'reviewer',
+        prompt: 'review',
+        readOnly: true,
+      });
+      expect(environment.CLAUDE_FLOW_POLICY_SIGNING_KEY).toBeUndefined();
+      expect(environment.OPENROUTER_API_KEY).toBeUndefined();
+      expect(environment.CLAUDE_FLOW_PRINCIPAL_ID).toBe('agent:safe-worker');
+      expect(environment.CLAUDE_FLOW_CAPABILITY_ENVELOPE).toContain('"network":false');
+    } finally {
+      delete process.env.CLAUDE_FLOW_POLICY_SIGNING_KEY;
+      delete process.env.OPENROUTER_API_KEY;
+    }
+  });
+
+  // ADR-377 Phase 3 (dream-cycle candidate, 2026-08-26) — worker-lifetime
+  // InvocationToken issuance, off by default. See workerEnvironment's inline
+  // comment for the deliberate single-tool-binding trade-off (toolName '*').
+  it('does not set MCP invocation-token env vars when caller-auth is disabled (default)', () => {
+    delete process.env.CLAUDE_FLOW_MCP_CALLER_AUTH;
+    const environment = (orch() as unknown as {
+      workerEnvironment(worker: WorkerConfig): NodeJS.ProcessEnv;
+    }).workerEnvironment({
+      id: 'plain-worker',
+      platform: 'codex',
+      role: 'reviewer',
+      prompt: 'review',
+      readOnly: true,
+    });
+    expect(environment.CLAUDE_FLOW_MCP_INVOCATION_TOKEN).toBeUndefined();
+    expect(environment.CLAUDE_FLOW_MCP_CALLER_PUBKEY).toBeUndefined();
+    expect(environment.CLAUDE_FLOW_PRINCIPAL_ID).toBe('agent:plain-worker');
+  });
+
+  it('mints a worker-lifetime InvocationToken when caller-auth is enabled, and it round-trips through verifyInvocationToken', () => {
+    process.env.CLAUDE_FLOW_MCP_CALLER_AUTH = 'true';
+    try {
+      const orchestrator = new DualModeOrchestrator({ projectPath: '/tmp', timeout: 45_000 }) as unknown as {
+        workerEnvironment(worker: WorkerConfig): NodeJS.ProcessEnv;
+      };
+      const worker: WorkerConfig = {
+        id: 'signed-worker',
+        platform: 'codex',
+        role: 'coder',
+        prompt: 'implement',
+      };
+      const environment = orchestrator.workerEnvironment(worker);
+      const encodedToken = environment.CLAUDE_FLOW_MCP_INVOCATION_TOKEN;
+      const publicKeyHex = environment.CLAUDE_FLOW_MCP_CALLER_PUBKEY;
+      expect(encodedToken).toBeDefined();
+      expect(publicKeyHex).toBeDefined();
+
+      const token = decodeTokenEnvelope(encodedToken!);
+      expect(token).toBeDefined();
+      expect(token!.callerId).toBe('agent:signed-worker');
+      // Wildcard sentinel — deliberately not tool-bound (see file header).
+      expect(token!.toolName).toBe('*');
+      // TTL reuses the orchestrator's own per-worker timeout, not a new default.
+      expect(token!.expiresAt - token!.issuedAt).toBe(45_000);
+
+      const publicKey = publicKeyFromHex(publicKeyHex!);
+      expect(verifyInvocationToken(token!, publicKey, {})).toEqual({ valid: true });
+
+      // A second worker spawned from the same orchestrator reuses the cached
+      // keypair (both tokens verify against the same emitted public key).
+      const secondEnvironment = orchestrator.workerEnvironment({ ...worker, id: 'signed-worker-2' });
+      expect(secondEnvironment.CLAUDE_FLOW_MCP_CALLER_PUBKEY).toBe(publicKeyHex);
+    } finally {
+      delete process.env.CLAUDE_FLOW_MCP_CALLER_AUTH;
+    }
+  });
+
+  it('enforces worker capability envelopes as reductions', () => {
+    const orchestrator = orch() as unknown as {
+      resolveWorkerEnvelope(worker: WorkerConfig): Record<string, unknown>;
+    };
+    const base: WorkerConfig = {
+      id: 'bounded',
+      platform: 'codex',
+      role: 'coder',
+      prompt: 'work',
+    };
+    expect(orchestrator.resolveWorkerEnvelope({
+      ...base,
+      capabilityEnvelope: { actions: ['memory.read'], maxConcurrency: 1 },
+    })).toMatchObject({
+      actions: ['memory.read'],
+      network: false,
+      destructive: false,
+    });
+    expect(() => orchestrator.resolveWorkerEnvelope({
+      ...base,
+      capabilityEnvelope: { network: true },
+    })).toThrow('capability envelope cannot expand');
   });
 
   it('buildDependencyLevels groups a linear pipeline one-per-level', () => {
@@ -128,10 +359,10 @@ describe('DualModeOrchestrator', () => {
     expect(levels.map(l => l.map(w => w.id))).toEqual([['a'], ['b'], ['c']]);
   });
 
-  it('buildDependencyLevels puts independent workers in the same level', () => {
+  it('buildDependencyLevels puts independent read-only workers in the same level', () => {
     const ws: WorkerConfig[] = [
-      { id: 'a', platform: 'claude', role: 'a', prompt: 'x' },
-      { id: 'b', platform: 'codex', role: 'b', prompt: 'y' },
+      { id: 'a', platform: 'claude', role: 'a', prompt: 'x', readOnly: true },
+      { id: 'b', platform: 'codex', role: 'b', prompt: 'y', readOnly: true },
       { id: 'c', platform: 'codex', role: 'c', prompt: 'z', dependsOn: ['a', 'b'] },
     ];
     const levels = (orch() as unknown as { buildDependencyLevels(w: WorkerConfig[]): WorkerConfig[][] }).buildDependencyLevels(ws);
@@ -140,12 +371,54 @@ describe('DualModeOrchestrator', () => {
     expect(levels[1].map(w => w.id)).toEqual(['c']);
   });
 
-  it('buildDependencyLevels breaks a circular dependency instead of looping forever', () => {
+  it('buildDependencyLevels rejects circular dependencies', () => {
     const ws: WorkerConfig[] = [
       { id: 'a', platform: 'claude', role: 'a', prompt: 'x', dependsOn: ['b'] },
       { id: 'b', platform: 'codex', role: 'b', prompt: 'y', dependsOn: ['a'] },
     ];
-    const levels = (orch() as unknown as { buildDependencyLevels(w: WorkerConfig[]): WorkerConfig[][] }).buildDependencyLevels(ws);
-    expect(levels.flat().map(w => w.id).sort()).toEqual(['a', 'b']);
+    expect(() => (orch() as unknown as { buildDependencyLevels(w: WorkerConfig[]): WorkerConfig[][] }).buildDependencyLevels(ws))
+      .toThrow(/dependency cycle/);
+  });
+
+  it('rejects concurrent writers sharing a worktree', () => {
+    const ws: WorkerConfig[] = [
+      { id: 'a', platform: 'codex', role: 'coder', prompt: 'x', worktreePath: '/tmp/shared' },
+      { id: 'b', platform: 'codex', role: 'tester', prompt: 'y', worktreePath: '/tmp/shared' },
+    ];
+    const isolated = new DualModeOrchestrator({ projectPath: '/tmp', worktreeIsolation: true });
+    expect(() => (isolated as unknown as { buildDependencyLevels(w: WorkerConfig[]): WorkerConfig[][] }).buildDependencyLevels(ws))
+      .toThrow(/distinct worktrees/);
+  });
+
+  it('accepts a wider dependency level and schedules it in bounded batches', () => {
+    const orchestrator = new DualModeOrchestrator({ projectPath: '/tmp', maxWriters: 1 });
+    const ws: WorkerConfig[] = [
+      { id: 'a', platform: 'codex', role: 'coder', prompt: 'x', worktreePath: '/tmp/a' },
+      { id: 'b', platform: 'codex', role: 'tester', prompt: 'y', worktreePath: '/tmp/b' },
+    ];
+    expect((orchestrator as unknown as {
+      buildDependencyLevels(w: WorkerConfig[]): WorkerConfig[][];
+    }).buildDependencyLevels(ws)[0]).toHaveLength(2);
+  });
+
+  it('bounds writers independently without serializing read-only workers', () => {
+    const orchestrator = new DualModeOrchestrator({
+      projectPath: '/tmp',
+      maxConcurrent: 3,
+      maxWriters: 1,
+    });
+    const level: WorkerConfig[] = [
+      { id: 'writer-a', platform: 'codex', role: 'coder', prompt: 'x' },
+      { id: 'reader-a', platform: 'claude', role: 'reviewer', prompt: 'y', readOnly: true },
+      { id: 'writer-b', platform: 'codex', role: 'tester', prompt: 'z' },
+      { id: 'reader-b', platform: 'claude', role: 'analyst', prompt: 'q', readOnly: true },
+    ];
+    const batches = (orchestrator as unknown as {
+      partitionLevel(items: WorkerConfig[]): WorkerConfig[][];
+    }).partitionLevel(level);
+    expect(batches.map((batch) => batch.map((item) => item.id))).toEqual([
+      ['writer-a', 'reader-a', 'reader-b'],
+      ['writer-b'],
+    ]);
   });
 });

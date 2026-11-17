@@ -125,9 +125,17 @@ const searchCommand: Command = {
   action: async (ctx: CommandContext): Promise<CommandResult> => {
     const query = ctx.flags.query as string;
     const namespace = ctx.flags.collection as string || 'default';
-    const limit = parseInt(ctx.flags.limit as string || '10', 10);
-    const threshold = parseFloat(ctx.flags.threshold as string || '0.5');
-    const dbPath = ctx.flags['db-path'] as string || '.swarm/memory.db';
+    // #2790 fix — `||` on a numeric-0 argument returns the fallback,
+    // so `--threshold 0` was unreachable. `??` preserves an explicit zero.
+    // The flag arrives as a string here (parser produces string for typed
+    // options passed via CLI without type coercion in some paths), so we
+    // check for undefined explicitly rather than falsy.
+    const limit = parseInt((ctx.flags.limit as string) ?? '10', 10);
+    const rawThreshold = ctx.flags.threshold;
+    const threshold = rawThreshold === undefined || rawThreshold === null
+      ? 0.5
+      : parseFloat(String(rawThreshold));
+    const dbPath = ctx.flags.dbPath as string || '.swarm/memory.db';
 
     if (!query) {
       output.printError('Query is required');
@@ -441,7 +449,7 @@ const collectionsCommand: Command = {
   ],
   action: async (ctx: CommandContext): Promise<CommandResult> => {
     const action = ctx.flags.action as string || 'list';
-    const dbPath = ctx.flags['db-path'] as string || '.swarm/memory.db';
+    const dbPath = ctx.flags.dbPath as string || '.swarm/memory.db';
 
     output.writeln();
     output.writeln(output.bold('Embedding Collections (Namespaces)'));
@@ -562,7 +570,7 @@ const indexCommand: Command = {
   action: async (ctx: CommandContext): Promise<CommandResult> => {
     const action = ctx.flags.action as string || 'status';
     const collection = ctx.flags.collection as string;
-    const efConstruction = parseInt(ctx.flags['ef-construction'] as string || '200', 10);
+    const efConstruction = parseInt(ctx.flags.efConstruction as string || '200', 10);
     const m = parseInt(ctx.flags.m as string || '16', 10);
 
     output.writeln();
@@ -708,7 +716,7 @@ const initCommand: Command = {
   name: 'init',
   description: 'Initialize embedding subsystem with ONNX model and hyperbolic config',
   options: [
-    { name: 'model', short: 'm', type: 'string', description: 'ONNX model ID', default: 'Xenova/all-MiniLM-L6-v2' },
+    { name: 'model', short: 'm', type: 'string', description: 'ONNX model ID', default: 'all-MiniLM-L6-v2' },
     { name: 'hyperbolic', type: 'boolean', description: 'Enable hyperbolic (Poincaré ball) embeddings', default: 'true' },
     { name: 'curvature', short: 'c', type: 'string', description: 'Poincaré ball curvature (use --curvature=-1 for negative)', default: '-1' },
     { name: 'download', short: 'd', type: 'boolean', description: 'Download model during init', default: 'true' },
@@ -717,13 +725,13 @@ const initCommand: Command = {
   ],
   examples: [
     { command: 'claude-flow embeddings init', description: 'Initialize with defaults' },
-    { command: 'claude-flow embeddings init --model Xenova/all-mpnet-base-v2', description: 'Use higher quality model' },
+    { command: 'claude-flow embeddings init --model all-mpnet-base-v2', description: 'Use higher quality model' },
     { command: 'claude-flow embeddings init --no-hyperbolic', description: 'Euclidean only' },
     { command: 'claude-flow embeddings init --curvature=-0.5', description: 'Custom curvature (use = for negative)' },
     { command: 'claude-flow embeddings init --force', description: 'Overwrite existing config' },
   ],
   action: async (ctx: CommandContext): Promise<CommandResult> => {
-    const model = ctx.flags.model as string || 'Xenova/all-MiniLM-L6-v2';
+    const model = ctx.flags.model as string || 'all-MiniLM-L6-v2';
     const hyperbolic = ctx.flags.hyperbolic !== false;
     const download = ctx.flags.download !== false;
     const force = ctx.flags.force === true;
@@ -768,7 +776,13 @@ const initCommand: Command = {
         fs.mkdirSync(modelDir, { recursive: true });
       }
 
-      // Download model if requested
+      // Download model if requested. #3376: record what actually happened
+      // instead of assuming the download ran — `getEmbeddings()` returns null
+      // whenever the optional @claude-flow/embeddings package is absent, which
+      // is every plain `npm i -g ruflo` install.
+      let modelDownloaded = false;
+      let modelSkipReason: string | null = null;
+
       if (download) {
         spinner.setText(`Downloading ONNX model: ${model}...`);
         const embeddings = await getEmbeddings();
@@ -777,11 +791,16 @@ const initCommand: Command = {
           await embeddings.downloadEmbeddingModel(model, modelDir, (p) => {
             spinner.setText(`Downloading ${model}... ${p.percent.toFixed(0)}%`);
           });
+          modelDownloaded = true;
         } else {
-          // Embeddings package not available — skip download
-          await new Promise(r => setTimeout(r, 500));
-          output.writeln(output.dim('  (Skipped — @claude-flow/embeddings not installed)'));
+          // No download happened. That is the outcome of this command, not an
+          // aside — reported below via spinner.fail + a warning, never as a
+          // dimmed note on a success path. No fake progress delay: there is
+          // nothing in progress.
+          modelSkipReason = '@claude-flow/embeddings is not installed';
         }
+      } else {
+        modelSkipReason = 'download disabled by --no-download';
       }
 
       // Write embeddings config
@@ -792,6 +811,12 @@ const initCommand: Command = {
         modelPath: modelDir,
         dimension,
         cacheSize,
+        // #3376: additive, optional fields. `modelPath` keeps its old meaning
+        // (the directory the model belongs in), but it no longer implies a
+        // model is in it — `modelDownloaded` says whether one is. Readers that
+        // predate these keys are unaffected; they ignore unknown properties.
+        modelDownloaded,
+        ...(modelSkipReason ? { modelSkipReason } : {}),
         hyperbolic: {
           enabled: hyperbolic,
           curvature,
@@ -808,7 +833,15 @@ const initCommand: Command = {
 
       fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
 
-      spinner.succeed('Embedding subsystem initialized');
+      // A download that was asked for and did not happen is a failed init:
+      // the only substantive step of `embeddings init` did not run. #3376.
+      const downloadSkipped = download && !modelDownloaded;
+
+      if (downloadSkipped) {
+        spinner.fail('Embedding model NOT downloaded — embedding subsystem is not ready');
+      } else {
+        spinner.succeed('Embedding subsystem initialized');
+      }
 
       output.writeln();
       output.printTable({
@@ -818,6 +851,7 @@ const initCommand: Command = {
         ],
         data: [
           { setting: 'Model', value: model },
+          { setting: 'Model Status', value: modelDownloaded ? output.success('Downloaded') : output.error('NOT downloaded') },
           { setting: 'Dimension', value: String(dimension) },
           { setting: 'Cache Size', value: String(cacheSize) + ' entries' },
           { setting: 'Hyperbolic', value: hyperbolic ? `${output.success('Enabled')} (c=${curvature})` : output.dim('Disabled') },
@@ -826,6 +860,21 @@ const initCommand: Command = {
           { setting: 'Config', value: configPath },
         ],
       });
+
+      if (downloadSkipped) {
+        output.writeln();
+        output.printWarning(`No embedding model was installed: ${modelSkipReason}.`);
+        output.printWarning('Until a real embedder is present, embeddings fall back to hash vectors, which carry no semantic meaning.');
+        output.printInfo(`Configuration was still written to ${configPath}, recording "modelDownloaded": false.`);
+        output.writeln();
+        output.writeln(output.dim('To finish initializing:'));
+        output.printList([
+          'npm install @claude-flow/embeddings   - the package this command downloads with; then: embeddings init --force',
+          'npm install ruvector                  - the other real embedder ruflo accepts; needs no download step',
+          'embeddings init --no-download --force - keep this configuration without a model (exits 0)',
+        ]);
+        return { success: false, exitCode: 1, data: config };
+      }
 
       output.writeln();
       if (hyperbolic) {
@@ -910,7 +959,7 @@ const chunkCommand: Command = {
   action: async (ctx: CommandContext): Promise<CommandResult> => {
     const embeddings = await getEmbeddings();
     const text = ctx.flags.text as string || '';
-    const maxSize = parseInt(ctx.flags['max-size'] as string || '512', 10);
+    const maxSize = parseInt(ctx.flags.maxSize as string || '512', 10);
     const overlap = parseInt(ctx.flags.overlap as string || '50', 10);
     const strategy = ctx.flags.strategy as string || 'sentence';
 
@@ -1134,7 +1183,12 @@ const neuralCommand: Command = {
   action: async (ctx: CommandContext): Promise<CommandResult> => {
     const feature = ctx.flags.feature as string || 'all';
     const init = ctx.flags.init as boolean;
-    const driftThreshold = parseFloat((ctx.flags['drift-threshold'] || ctx.flags.driftThreshold || '0.3') as string);
+    // #2790 fix — same `0 || fallback` bug: `--drift-threshold 0` was
+    // silently replaced by 0.3. Use nullish coalescing.
+    const rawDriftThreshold = ctx.flags['drift-threshold'] ?? ctx.flags.driftThreshold;
+    const driftThreshold = rawDriftThreshold === undefined || rawDriftThreshold === null
+      ? 0.3
+      : parseFloat(String(rawDriftThreshold));
     const decayRate = parseFloat((ctx.flags['decay-rate'] || ctx.flags.decayRate || '0.01') as string);
     const consolidationInterval = parseInt((ctx.flags['consolidation-interval'] || ctx.flags.consolidationInterval || '60000') as string, 10);
 
@@ -1309,8 +1363,11 @@ const modelsCommand: Command = {
           return { success: false, exitCode: 1 };
         }
       } else {
-        await new Promise(r => setTimeout(r, 500));
-        spinner.succeed(`Download skipped — @claude-flow/embeddings not installed`);
+        // #3376, same class as `init`: nothing was downloaded, so this is a
+        // failure, not a success with a caveat. No fake progress delay either.
+        spinner.fail(`Download skipped — @claude-flow/embeddings is not installed`);
+        output.printWarning(`"${download}" was not downloaded. Install @claude-flow/embeddings to enable model downloads.`);
+        return { success: false, exitCode: 1 };
       }
       return { success: true };
     }
@@ -1363,7 +1420,7 @@ const cacheCommand: Command = {
   ],
   action: async (ctx: CommandContext): Promise<CommandResult> => {
     const action = ctx.flags.action as string || 'stats';
-    const dbPath = ctx.flags['db-path'] as string || '.cache/embeddings.db';
+    const dbPath = ctx.flags.dbPath as string || '.cache/embeddings.db';
 
     output.writeln();
     output.writeln(output.bold('Embedding Cache'));
@@ -1583,7 +1640,7 @@ const benchmarkCommand: Command = {
   ],
   action: async (ctx: CommandContext): Promise<CommandResult> => {
     const iterations = parseInt(ctx.flags.iterations as string || '10', 10);
-    const batchSize = parseInt(ctx.flags['batch-size'] as string || '5', 10);
+    const batchSize = parseInt(ctx.flags.batchSize as string || '5', 10);
     const full = ctx.flags.full === true;
 
     output.writeln();
