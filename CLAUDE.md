@@ -1,8 +1,8 @@
-# Claude Code Configuration - Ruflo v3.6
+# Claude Code Configuration - Ruflo V3
 
-> **Ruflo v3.6** (2026-04-29) — Stable release with agent federation and comms-first coordination.
-> 6,000+ commits, 314 MCP tools, 16 agent roles + custom types, 19 AgentDB controllers, 21 native plugins.
-> Packages: `@claude-flow/cli@3.6.10`, `claude-flow@3.6.10`, `ruflo@3.6.10`
+> Public release train: `@claude-flow/cli`, `claude-flow`, and `ruflo`.
+> Use package manifests and the registry as version truth; do not copy stale
+> version or capability counts into agent guidance.
 
 ## Behavioral Rules (Always Enforced)
 
@@ -14,6 +14,22 @@
 - Never continuously check status after spawning a swarm — wait for results
 - ALWAYS read a file before editing it
 - NEVER commit secrets, credentials, or .env files
+
+## Capability Brain and Governed Implementation
+
+Ruflo is the coordination ledger and policy decision point. Claude Code
+executes code, tests, commands, and file changes. A Ruflo coordination call
+records work; it does not perform the implementation.
+
+When registered, call
+`guidance_brain({ mode: "recommend", task: "..." })` before complex Ruflo
+work. Use its live registry rather than guessing tool names. Treat
+`registered`, `configured`, `reachable`, `healthy`, and `authorized` as
+separate facts. If unavailable, continue with compatible guidance tools, CLI
+discovery, and these repository instructions.
+
+Use this loop: recall → inspect → route → plan → execute → test → validate →
+benchmark → optimize → receipt → handoff → separately authorized publish.
 
 ## File Organization
 
@@ -37,7 +53,7 @@
 ### Key Packages
 
 | Package | Path | Purpose |
-|---------|------|----------|
+|---------|------|---------|
 | `@claude-flow/cli` | `v3/@claude-flow/cli/` | CLI entry point (26 commands) |
 | `@claude-flow/codex` | `v3/@claude-flow/codex/` | Dual-mode Claude + Codex collaboration |
 | `@claude-flow/guidance` | `v3/@claude-flow/guidance/` | Governance control plane |
@@ -45,17 +61,23 @@
 | `@claude-flow/memory` | `v3/@claude-flow/memory/` | AgentDB + HNSW search |
 | `@claude-flow/security` | `v3/@claude-flow/security/` | Input validation, CVE remediation |
 
-## Concurrency: 1 MESSAGE = ALL RELATED OPERATIONS
+## Concurrent Automated Development
 
-- All operations MUST be concurrent/parallel in a single message
-- Use Claude Code's Task tool for spawning agents, not just MCP
-
-**Mandatory patterns:**
-- ALWAYS batch ALL todos in ONE TodoWrite call (5-10+ minimum)
-- ALWAYS spawn ALL agents in ONE message with full instructions via Task tool
-- ALWAYS batch ALL file reads/writes/edits in ONE message
-- ALWAYS batch ALL terminal operations in ONE Bash message
-- ALWAYS batch ALL memory store/retrieve operations in ONE message
+- Parallelize independent research, tests, reviews, and non-overlapping
+  implementation.
+- Never allow two writers in one worktree. Give every writing agent an isolated
+  worktree and explicit file ownership.
+- Read-only agents may share a checkout; writing agents may not.
+- Only the integration owner edits shared manifests and lockfiles or reconciles
+  overlapping changes.
+- Continue independent local work after spawning agents; wait only when a real
+  dependency blocks progress. Do not repeatedly poll.
+- A lease or work claim coordinates ownership; it never grants authority.
+- Bind tests, benchmarks, policy decisions, and handoffs to an exact clean
+  commit or immutable dirty-worktree snapshot.
+- Darwin, Flywheel, MetaHarness, memory, and neural systems may propose and
+  evaluate candidates, but cannot self-promote or expand tools, network,
+  secrets, spend, concurrency, or release authority.
 
 ---
 
@@ -70,16 +92,18 @@
 - MUST call MCP tools AND Task tool in ONE message for complex work
 - Always call MCP first, then IMMEDIATELY call Task tool to spawn agents
 
-### 3-Tier Model Routing (ADR-026)
+### 3-Tier Model Routing (ADR-026, ADR-143)
 
 | Tier | Handler | Latency | Cost | Use Cases |
-|------|---------|---------|------|----------|
-| **1** | Agent Booster (WASM) | <1ms | $0 | Simple transforms (var→const, add types, etc.) — **Skip LLM entirely** |
+|------|---------|---------|------|-----------|
+| **1** | Deterministic codemod | ~1ms | $0 | Structural transforms with **no LLM**: `var-to-const`, `remove-console`, `add-logging` |
 | **2** | Haiku | ~500ms | $0.0002 | Simple tasks, low complexity (<30%) |
 | **3** | Sonnet/Opus | 2-5s | $0.003-0.015 | Complex reasoning, architecture, security (>30%) |
 
-- Always check for `[AGENT_BOOSTER_AVAILABLE]` or `[TASK_MODEL_RECOMMENDATION]` before spawning agents
-- Use Edit tool directly when `[AGENT_BOOSTER_AVAILABLE]` — intent types: `var-to-const`, `add-types`, `add-error-handling`, `async-await`, `add-logging`, `remove-console`
+- Always check for `[CODEMOD_AVAILABLE]` or `[TASK_MODEL_RECOMMENDATION]` before spawning agents
+- When you see `[CODEMOD_AVAILABLE]`, call the `hooks_codemod` MCP tool (intent + file) — it applies the transform deterministically via the TypeScript compiler at $0, no LLM. Deterministic intents only: `var-to-const`, `remove-console`, `add-logging`
+- `add-types`, `add-error-handling`, `async-await` need judgement and route to a model (Tier 2/3) — they are **not** $0 codemods (see ADR-143)
+- Agent Booster (`agent-booster`) is a fast-apply merge engine for arbitrary LLM-produced edit snippets, not an intent-transform engine — it is **not** the Tier-1 path
 
 ## Swarm Configuration & Anti-Drift
 
@@ -134,11 +158,11 @@ Task("Reviewer", "Review code quality and security. Store findings in 'collabora
 
 // 🟢 Codex workers (implementation, optimization)
 // Spawn via CLI for Codex platform
-Bash("npx claude-flow-codex dual run --worker 'codex:coder:Implement the solution based on architect design' --namespace collaboration")
-Bash("npx claude-flow-codex dual run --worker 'codex:optimizer:Optimize performance based on implementation' --namespace collaboration")
+Bash("npx @claude-flow/codex dual run --worker 'codex:coder:Implement the solution based on architect design' --namespace collaboration")
+Bash("npx @claude-flow/codex dual run --worker 'codex:optimizer:Optimize performance based on implementation' --namespace collaboration")
 
 // STEP 3: Coordinate via shared memory
-Bash("npx claude-flow@v3alpha memory store --namespace collaboration --key 'task-context' --value '[task description]'")
+Bash("npx ruflo@latest memory store --namespace collaboration --key 'task-context' --value '[task description]'")
 ```
 
 ### Collaboration Templates (Pre-Built Pipelines)
@@ -154,12 +178,12 @@ Bash("npx claude-flow@v3alpha memory store --namespace collaboration --key 'task
 
 ```bash
 # Run a collaboration template
-npx claude-flow-codex dual run feature --task "Add user authentication with OAuth"
-npx claude-flow-codex dual run security --target "./src"
-npx claude-flow-codex dual run refactor --target "./src/legacy"
+npx @claude-flow/codex dual run feature --task "Add user authentication with OAuth"
+npx @claude-flow/codex dual run security --target "./src"
+npx @claude-flow/codex dual run refactor --target "./src/legacy"
 
 # Custom multi-platform swarm
-npx claude-flow-codex dual run \
+npx @claude-flow/codex dual run \
   --worker "claude:architect:Design the API structure" \
   --worker "codex:coder:Implement REST endpoints" \
   --worker "claude:tester:Write integration tests" \
@@ -167,10 +191,10 @@ npx claude-flow-codex dual run \
   --namespace "api-feature"
 
 # Check collaboration status
-npx claude-flow-codex dual status
+npx @claude-flow/codex dual status
 
 # List available templates
-npx claude-flow-codex dual templates
+npx @claude-flow/codex dual templates
 ```
 
 ### Shared Memory Coordination
@@ -179,13 +203,13 @@ All workers share state via the `collaboration` namespace:
 
 ```bash
 # Store context for cross-platform sharing
-npx claude-flow@v3alpha memory store --namespace collaboration --key "design-decisions" --value "..."
+npx ruflo@latest memory store --namespace collaboration --key "design-decisions" --value "..."
 
 # Search for patterns across all workers
-npx claude-flow@v3alpha memory search --namespace collaboration --query "authentication patterns"
+npx ruflo@latest memory search --namespace collaboration --query "authentication patterns"
 
 # Retrieve specific findings
-npx claude-flow@v3alpha memory retrieve --namespace collaboration --key "security-findings"
+npx ruflo@latest memory retrieve --namespace collaboration --key "security-findings"
 ```
 
 ### Cross-Platform Learning
@@ -194,13 +218,13 @@ Both platforms learn from each other's outputs:
 
 ```bash
 # After successful collaboration, train patterns
-npx claude-flow@v3alpha hooks post-task --task-id "dual-[id]" --success true --train-neural true
+npx ruflo@latest hooks post-task --task-id "dual-[id]" --success true --train-neural true
 
 # Store successful collaboration patterns
-npx claude-flow@v3alpha memory store --namespace patterns --key "dual-mode-[pattern]" --value "[what worked]"
+npx ruflo@latest memory store --namespace patterns --key "dual-mode-[pattern]" --value "[what worked]"
 
 # Transfer learnings to both platforms
-npx claude-flow@v3alpha hooks transfer store --pattern "dual-collab-success"
+npx ruflo@latest hooks transfer store --pattern "dual-collab-success"
 ```
 
 ### Worker Dependency Levels
@@ -340,7 +364,7 @@ This project is configured with Claude Flow V3 (Anti-Drift Defaults):
 - **Strategy**: specialized (clear roles, no overlap)
 - **Consensus**: raft (leader maintains authoritative state)
 - **Memory Backend**: hybrid (SQLite + AgentDB)
-- **HNSW Indexing**: Enabled (150x-12,500x faster)
+- **HNSW Indexing**: Enabled (measured ~1.9x at N=20k, ~3.2x–4.7x at N=5k vs brute force; ANN wins above the crossover)
 - **Neural Learning**: Enabled (SONA)
 
 ## V3 CLI Commands (26 Commands, 140+ Subcommands)
@@ -352,7 +376,7 @@ This project is configured with Claude Flow V3 (Anti-Drift Defaults):
 | `init` | 4 | Project initialization with wizard, presets, skills, hooks |
 | `agent` | 8 | Agent lifecycle (spawn, list, status, stop, metrics, pool, health, logs) |
 | `swarm` | 6 | Multi-agent swarm coordination and orchestration |
-| `memory` | 11 | AgentDB memory with vector search (150x-12,500x faster) |
+| `memory` | 11 | AgentDB memory with HNSW vector search (measured ~1.9x–4.7x vs brute force above crossover) |
 | `mcp` | 9 | MCP server management and tool execution |
 | `task` | 6 | Task creation, assignment, and lifecycle |
 | `session` | 7 | Session state management and persistence |
@@ -374,7 +398,7 @@ This project is configured with Claude Flow V3 (Anti-Drift Defaults):
 | `providers` | 5 | AI providers (list, add, remove, test, configure) |
 | `plugins` | 5 | Plugin management (list, install, uninstall, enable, disable) |
 | `deployment` | 5 | Deployment management (deploy, rollback, status, environments, release) |
-| `embeddings` | 4 | Vector embeddings (embed, batch, search, init) - 75x faster with agentic-flow |
+| `embeddings` | 4 | Vector embeddings (embed, batch, search, init) — agentic-flow ONNX backend (speedup unverified, no benchmark) |
 | `claims` | 4 | Claims-based authorization (check, grant, revoke, list) |
 | `migrate` | 5 | V2 to V3 migration with rollback support |
 | `process` | 4 | Background process management |
@@ -385,28 +409,28 @@ This project is configured with Claude Flow V3 (Anti-Drift Defaults):
 
 ```bash
 # Initialize project
-npx claude-flow@v3alpha init --wizard
+npx ruflo@latest init --wizard
 
 # Start daemon with background workers
-npx claude-flow@v3alpha daemon start
+npx ruflo@latest daemon start
 
 # Spawn an agent
-npx claude-flow@v3alpha agent spawn -t coder --name my-coder
+npx ruflo@latest agent spawn -t coder --name my-coder
 
 # Initialize swarm
-npx claude-flow@v3alpha swarm init --v3-mode
+npx ruflo@latest swarm init --v3-mode
 
 # Search memory (HNSW-indexed)
-npx claude-flow@v3alpha memory search -q "authentication patterns"
+npx ruflo@latest memory search -q "authentication patterns"
 
 # System diagnostics
-npx claude-flow@v3alpha doctor --fix
+npx ruflo@latest doctor --fix
 
 # Security scan
-npx claude-flow@v3alpha security scan --depth full
+npx ruflo@latest security scan --depth full
 
 # Performance benchmark
-npx claude-flow@v3alpha performance benchmark --suite all
+npx ruflo@latest performance benchmark --suite all
 ```
 
 ## Headless Background Instances (claude -p)
@@ -449,7 +473,7 @@ wait  # Wait for all to complete
 # With results captured
 SECURITY=$(claude -p "Security audit of auth module" &)
 TESTS=$(claude -p "Generate test coverage report" &)
-PEEF=$(claude -p "Profile memory usage in workers" &)
+PERF=$(claude -p "Profile memory usage in workers" &)
 wait
 echo "$SECURITY" "$TESTS" "$PERF"
 ```
@@ -469,7 +493,7 @@ claude -p --resume "abc-123" --fork-session "Try approach B: CQRS pattern"
 ### Key Flags
 
 | Flag | Purpose |
-|------|----------|
+|------|---------|
 | `-p, --print` | Non-interactive mode, print and exit |
 | `--model <model>` | Select model (haiku, sonnet, opus) |
 | `--output-format <fmt>` | Output: text, json, stream-json |
@@ -682,13 +706,13 @@ Task({
 ### Agent Teams Hooks
 
 | Hook | Trigger | Purpose |
-|------|---------|----------|
+|------|---------|---------|
 | `TeammateIdle` | Teammate finishes turn | Auto-assign pending tasks via SendMessage |
 | `TaskCompleted` | Task marked complete | Train patterns, notify lead via SendMessage |
 
 ```bash
-npx claude-flow@v3alpha hooks teammate-idle --auto-assign true
-npx claude-flow@v3alpha hooks task-completed -i task-123 --train-patterns true
+npx ruflo@latest hooks teammate-idle --auto-assign true
+npx ruflo@latest hooks task-completed -i task-123 --train-patterns true
 ```
 
 ### Rules
@@ -706,7 +730,7 @@ npx claude-flow@v3alpha hooks task-completed -i task-123 --train-patterns true
 ### Hook Categories
 
 | Category | Hooks | Purpose |
-|----------|-------|----------|
+|----------|-------|---------|
 | **Core** | `pre-edit`, `post-edit`, `pre-command`, `post-command`, `pre-task`, `post-task` | Tool lifecycle |
 | **Session** | `session-start`, `session-end`, `session-restore`, `notify` | Context management |
 | **Intelligence** | `route`, `explain`, `pretrain`, `build-agents`, `transfer` | Neural learning |
@@ -734,37 +758,37 @@ npx claude-flow@v3alpha hooks task-completed -i task-123 --train-patterns true
 
 ```bash
 # Core hooks
-npx claude-flow@v3alpha hooks pre-task --description "[task]"
-npx claude-flow@v3alpha hooks post-task --task-id "[id]" --success true
-npx claude-flow@v3alpha hooks post-edit --file "[file]" --train-patterns
+npx ruflo@latest hooks pre-task --description "[task]"
+npx ruflo@latest hooks post-task --task-id "[id]" --success true
+npx ruflo@latest hooks post-edit --file "[file]" --train-patterns
 
 # Session management
-npx claude-flow@v3alpha hooks session-start --session-id "[id]"
-npx claude-flow@v3alpha hooks session-end --export-metrics true
-npx claude-flow@v3alpha hooks session-restore --session-id "[id]"
+npx ruflo@latest hooks session-start --session-id "[id]"
+npx ruflo@latest hooks session-end --export-metrics true
+npx ruflo@latest hooks session-restore --session-id "[id]"
 
 # Intelligence routing
-npx claude-flow@v3alpha hooks route --task "[task]"
-npx claude-flow@v3alpha hooks explain --topic "[topic]"
+npx ruflo@latest hooks route --task "[task]"
+npx ruflo@latest hooks explain --topic "[topic]"
 
 # Neural learning
-npx claude-flow@v3alpha hooks pretrain --model-type moe --epochs 10
-npx claude-flow@v3alpha hooks build-agents --agent-types coder,tester
+npx ruflo@latest hooks pretrain --model-type moe --epochs 10
+npx ruflo@latest hooks build-agents --agent-types coder,tester
 
 # Background workers
-npx claude-flow@v3alpha hooks worker list
-npx claude-flow@v3alpha hooks worker dispatch --trigger audit
-npx claude-flow@v3alpha hooks worker status
+npx ruflo@latest hooks worker list
+npx ruflo@latest hooks worker dispatch --trigger audit
+npx ruflo@latest hooks worker status
 ```
 
 ## Intelligence System (RuVector)
 
-V3 includes the RuVector Intelligence System:
-- **SONA**: Self-Optimizing Neural Architecture (<0.05ms adaptation)
-- **MoE**: Mixture of Experts for specialized routing
-- **HNSW**: 150x-12,500x faster pattern search
+V3 includes the RuVector Intelligence System (measured numbers: see [audit](docs/reviews/intelligence-system-audit-2026-05-29.md) + [`scripts/benchmark-intelligence.mjs`](scripts/benchmark-intelligence.mjs)):
+- **SONA**: Self-Optimizing Neural Architecture (measured 0.0043ms/adapt, target <0.05ms met)
+- **MoE**: Mixture of Experts for specialized routing (gate converges — confidence 0.13→0.88 after rewards)
+- **HNSW**: measured ~1.9x at N=20k, ~3.2x–4.7x at N=5k vs brute force (recall@10 ~0.99); ANN wins above the crossover, ruvector NAPI backend (WASM not active on test host)
 - **EWC++**: Elastic Weight Consolidation (prevents forgetting)
-- **Flash Attention**: 2.49x-7.47x speedup
+- **Flash Attention**: integration available; speedup dropped from docs pending an in-tree benchmark (was: 2.49x–7.47x, inherited unverified from upstream — removed to avoid a credibility claim we can't reproduce)
 
 The 4-step intelligence pipeline:
 1. **RETRIEVE** — Fetch relevant patterns via HNSW
@@ -779,7 +803,7 @@ Features:
 - **Document chunking**: Configurable overlap and size
 - **Normalization**: L2, L1, min-max, z-score
 - **Hyperbolic embeddings**: Poincare ball model for hierarchical data
-- **75x faster**: With agentic-flow ONNX integration
+- **agentic-flow ONNX integration**: speedup unverified (no benchmark; backend reported `onnx`, model all-MiniLM-L6-v2, 384-dim)
 - **Neural substrate**: Integration with RuVector
 
 ## Hive-Mind Consensus
@@ -799,15 +823,18 @@ Features:
 
 ## V3 Performance Targets
 
-| Metric | Target | Status |
-|--------|--------|--------|
-| HNSW Search | 150x-12,500x faster | **Implemented** (persistent) |
-| Memory Reduction | 50-75% with quantization | **Implemented** (3.92x Int8) |
-| SONA Integration | Pattern learning | **Implemented** (ReasoningBank) |
-| Flash Attention | 2.49x-7.47x speedup | In progress |
-| MCP Response | <100ms | Achieved |
-| CLI Startup | <500ms | Achieved |
-| SONA Adaptation | <0.05ms | In progress |
+> Source of truth: [`docs/reviews/intelligence-system-audit-2026-05-29.md`](docs/reviews/intelligence-system-audit-2026-05-29.md) + [`scripts/benchmark-intelligence.mjs`](scripts/benchmark-intelligence.mjs). Numbers below are measured unless marked "target/unverified".
+
+| Metric | Measured / Target | Status |
+|--------|-------------------|--------|
+| HNSW Search | ~1.9x at N=20k, ~3.2x–4.7x at N=5k vs brute force (recall@10 ~0.99); ties/loses below crossover | **Measured** (ruvector NAPI; 150x-12,500x NOT reproduced — was brute-force fallback) |
+| Int8 Quantization | 3.84x compression, reconstruction cosine 0.99999 | **Measured** |
+| RaBitQ Quantization | 32x compression, 0.60ms/query (14,760-vec index) | **Measured** |
+| SONA Adaptation | 0.0043ms/adapt (target <0.05ms met) | **Measured** |
+| MoE Gate | converges — confidence 0.13→0.88, Q 0→99.8 after rewards | **Measured** |
+| Flash Attention | integration available; measured speedup pending benchmark | **Not measured** — prior "2.49x–7.47x" figure was inherited from upstream marketing, never reproduced in-tree; dropped to avoid a credibility claim we can't verify |
+| MCP Response | <100ms | target |
+| CLI Startup | <500ms | target |
 
 ## Environment Variables
 
@@ -833,7 +860,7 @@ CLAUDE_FLOW_MEMORY_PATH=./data/memory
 
 ## Doctor Health Checks
 
-Run `npx claude-flow@v3alpha doctor` to check:
+Run `npx ruflo@latest doctor` to check:
 - Node.js version (20+)
 - npm version (9+)
 - Git installation
@@ -849,15 +876,15 @@ Run `npx claude-flow@v3alpha doctor` to check:
 
 ```bash
 # Add MCP servers
-claude mcp add claude-flow npx claude-flow@v3alpha mcp start
+claude mcp add claude-flow -- npx -y ruflo@latest mcp start
 claude mcp add ruv-swarm npx ruv-swarm mcp start  # Optional
 claude mcp add flow-nexus npx flow-nexus@latest mcp start  # Optional
 
 # Start daemon
-npx claude-flow@v3alpha daemon start
+npx ruflo@latest daemon start
 
 # Run doctor
-npx claude-flow@v3alpha doctor --fix
+npx ruflo@latest doctor --fix
 ```
 
 ## Claude Code vs MCP Tools
@@ -926,60 +953,273 @@ memory_search_unified({ query: "authentication security", limit: 5 })
 
 ## Publishing to npm
 
+### Versioning policy (stable releases — alpha series ended at 3.7.0-alpha.81, 2026-05-23)
+
+- **From 3.7.0 onward we ship stable semver**, NOT alpha pre-releases.
+- Bump rules (semver discipline):
+  - **PATCH** (3.7.0 → 3.7.1): bug fixes only, no API change, no schema change
+  - **MINOR** (3.7.0 → 3.8.0): backward-compatible additions (new MCP tool, new flag, new agent type)
+  - **MAJOR** (3.x → 4.0.0): breaking change in CLI surface, MCP tool signature, file layout, or default behavior
+- Default tag is `latest` (no `--tag alpha`). **No more alpha tags (ADR-513, 2026-10-31):** do not add or move `alpha`, `v3alpha` or `next` dist-tags on any package. The existing tags stay where they point (frozen at 3.66.2 for the train), so old `@alpha` install commands still resolve, but they no longer advance. The same applies to every ruvnet package ruflo depends on (`agentdb`, `agentic-flow`, `aidefence`, `@claude-flow/*`).
+- Never publish a pre-release (`-alpha.N`, `-beta.N`, `-rc.N`) unless the user explicitly asks for a pre-release flow.
+- **The internal `@claude-flow/*` leaves follow the same policy since 2026-09-28**
+  (moved to `3.0.0`; `cli-core` `3.7.0`; the two plugins `1.0.0`). One exception:
+  `@claude-flow/embeddings` stays on its alpha line — its registry `latest`
+  (`3.0.0-alpha.45`) was built from a branch not on `main`, and publishing from
+  `main` would drop 139 exported names. Reconcile that branch before bumping it.
+
 ### Publishing Rules
 
-- MUST publish ALL THREE packages when publishing CLI changes: `@claude-flow/cli`, `claude-flow`, AND `ruflo`
-- MUST update ALL dist-tags for ALL THREE packages after publishing
+- The normal public release train is exactly THREE packages:
+  `@claude-flow/cli`, `claude-flow`, and `ruflo`.
+- **Exactly FOUR `@claude-flow/*` components are bundled** into the public
+  artifacts: `security`, `codex`, `mcp`, `plugin-agent-federation` — the list
+  is `INTERNAL_RUNTIME_PACKAGES` in `scripts/stage-internal-runtime-bundles.mjs`.
+  These are built from the tagged source and staged into the tarball's
+  `package/node_modules/`, so a source change in them ships with the train.
+  They are ALSO published standalone for direct consumers (the staging script
+  copies only `dist` + `README.md`, independent of the standalone tarball) — when
+  their source changes, republish the standalone package too, or direct
+  consumers keep the old copy (the #3411 `mcp` disclosure was about the
+  standalone tarball, not the train).
+- Every publishable leaf needs a `files` allowlist and must NOT set
+  `publishConfig.tag`. Without `files`, npm ships whatever sits in the package
+  directory — published tarballs have leaked `.claude-flow/` daemon logs and
+  pids, `settings.json`, `.swarm/memory.db` and headless-worker prompt logs.
+  A `publishConfig.tag` of `v3alpha` silently routes a stable publish away
+  from `latest`.
+- **Every OTHER `@claude-flow/*` dependency resolves from the registry**, at the
+  version `v3/@claude-flow/cli/package.json` pins. A source change in one of
+  those does NOT ship with the train — the release silently carries the last
+  *published* copy of that package, not the code you just merged. It must be
+  bumped and published standalone in the same release or the fix reaches nobody:
+
+  | dep of `@claude-flow/cli` | bundled? | how a source change reaches users |
+  |---|---|---|
+  | `security`, `codex`, `mcp`, `plugin-agent-federation` | yes | with the train |
+  | `cli-core`, `neural`, `shared`, `memory` | **no** | **standalone publish required** |
+
+  `memory` is the easiest of these to miss: its own package tests run against
+  workspace source, so CI goes green on a change that cannot ship. Since #3414
+  the CLI pins every non-bundled leaf exactly, so a stale cached copy can no
+  longer satisfy the spec silently — but the pin now fails the other way: an
+  exact pin to a version that was never published breaks installs outright
+  (`memory@3.0.0-alpha.27` sat unpublished behind a merged pin on 2026-09-28).
+  `v3/.npmrc` sets `prefer-workspace-packages=true`, so `v3/pnpm-lock.yaml`
+  links every `@claude-flow/*` package to workspace source (without it, pnpm
+  swaps in a newer registry copy — e.g. a `cli` released from a branch not on
+  `main` — and drags that copy's alpha deps into the lockfile). The lockfile
+  therefore never proves a leaf was published: check `npm view <leaf>@<ver>`
+  before merging a pin. #3390 (#3327 Finding A) is the
+  worked example — it fixed `memory/src/controller-registry.ts` and
+  `cli/src/memory/memory-bridge.ts` together, and without a standalone `memory`
+  publish only the `cli` half would have shipped, leaving the fix inert.
+- Before tagging, check every non-bundled leaf for drift between what the CLI
+  pins and what the workspace source says — a mismatch means an unpublished
+  change is about to be skipped by the release:
+
+  ```bash
+  # needs root deps for `semver` — run after `npm ci` at repo root
+  node -e 'const semver=require("semver"),c=require("./v3/@claude-flow/cli/package.json"),d={...c.dependencies,...c.optionalDependencies},b=["security","codex","mcp","plugin-agent-federation"];let n_=0;for(const[n,v]of Object.entries(d)){if(!n.startsWith("@claude-flow/"))continue;if(b.includes(n.slice(13)))continue;let w;try{w=require(`./v3/${n}/package.json`).version}catch{continue}n_++;if(!semver.satisfies(w,v,{includePrerelease:true}))console.log(`DRIFT ${n}: cli pins ${v}, workspace source ${w} — publish it or the release skips the change`)}if(!n_){console.error("checked 0 leaves — check is broken, do not trust a clean result");process.exit(1)}console.log(`checked ${n_} non-bundled leaves`)'
+  ```
+
+  It must use `semver.satisfies`, not a string compare: a pin may be a range,
+  and a literal match would then report a false DRIFT. It also fails loudly
+  at zero leaves checked — a guard that inspects nothing must not report clean.
+- **The drift check above only proves the CLI's pin and the workspace version agree with
+  EACH OTHER — it says nothing about whether that version is actually on npm.** #4303
+  (2026-10-20) shipped `@claude-flow/cli@3.57.2` depending on `@claude-flow/memory@3.0.6`,
+  which had never been published — #4279 bumped the workspace version and the CLI's pin
+  together, so the drift check above was clean, but nobody ran the standalone `npm
+  publish` for `memory`. Every fresh install of that line failed with `ETARGET`. Run
+  `node scripts/audit-leaf-versions-published.mjs` before tagging — it queries the live
+  npm registry for every non-bundled leaf pin and fails if the version it resolves to was
+  never published. This is now also a required CI check (`plugin-package-audit` job in
+  `v3-ci.yml`), so a PR that bumps a pin ahead of its own leaf's publish fails on the PR,
+  not on a consumer's install.
+- After publishing, verify `latest` points at the new version for ALL THREE packages. Do not touch `alpha`/`v3alpha` (ADR-513).
 - Publish order: `@claude-flow/cli` first, then `claude-flow` (umbrella), then `ruflo` (alias umbrella)
 - MUST run verification for ALL THREE before telling user publishing is complete
+- Run `node scripts/audit-umbrella-version-lockstep.mjs` before packing or
+  publishing.
+- Publish from a clean reviewed commit/tag-equivalent worktree. Do not ship
+  unrelated uncommitted changes.
+- A fresh worktree has two separate dependency trees to install before anything
+  builds: `npm install` at repo root (npm workspaces), AND `pnpm install` inside
+  `v3/` (a separate pnpm workspace — root `prepare-root-publish.mjs` shells out to
+  `pnpm --filter` to build `v3/@claude-flow/{shared,hooks,guidance}`, which fails
+  with `spawn ENOENT` on `tsc` if `v3/node_modules` was never populated).
+- Use the existing authenticated `ruvnet` npm session. Do not replace it with a
+  token from another GCP project.
+
+**`npm publish` auth — FIXED (2026-07-30):** use the `NPM_TOKEN` secret directly,
+via a throwaway `.npmrc` with `NPM_CONFIG_USERCONFIG` — same pattern as the
+helpers-signing-key handling. It is mirrored in two GCP projects — `ruv-dev`
+(version 3+) and `cognitum-20260110` (version 7+) — so either project's copy
+is current; use whichever `gcloud` session is already authenticated. This is a
+granular access token ("ruflo publishjing", expires 2026-10-28) with
+`package: write` + `bypass_2fa: true`, scoped broadly enough to cover
+`@claude-flow/cli`, `claude-flow`, and `ruflo` (plus the `cognitum`/
+`cognitum-one` orgs). Confirmed end-to-end against the real registry (not just
+a permissions probe): `npm publish` for `@claude-flow/cli` succeeded via this
+token with zero OTP/WebAuthn prompt, and
+`npm dist-tag add` against both a scoped (`@claude-flow/cli`) and unscoped
+(`claude-flow`) package also went through with no prompt.
+
+**Why the earlier `NPM_TOKEN` version failed:** versions 1/2 of that secret
+were older classic automation tokens, and npm has been restricting tokens that
+bypass 2FA for writes account-wide (the login flow prints this notice —
+`gh.io/npm-gat-bypass2fa-deprecation`). Version 3 is a **granular access
+token** created explicitly for this purpose, which is npm's supported
+replacement path (its own 2FA-bypass flag still works for a granular token,
+unlike the deprecated classic automation tokens). If this token's `bypass_2fa`
+flag or scope ever gets narrowed/expired (check expiry above), the fallback
+is the WebAuthn dance below — but try this path first every time.
 
 ```bash
-# STEP 1: Build and publish CLI
+gcloud secrets versions access latest --secret=NPM_TOKEN --project=ruv-dev > /tmp/.npmrc-publish-raw
+printf '//registry.npmjs.org/:_authToken=%s\n' "$(cat /tmp/.npmrc-publish-raw)" > /tmp/.npmrc-publish
+rm -f /tmp/.npmrc-publish-raw
+NPM_CONFIG_USERCONFIG=/tmp/.npmrc-publish npm publish   # from the package dir, with signing-key env vars for @claude-flow/cli
+shred -u /tmp/.npmrc-publish 2>/dev/null || rm -f /tmp/.npmrc-publish   # ALWAYS clean up, same discipline as the signing key
+```
+
+**Fallback — WebAuthn procedure, if the token above is dead:** the `ruvnet`
+account's 2FA method is a WebAuthn security key, not TOTP (no numeric
+`--otp=<code>` exists). This must be driven by the human (an agent cannot
+approve a WebAuthn browser prompt):
+1. Human goes to npmjs.com → account 2FA settings → turns OFF "Require
+   two-factor authentication for write actions" (narrows to auth-only, not a
+   full 2FA disable), then runs `npm login` in their own terminal to refresh
+   the session under the new setting.
+2. Agent can then run `npm publish` directly via Bash with no further prompt.
+3. **`npm dist-tag add` still requires a fresh WebAuthn approval PER CALL**
+   regardless of the write-2FA setting — 6 individual browser approvals for a
+   3-package release (alpha + v3alpha × 3), not 1. Tell the human up front.
+- After every dist-tag call (or if unsure), verify with
+  `npm view <pkg> dist-tags --json` — don't trust the CLI's own stdout alone, since
+  a WebAuthn prompt that's still pending in the browser produces no terminal
+  output an agent can see.
+- Confirm the version actually landed (`npm view <pkg>@<version> version`) before
+  telling the user publishing succeeded, same reasoning: a mid-publish approval
+  that never gets answered fails silently from an agent's point of view.
+
+**Helpers signing key (required for `@claude-flow/cli` publish):** `npm publish`'s
+`prepublishOnly` runs `scripts/sign-helpers.mjs`, which needs a private key to sign
+`.claude/helpers/helpers.manifest.json`. The secret lives in GCP Secret Manager in the
+**`ruv-dev`** project (not `cognitum-20260110` or `claude-flow` — checked both, not there),
+secret name `ruflo-helpers-signing-key`:
+
+```bash
 cd v3/@claude-flow/cli
-npm version 3.0.0-alpha.XXX --no-git-tag-version
+RUFLO_HELPERS_SIGNING_SECRET=ruflo-helpers-signing-key RUFLO_HELPERS_SIGNING_PROJECT=ruv-dev \
+  npm publish
+```
+
+(`ruv-dev` also holds `ruflo-config-signing-key`; do not replace the existing
+authenticated npm session with a token from another project.)
+
+**Handling the signing key without leaking it (learned 2026-07-14, hard way):**
+an earlier Windows path invoked `gcloud` without its required `.cmd` suffix. The
+fallback command printed the PEM into captured tool output and a session transcript.
+GCP secret v1 was destroyed and a fresh v2 was rotated in (commit 0052b1b06 /
+PR #2673). `sign-helpers.mjs` now selects `gcloud.cmd` on Windows and supports a
+stdin-only fallback. **Rules:**
+- NEVER invoke `gcloud secrets versions access` in a way that lets the payload reach
+  tool output. Use the built-in `RUFLO_HELPERS_SIGNING_SECRET` path above, or pipe
+  directly into the signer:
+  `gcloud secrets versions access latest --secret=ruflo-helpers-signing-key --project=ruv-dev | node scripts/sign-helpers.mjs --stdin-key`.
+- `--stdin-key` refuses interactive entry, validates Ed25519 key type, and never
+  echoes parser input. A local file via `RUFLO_HELPERS_SIGNING_KEY` remains the
+  air-gapped fallback.
+- If a rotation IS needed, keep the private half in `~/.ruflo/helpers-signing.key`
+  only, print ONLY the public half (via `Ed25519 pub export` from Node crypto), upload
+  new private via `gcloud secrets versions add … --data-file=`, then
+  `gcloud secrets versions destroy <old>` to make the old irrecoverable.
+
+**Windows `prepublishOnly` failure (learned 2026-07-14):** the CLI's `prepublishOnly`
+chain (`cp ../../../README.md ./README.md && rm -rf plugins && mkdir -p plugins && cp -r ...`)
+is POSIX-shell-only. On Windows, npm runs it via `cmd.exe /d /s /c` which chokes on
+`mkdir -p` (interprets `-p` as a directory name) and `cp -r` (no such command). Two
+workarounds until the script is rewritten in cross-platform Node:
+1. Run the prep steps manually in Git Bash, then `npm publish --ignore-scripts`.
+2. Or use a POSIX shell for the whole publish: `SHELL=bash npm publish` — but this
+   doesn't always take effect on Windows depending on npm version.
+Option 1 is what worked for v3.29.0. Track proper fix in ruvnet/ruflo issue for
+cross-platform prepublish.
+
+**Concurrent-session helper corruption (real, observed, be paranoid):** multiple Claude Code
+sessions can have their own `npm exec @claude-flow/cli@latest mcp start` MCP server running
+concurrently with `cwd` inside this repo (check with `readlink /proc/<pid>/cwd` on
+`pgrep -f "npm exec @claude-flow/cli@latest mcp start"`). If one of those resolved an older
+cached `@latest` (predating the `semver.gte` downgrade-guard in
+`helper-refresh.ts:autoRefreshHelpersIfStale`), it will silently overwrite this repo's
+hand-maintained `.claude/helpers/hook-handler.cjs` / `intelligence.cjs` (root AND package
+copies) — and `helpers.manifest.json` + `.helpers-version` — with its own older bundled
+content, mid-session, with no warning. Observed live 2026-07-13: this happened *twice* in
+one publish flow, once right after a manual revert and once right after signing (silently
+invalidating a freshly-signed manifest). **Mitigation:** never trust the on-disk state of
+those files between tool calls — `git diff --stat` them immediately before any `git add`/
+`sign-helpers.mjs`/`npm publish` step, `git checkout HEAD --` revert if dirty, and chain
+revert → sign → verify → add → commit as ONE bash invocation (`&&`-joined) to minimize the
+race window. `npm publish`'s own `prepublishOnly` re-signs fresh at pack time regardless, so
+what matters is the on-disk state at the *exact moment* `npm publish` runs, not before.
+
+```bash
+# Replace 3.7.1 below with your chosen stable version (patch/minor/major per the rules above)
+
+# STEP 1: Build and publish @claude-flow/cli
+cd v3/@claude-flow/cli
+npm version 3.7.1 --no-git-tag-version
 npm run build
-npm publish --tag alpha
-npm dist-tag add @claude-flow/cli@3.0.0-alpha.XXX latest
+npm publish                              # default tag is `latest` — no --tag flag
 
 # STEP 2: Publish claude-flow umbrella
-cd /workspaces/claude-flow
-npm version 3.0.0-alpha.XXX --no-git-tag-version
-npm publish --tag v3alpha
+cd /Users/cohen/Projects/ruflo                    # or your repo root
+npm version 3.7.1 --no-git-tag-version
+npm publish
 
-# STEP 3: Update ALL claude-flow umbrella tags (CRITICAL - DON'T SKIP!)
-npm dist-tag add claude-flow@3.0.0-alpha.XXX latest
-npm dist-tag add claude-flow@3.0.0-alpha.XXX alpha
-
-# STEP 4: Publish ruflo umbrella (CRITICAL - DON'T FORGET!)
-cd /workspaces/claude-flow/ruflo
-npm version 3.0.0-alpha.XXX --no-git-tag-version
-npm publish --tag alpha
-npm dist-tag add ruflo@3.0.0-alpha.XXX latest
+# STEP 3: Publish ruflo wrapper (CRITICAL — DON'T FORGET — this is what users run)
+cd ruflo
+npm version 3.7.1 --no-git-tag-version
+npm publish
 ```
 
-**Verification (run before telling user):**
+**Verification (run before telling user publishing is complete):**
+
 ```bash
-npm view @claude-flow/cli dist-tags --json
-npm view claude-flow dist-tags --json
-npm view ruflo dist-tags --json
-# ALL THREE packages need: alpha AND latest pointing to newest version
+for pkg in @claude-flow/cli claude-flow ruflo; do
+  echo "$pkg: $(npm view $pkg@latest version)"
+  npm view $pkg dist-tags --json
+done
+# All three must show latest === new version (alpha/v3alpha stay frozen, ADR-513)
 ```
 
-### All Tags That Must Be Updated
+### Tags
+
 | Package | Tag | Command Users Run |
 |---------|-----|-------------------|
-| `@claude-flow/cli` | `alpha` | `npx @claude-flow/cli@alpha` |
 | `@claude-flow/cli` | `latest` | `npx @claude-flow/cli@latest` |
-| `@claude-flow/cli` | `v3alpha` | `npx @claude-flow/cli@v3alpha` |
-| `claude-flow` | `alpha` | `npx claude-flow@alpha` — EASY TO FORGET |
 | `claude-flow` | `latest` | `npx claude-flow@latest` |
-| `claude-flow` | `v3alpha` | `npx claude-flow@v3alpha` |
-| `ruflo` | `alpha` | `npx ruflo@alpha` — EASY TO FORGET |
 | `ruflo` | `latest` | `npx ruflo@latest` |
 
-- Never forget the `ruflo` package — it's a thin wrapper users run via `npx ruflo@alpha`
-- Never forget the umbrella `alpha` tag — users run `npx claude-flow@alpha`
+The `alpha` and `v3alpha` tags still exist on all three, frozen at 3.66.2 (ADR-513). Do not move them.
+
+- Never forget the `ruflo` package — it's the thin wrapper users actually run via `npx ruflo`
+- `overrides` in `ruflo/package.json` and the CLI manifest do NOT reach users: npm applies `overrides` only in the root project. Fix a dependency advisory by changing the range the publishing package declares, and prove it with a fresh `npm install ruflo@<ver> && npm audit --omit=dev` (ADR-513).
 - `ruflo` source is in `/ruflo/` — it depends on `@claude-flow/cli`
+- Also remember to update `ruflo/package.json` overrides when adding new pinned transitives (see #2112 lesson — root overrides do NOT propagate to the published `ruflo` wrapper)
+
+### GitHub Release after publish
+
+Every stable bump SHOULD have a matching `gh release create v<version>` with consolidated release notes pointing at the gist if one exists. Example:
+
+```bash
+git tag v3.7.1 main
+git push origin v3.7.1
+gh release create v3.7.1 --title "v3.7.1 — <one-line headline>" \
+  --notes-file /tmp/release-notes.md
+```
 
 ## Plugin Registry Maintenance (IPFS/Pinata)
 
@@ -1072,20 +1312,141 @@ export const LIVE_REGISTRY_CID = 'NEW_CID_FROM_PINATA';
 curl -s "https://gateway.pinata.cloud/ipfs/{NEW_CID}" | jq '.totalPlugins'
 ```
 
+## MetaHarness Integration (ADR-150)
+
+Ruflo integrates with the upstream `metaharness` / `@metaharness/*` ecosystem as a sibling agent-harness scaffolding system (same author, designed around ruflo's primitives). MetaHarness packages are optional peer dependencies and are never required at runtime.
+
+### Architectural constraint (load-bearing)
+
+**Ruflo remains operational if every MetaHarness package is removed.** Four rules:
+1. **Removable**: `npm ls --without @metaharness/*` must still produce a working CLI
+2. **Optional in package.json**: `@metaharness/*` packages MUST be optional peers, never normal dependencies. Exception (ADR-526): `@metaharness/darwin` is a regular dependency of `@claude-flow/cli`, used in-process for bench verify and GEPA ops
+3. **Graceful degradation**: every code path that touches MetaHarness catches `MODULE_NOT_FOUND` and falls back
+4. **CI gate**: `.github/workflows/no-metaharness-smoke.yml` enforces all three by static grep + runtime drill on every PR
+
+### Command + tool surface
+
+```bash
+# CLI subcommands (npx ruflo metaharness …)
+npx ruflo metaharness score                      # 5-dim readiness scorecard
+npx ruflo metaharness genome                     # 7-section categorical report
+npx ruflo metaharness mcp-scan --fail-on high    # static security findings
+npx ruflo metaharness threat-model               # enterprise threat report
+npx ruflo metaharness oia-audit --alert-on-worst high
+                                                 # composite weekly audit → memory
+npx ruflo metaharness audit-list --since 30d     # enumerate audit records
+npx ruflo metaharness audit-trend \              # diff two audits (drift)
+  --baseline-key <a> --current-key <b> --alert-on-worsening \
+  --alert-on-distance-below 0.85               # iter 38 — structural-distance gate (ADR-152 §3.1)
+npx ruflo metaharness similarity \               # iter 36 — ADR-152 §3.1 weighted similarity
+  --a a.json --b b.json [--per-dimension] [--alert-below 0.5]
+npx ruflo metaharness drift-from-history \       # iter 53 — 1-command drift (composes 3 primitives)
+  [--baseline-since 7d] [--baseline-key <key>] [--baseline-file <path>] \
+  [--threshold 0.95] [--alert-on-new-severity high] [--dry-run]
+                                                 # iter 66 — --baseline-key skips audit-list (~14x faster)
+                                                 # iter 67 — --baseline-file skips memory entirely (~19x faster)
+                                                 # iter 78 — --alert-on-new-severity adds orthogonal finding-severity gate
+npx ruflo metaharness mint --name foo --template vertical:coding --confirm
+npx ruflo metaharness redblue init               # @metaharness/redblue — scaffold redblue.yaml
+npx ruflo metaharness redblue run --mock-judge --tests 10
+                                                 # $0 marker-fixture path (CI / offline)
+npx ruflo metaharness redblue run --tests 50 --patch
+                                                 # real model judge (needs OPENROUTER_API_KEY,
+                                                 #   capped by max_cost_usd, default $3)
+npx ruflo metaharness redblue attack prompt --count 3
+                                                 # preview generated attack cases (no target call)
+npx ruflo metaharness redblue patch --mock-judge # baseline → blue-team patch → retest delta
+npx ruflo metaharness redblue report --in report.json
+                                                 # render existing report as markdown
+npx ruflo metaharness learn --host claude-code --model haiku --slice slices/lite.json
+                                                 # metaharness@0.3.0 / upstream ADR-235 —
+                                                 #   GEPA learning run; $0 dry-run default,
+                                                 #   --run to spend; needs a metaharness
+                                                 #   repo checkout (--repo / $METAHARNESS_REPO)
+npx ruflo metaharness gepa --op genome           # darwin@0.8.0 GEPA library — load + validate
+                                                 #   the shipped cand-6 genome (or --path <f>)
+npx ruflo metaharness gepa --op render           # genome → the system prompt it compiles to
+npx ruflo metaharness gepa --op analyze --transcript run.json
+                                                 # classify failure modes in a transcript
+npx ruflo metaharness evolve --bench .harness/bench.json
+                                                 # Darwin proposes candidates; governed gates decide
+npx ruflo metaharness bench verify --path .harness/bench.json
+                                                 # create or verify stable benchmark corpora
+npx ruflo metaharness flywheel run --proposer auto --max-concurrency 2
+                                                 # bounded concurrent evaluation; does not promote
+npx ruflo metaharness flywheel receipts          # inspect immutable evaluation receipts
+npx ruflo metaharness flywheel promote <receipt-id> \
+  --public-key ./approved-ed25519-public.pem --confirm
+                                                 # explicit policy-authorized atomic promotion
+
+# Dedicated command
+npx ruflo eject --name my-harness                # lift ruflo project → standalone harness
+                                                 # dry-run by default; refuses in-repo target
+
+# Doctor health check
+npx ruflo doctor --component metaharness         # report metaharness availability + version
+
+# MCP tools (callable by Claude Code agents)
+mcp__claude-flow__metaharness_score
+mcp__claude-flow__metaharness_genome
+mcp__claude-flow__metaharness_mcp_scan
+mcp__claude-flow__metaharness_threat_model
+mcp__claude-flow__metaharness_oia_audit
+mcp__claude-flow__metaharness_audit_list
+mcp__claude-flow__metaharness_audit_trend
+mcp__claude-flow__metaharness_similarity          # iter 36 — ADR-152 §3.1 genome similarity
+mcp__claude-flow__metaharness_drift_from_history  # iter 53 — 1-command drift detection
+mcp__claude-flow__metaharness_bench               # ADR-153 — create/verify bench suites for evolve --bench
+mcp__claude-flow__metaharness_evolve              # MAP-Elites driver — evolve a harness across bench suites
+mcp__claude-flow__metaharness_security_bench      # security-focused benchmark suite gate
+mcp__claude-flow__metaharness_redblue             # @metaharness/redblue — adversarial red/blue LLM testing (init|run|patch|attack|report)
+mcp__claude-flow__metaharness_learn               # metaharness@0.3.0 — GEPA learning run ($0 dry-run default; run=true to spend)
+mcp__claude-flow__metaharness_gepa                # darwin@0.8.0 — GEPA genome ops (genome|validate|render|analyze); gepaOptimize stays library-only
+mcp__claude-flow__metaharness_flywheel            # ADR-322 — evaluate concurrently, inspect receipts/ledger, or explicitly promote
+```
+
+### Routing integration (ADR-148/149)
+
+`@metaharness/router@~0.3.2` is wired as the cost-optimal model router behind the `CLAUDE_FLOW_ROUTER_NEURAL=1` triple-gate. The `routedBy` field on every routing decision carries `'metaharness-knn' | 'metaharness-krr' | 'fastgrnn'` when the neural path is active.
+
+### SelfEvolvingRouter parallel-logging (ADR-150 Phase 2)
+
+When `CLAUDE_FLOW_ROUTER_PARALLEL_LOG=1` is set, every `route()` call writes a paired-decision row (bandit pick + neural-augmented pick + outcome) to `.swarm/router-parallel.jsonl`. Analyze with:
+
+```bash
+node plugins/ruflo-metaharness/scripts/router-parallel-analyze.mjs \
+  --input .swarm/router-parallel.jsonl --strict
+```
+
+The 3-criteria AND-gate from ADR-150 review-round-1: `quality > 2% AND cost < 1% AND latency < 5%`. Exit 1 in `--strict` mode if any criterion fails — promotion gate.
+
+### CI workflows
+
+- `metaharness-ci.yml` — score / mcp-scan / router-compat / eject-dryrun jobs on every PR touching `plugins/ruflo-metaharness/**`
+- `no-metaharness-smoke.yml` — enforces the four architectural-constraint rules above on every PR
+- `oia-audit-weekly.yml` — Sundays 04:17 UTC, runs composite audit, uploads 90-day artifact
+
+### Cross-references
+
+- [ADR-150](v3/docs/adr/ADR-150-metaharness-integration-surfaces.md) — decision + implementation notes
+- [Issue #2399](https://github.com/ruvnet/ruflo/issues/2399) — phase tracker
+- [Research gist](https://gist.github.com/ruvnet/19d166ff9acf368c9da4172d91ac9113) — graded evidence
+- Upstream: `github.com/ruvnet/agent-harness-generator`
+
 ## Optional Plugins (20 Available)
 
 Plugins are distributed via IPFS and can be installed with the CLI. Browse and install from the official registry:
 
 ```bash
 # List all available plugins
-npx claude-flow@v3alpha plugins list
+npx ruflo@latest plugins list
 
 # Install a plugin
-npx claude-flow@v3alpha plugins install @claude-flow/plugin-name
+npx ruflo@latest plugins install @claude-flow/plugin-name
 
 # Enable/disable
-npx claude-flow@v3alpha plugins enable @claude-flow/plugin-name
-npx claude-flow@v3alpha plugins disable @claude-flow/plugin-name
+npx ruflo@latest plugins enable @claude-flow/plugin-name
+npx ruflo@latest plugins disable @claude-flow/plugin-name
 ```
 
 ### Core Plugins
@@ -1103,7 +1464,6 @@ npx claude-flow@v3alpha plugins disable @claude-flow/plugin-name
 
 | Plugin | Version | Description |
 |--------|---------|-------------|
-| `@claude-flow/plugin-agentic-qe` | 3.0.0-alpha.4 | Agentic quality engineering integration |
 | `@claude-flow/plugin-prime-radiant` | 0.1.5 | Prime Radiant intelligence integration |
 | `@claude-flow/plugin-gastown-bridge` | 3.0.0-alpha.1 | Gastown bridge protocol integration |
 | `@claude-flow/teammate-plugin` | 1.0.0-alpha.1 | Multi-agent teammate coordination |
@@ -1127,13 +1487,13 @@ npx claude-flow@v3alpha plugins disable @claude-flow/plugin-name
 
 ```bash
 # Create a new plugin from template
-npx claude-flow@v3alpha plugins create my-plugin
+npx ruflo@latest plugins create my-plugin
 
 # Test locally
-npx claude-flow@v3alpha plugins install ./path/to/my-plugin
+npx ruflo@latest plugins install ./path/to/my-plugin
 
 # Publish to registry (requires Pinata credentials)
-npx claude-flow@v3alpha plugins publish
+npx ruflo@latest plugins publish
 ```
 
 Registry source: IPFS via Pinata (`QmXbfEAaR7D2Ujm4GAkbwcGZQMHqAMpwDoje4583uNP834`)
@@ -1146,3 +1506,43 @@ Registry source: IPFS via Pinata (`QmXbfEAaR7D2Ujm4GAkbwcGZQMHqAMpwDoje4583uNP83
 ---
 
 Remember: **Claude Flow coordinates, Claude Code creates!**
+
+## Gateway-Delegated Development (meta-llm dev-bridge)
+
+For complex reasoning, architecture decisions, or hard bug-fixes, **delegate via the
+`metallm_delegate` MCP tool rather than solving inline.** The meta-llm gateway governs the
+work: it routes cheap-tier-first, escalates genuinely-hard tasks to the frontier (Fable),
+and meters every call — so delegation is cost-governed and preserves the main session's context.
+
+- **Default to `cognitum-auto`** — the gateway picks the tier by difficulty. Only pass an
+  explicit tier (`cognitum-low|mid|high`) when you must force one.
+- Prompt-wrapping does **not** inflate cost — the gateway normalizes host scaffolds so an
+  everyday sub-task still routes to the cheap tier. Trust `cognitum-auto`.
+- Use **`metallm_delegate`** for agentic sub-tasks needing tools/files in a working dir
+  (its `cwd` is sandboxed); use **`metallm_ask`** for a single-shot question — it returns
+  the gateway's real metered cost + resolved tier/model in-band.
+- Reserve the main (inline) session for orchestration, integration, and final review;
+  push expensive per-sub-task reasoning through the gateway.
+
+**Setup (per developer, local — never committed):** register the `metallm-dev-bridge` MCP
+server via a local `.mcp.json` (gitignored) and export your gateway key as `COGNITUM_DEV_KEY`
+in your shell. Build steps + the exact `.mcp.json` block are in the internal meta-llm
+dev-bridge README. **Never commit the key or an inline gateway URL.**
+
+### `ask` vs `delegate` — pick by task shape (load-bearing)
+
+**Use `metallm_ask` for single-shot facts, summaries, classification, and small code
+questions. Use `metallm_delegate` only when the task needs autonomous multi-step execution
+or isolated agent context.**
+
+Why the split is strict: `metallm_delegate` spawns a full `claude -p` sub-agent, which loads
+its entire harness context **even for a trivial task** — measured floor ≈ **$0.26/call**
+(~43k input tokens) before any real work. `metallm_ask` is a single gateway completion —
+measured ≈ **$0.0001** for a small query, ~2500× cheaper. So delegating casually is
+expensive at volume; `delegate` pays off only when offloading the sub-task's context from
+the main session is worth the floor. When in doubt, `ask`.
+
+Routing caveat (tracked): `metallm_ask` **auto** currently over-tiers some trivial prompts to
+`mid` (sonnet-5) instead of `low` — the bridge's `/v1/messages` path may miss ADR-236
+host-normalization (meta-llm issue #38). Forced tiers work correctly; cost impact is small
+per call but real at volume.

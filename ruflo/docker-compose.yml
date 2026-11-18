@@ -3,19 +3,25 @@
 #
 # Usage:
 #   cp .env.example .env   # fill in your API keys
+#   # Also required in .env:
+#   #   MONGO_INITDB_ROOT_PASSWORD=$(openssl rand -hex 32)
+#   #   MCP_AUTH_TOKEN=$(openssl rand -hex 32)
 #   docker compose up -d
 
 services:
-  # --- MongoDB ---
+  # --- MongoDB (ADR-166 §6 Phase 2b — auth on by default) ---
   mongodb:
     image: mongo:7
     restart: unless-stopped
     volumes:
       - mongo-data:/data/db
     ports:
-      - "27017:27017"
+      - "127.0.0.1:27017:27017"
     environment:
       MONGO_INITDB_DATABASE: ${MONGODB_DB_NAME:-chat-db}
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_INITDB_ROOT_USERNAME:-ruflo}
+      MONGO_INITDB_ROOT_PASSWORD: "${MONGO_INITDB_ROOT_PASSWORD:?MONGO_INITDB_ROOT_PASSWORD is required. Generate one with: openssl rand -hex 32}"
+    command: ["--auth"]
 
   # --- MCP Bridge (ruvocal version — Gemini grounded search, autopilot SSE) ---
   mcp-bridge:
@@ -24,7 +30,7 @@ services:
       dockerfile: Dockerfile
     restart: unless-stopped
     ports:
-      - "3001:3001"
+      - "127.0.0.1:3001:3001"
     environment:
       PORT: "3001"
       NODE_ENV: production
@@ -51,6 +57,18 @@ services:
       MCP_GROUP_CODEX: ${MCP_GROUP_CODEX:-false}
       # API keys for optional groups
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      # --- ADR-166 §6 security surface ---
+      # chat-ui reaches the bridge over the compose network, so loopback inside
+      # the container would be unreachable. Host exposure stays on the published
+      # 127.0.0.1 port above; the bridge refuses non-loopback binds without a token.
+      MCP_BIND_HOST: ${MCP_BIND_HOST:-0.0.0.0}
+      MCP_AUTH_TOKEN: "${MCP_AUTH_TOKEN:?MCP_AUTH_TOKEN is required. Generate one with: openssl rand -hex 32}"
+      MCP_ENABLE_TERMINAL: ${MCP_ENABLE_TERMINAL:-false}
+      MCP_CORS_ORIGIN: ${MCP_CORS_ORIGIN:-*}
+    # ADR-166 §6 Phase 2c — read-only rootfs breaks the PoC's /app/beacon.js write.
+    read_only: true
+    tmpfs:
+      - /tmp
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://localhost:3001/health').then(r => process.exit(r.ok ? 0 : 1))"]
       interval: 30s
@@ -87,7 +105,7 @@ services:
     environment:
       # Runtime config injected via DOTENV_LOCAL (entrypoint.sh writes .env.local)
       DOTENV_LOCAL: |
-        MONGODB_URL=mongodb://mongodb:27017
+        MONGODB_URL=mongodb://${MONGO_INITDB_ROOT_USERNAME:-ruflo}:${MONGO_INITDB_ROOT_PASSWORD}@mongodb:27017/${MONGODB_DB_NAME:-chat-db}?authSource=admin
         MONGODB_DB_NAME=${MONGODB_DB_NAME:-chat-db}
         PUBLIC_APP_NAME=${BRAND_NAME:-RuFlo}
         PUBLIC_APP_DESCRIPTION=${BRAND_DESCRIPTION:-Enterprise AI Agent Orchestration Platform}
@@ -97,8 +115,8 @@ services:
         ENABLE_DATA_EXPORT=true
         ALLOW_IFRAME=true
         OPENAI_BASE_URL=http://mcp-bridge:3001
-        OPENAI_API_KEY=${OPENAI_API_KEY:-sk-placeholder}
-        MCP_SERVERS=[{"name":"Core Tools","url":"http://mcp-bridge:3001/mcp/core"},{"name":"Intelligence & Learning","url":"http://mcp-bridge:3001/mcp/intelligence"},{"name":"Agents & Orchestration","url":"http://mcp-bridge:3001/mcp/agents"},{"name":"Memory & Knowledge","url":"http://mcp-bridge:3001/mcp/memory"},{"name":"Dev Tools & Analysis","url":"http://mcp-bridge:3001/mcp/devtools"}]
+        OPENAI_API_KEY=${MCP_AUTH_TOKEN}
+        MCP_SERVERS=[{"name":"Core Tools","url":"http://mcp-bridge:3001/mcp/core","headers":{"Authorization":"Bearer ${MCP_AUTH_TOKEN}"}},{"name":"Intelligence & Learning","url":"http://mcp-bridge:3001/mcp/intelligence","headers":{"Authorization":"Bearer ${MCP_AUTH_TOKEN}"}},{"name":"Agents & Orchestration","url":"http://mcp-bridge:3001/mcp/agents","headers":{"Authorization":"Bearer ${MCP_AUTH_TOKEN}"}},{"name":"Memory & Knowledge","url":"http://mcp-bridge:3001/mcp/memory","headers":{"Authorization":"Bearer ${MCP_AUTH_TOKEN}"}},{"name":"Dev Tools & Analysis","url":"http://mcp-bridge:3001/mcp/devtools","headers":{"Authorization":"Bearer ${MCP_AUTH_TOKEN}"}}]
         COOKIE_SECURE=${COOKIE_SECURE:-false}
         COOKIE_SAMESITE=${COOKIE_SAMESITE:-lax}
     depends_on:

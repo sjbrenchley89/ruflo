@@ -11,9 +11,11 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { WorkerDaemon } from '../../src/services/worker-daemon.js';
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from 'fs';
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir, cpus } from 'os';
+import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
 describe('WorkerDaemon resource thresholds', () => {
   let tempDir: string;
@@ -186,6 +188,32 @@ describe('WorkerDaemon resource thresholds', () => {
       expect(config.resourceThresholds.maxCpuLoad).toBeGreaterThanOrEqual(2.0);
       expect(config.resourceThresholds.minFreeMemoryPercent).toBe(expectedMinFreeMem);
     });
+  });
+
+  it('loads daemon settings from config.yaml in the ESM runtime', () => {
+    const configFile = join(tempDir, '.claude-flow', 'config.yaml');
+    writeFileSync(configFile, [
+      "'daemon.maxConcurrent': 7",
+      "'daemon.resourceThresholds.minFreeMemoryPercent': 0",
+    ].join('\n'));
+
+    // Vitest's transform supplies a CommonJS `require`, masking the bug in
+    // the published ESM runtime. Run the source in a real Node ESM process.
+    const cliRoot = fileURLToPath(new URL('../..', import.meta.url));
+    const moduleUrl = new URL('../../src/services/worker-daemon.ts', import.meta.url).href;
+    const script = `import { WorkerDaemon } from ${JSON.stringify(moduleUrl)};
+      const daemon = new WorkerDaemon(${JSON.stringify(tempDir)});
+      console.log('__DAEMON_CONFIG__' + JSON.stringify(daemon.getStatus().config));`;
+    const stdout = execFileSync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', script], {
+      cwd: cliRoot, encoding: 'utf8', timeout: 15_000,
+    });
+    const payload = stdout.match(/__DAEMON_CONFIG__(\{[^\n]+\})/);
+    expect(payload).not.toBeNull();
+    const config = JSON.parse(payload![1]);
+    expect(config.maxConcurrent).toBe(7);
+    expect(config.resourceThresholds.minFreeMemoryPercent).toBe(0);
+    expect(readFileSync(join(tempDir, '.claude-flow', 'logs', 'daemon.log'), 'utf8'))
+      .toContain(`Daemon config loaded from ${configFile}`);
   });
 
   // =========================================================================
@@ -741,6 +769,174 @@ describe('WorkerDaemon resource thresholds', () => {
       const expectedMaxCpuLoad = Math.max(effectiveCpus * 0.8, 2.0);
 
       expect(config.resourceThresholds.maxCpuLoad).toBeCloseTo(expectedMaxCpuLoad, 1);
+    });
+  });
+
+  // =========================================================================
+  // #2356 — Self-terminating lifecycle (TTL + idle shutdown)
+  // Caps how long a forgotten daemon can keep dispatching headless worker
+  // sweeps. Precedence: constructor arg > config.json (seconds) > env
+  // (RUFLO_DAEMON_TTL_SECS / RUFLO_DAEMON_IDLE_SECS) > built-in default.
+  // =========================================================================
+  describe('self-terminating lifecycle (ttl/idle)', () => {
+    const TTL_ENV = 'RUFLO_DAEMON_TTL_SECS';
+    const IDLE_ENV = 'RUFLO_DAEMON_IDLE_SECS';
+    let savedTtl: string | undefined;
+    let savedIdle: string | undefined;
+
+    beforeEach(() => {
+      savedTtl = process.env[TTL_ENV];
+      savedIdle = process.env[IDLE_ENV];
+      delete process.env[TTL_ENV];
+      delete process.env[IDLE_ENV];
+    });
+
+    afterEach(() => {
+      if (savedTtl === undefined) delete process.env[TTL_ENV]; else process.env[TTL_ENV] = savedTtl;
+      if (savedIdle === undefined) delete process.env[IDLE_ENV]; else process.env[IDLE_ENV] = savedIdle;
+    });
+
+    it('defaults ttlMs to 12h and idleShutdownMs to 30m (#2834)', () => {
+      const config = new WorkerDaemon(tempDir).getStatus().config;
+      expect(config.ttlMs).toBe(12 * 60 * 60 * 1000);
+      expect(config.idleShutdownMs).toBe(30 * 60 * 1000);
+    });
+
+    it('honors RUFLO_DAEMON_TTL_SECS env override (seconds → ms)', () => {
+      process.env[TTL_ENV] = '3600';
+      const config = new WorkerDaemon(tempDir).getStatus().config;
+      expect(config.ttlMs).toBe(3600 * 1000);
+    });
+
+    it('honors an explicit RUFLO_DAEMON_TTL_SECS=0 as "disabled" (not falling back to default)', () => {
+      process.env[TTL_ENV] = '0';
+      const config = new WorkerDaemon(tempDir).getStatus().config;
+      expect(config.ttlMs).toBe(0);
+    });
+
+    it('falls back to default for an invalid/negative env value', () => {
+      process.env[TTL_ENV] = '-5';
+      const config = new WorkerDaemon(tempDir).getStatus().config;
+      expect(config.ttlMs).toBe(12 * 60 * 60 * 1000);
+    });
+
+    it('honors RUFLO_DAEMON_IDLE_SECS env override', () => {
+      process.env[IDLE_ENV] = '7200';
+      const config = new WorkerDaemon(tempDir).getStatus().config;
+      expect(config.idleShutdownMs).toBe(7200 * 1000);
+    });
+
+    it('reads daemon.ttlSecs / daemon.idleSecs from config.json (seconds → ms)', () => {
+      const configFile = join(tempDir, '.claude-flow', 'config.json');
+      writeFileSync(configFile, JSON.stringify({
+        'daemon.ttlSecs': 1800,
+        'daemon.idleSecs': 900,
+      }));
+      const config = new WorkerDaemon(tempDir).getStatus().config;
+      expect(config.ttlMs).toBe(1800 * 1000);
+      expect(config.idleShutdownMs).toBe(900 * 1000);
+    });
+
+    it('honors config.json daemon.ttlSecs=0 as disabled', () => {
+      const configFile = join(tempDir, '.claude-flow', 'config.json');
+      writeFileSync(configFile, JSON.stringify({ 'daemon.ttlSecs': 0 }));
+      const config = new WorkerDaemon(tempDir).getStatus().config;
+      expect(config.ttlMs).toBe(0);
+    });
+
+    it('reads daemon.idleSecs from the `values` envelope config_set writes for default scope (#3192)', () => {
+      const configFile = join(tempDir, '.claude-flow', 'config.json');
+      // This is the literal shape config_set's default-scope handler
+      // produces (v3/@claude-flow/cli/src/mcp-tools/config-tools.ts),
+      // not a hand-authored file — the daemon reads the same config.json
+      // that tool writes to.
+      writeFileSync(configFile, JSON.stringify({
+        values: { 'daemon.idleSecs': 0 },
+        scopes: {},
+        version: '3.0.0',
+        updatedAt: new Date().toISOString(),
+      }));
+      const config = new WorkerDaemon(tempDir).getStatus().config;
+      expect(config.idleShutdownMs).toBe(0);
+    });
+
+    it('reads daemon.idleSecs from `values` even when scopes.project holds a different key (mixed-shape config.json)', () => {
+      // A real config.json can accumulate keys from both a project-scoped
+      // config_set call and a default-scope one. Picking one whole object
+      // as "cfg" (scopes.project OR values OR root) would make the daemon
+      // miss any key that lives in a different shape than the one "cfg"
+      // happened to resolve to — each key must be resolved independently.
+      const configFile = join(tempDir, '.claude-flow', 'config.json');
+      writeFileSync(configFile, JSON.stringify({
+        values: { 'daemon.idleSecs': 0 },
+        scopes: { project: { 'daemon.maxConcurrent': 4 } },
+      }));
+      const config = new WorkerDaemon(tempDir).getStatus().config;
+      expect(config.idleShutdownMs).toBe(0);
+      expect(config.maxConcurrent).toBe(4);
+    });
+
+    it('prefers constructor arg over config.json and env', () => {
+      process.env[TTL_ENV] = '3600';
+      const configFile = join(tempDir, '.claude-flow', 'config.json');
+      writeFileSync(configFile, JSON.stringify({ 'daemon.ttlSecs': 1800 }));
+      const config = new WorkerDaemon(tempDir, { ttlMs: 60_000 }).getStatus().config;
+      expect(config.ttlMs).toBe(60_000);
+    });
+
+    it('prefers config.json over env', () => {
+      process.env[TTL_ENV] = '3600';
+      const configFile = join(tempDir, '.claude-flow', 'config.json');
+      writeFileSync(configFile, JSON.stringify({ 'daemon.ttlSecs': 1800 }));
+      const config = new WorkerDaemon(tempDir).getStatus().config;
+      expect(config.ttlMs).toBe(1800 * 1000);
+    });
+
+    it('arms the lifecycle monitor even when ttl/idle are disabled (#2661 workspace-removal check)', () => {
+      const daemon = new WorkerDaemon(tempDir, { ttlMs: 0, idleShutdownMs: 0 });
+      // Pre-#2661 this was a no-op with both limits at 0. The monitor now
+      // always runs so a daemon whose worktree is deleted shuts itself
+      // down; ttl/idle remain opt-in inside the shared predicate.
+      (daemon as any).startLifecycleMonitor();
+      expect((daemon as any).lifecycleTimer).toBeDefined();
+      // But with the workspace present and both limits off, the predicate
+      // must not request a shutdown.
+      expect((daemon as any).lifecycleShutdownReason(Date.now())).toBeNull();
+      clearInterval((daemon as any).lifecycleTimer);
+      (daemon as any).lifecycleTimer = undefined;
+    });
+
+    it('arms (and can clear) the lifecycle monitor when a TTL is set', () => {
+      const daemon = new WorkerDaemon(tempDir, { ttlMs: 60_000, idleShutdownMs: 0 });
+      (daemon as any).startLifecycleMonitor();
+      expect((daemon as any).lifecycleTimer).toBeDefined();
+      // The monitor timer must be unref'd so it never keeps the process alive.
+      clearInterval((daemon as any).lifecycleTimer);
+      (daemon as any).lifecycleTimer = undefined;
+    });
+
+    it('measures idle time from this start when restored worker activity is stale (#3194)', () => {
+      const stateFile = join(tempDir, '.claude-flow', 'daemon-state.json');
+      const previousRun = new Date('2026-01-01T00:00:00.000Z');
+      const startedMs = new Date('2026-01-02T00:00:00.000Z').getTime();
+      writeFileSync(stateFile, JSON.stringify({
+        workers: { audit: { lastRun: previousRun, lastStartedAt: previousRun } },
+      }));
+
+      const daemon = new WorkerDaemon(tempDir, { ttlMs: 0, idleShutdownMs: 90_000 });
+      const internal = daemon as any;
+      internal.startedAt = new Date(startedMs);
+      expect(internal.workers.get('audit').lastRun).toEqual(previousRun);
+
+      // The first lifecycle tick must not kill a fresh daemon because of
+      // activity from a previous process, but idle shutdown still applies.
+      expect(internal.lifecycleShutdownReason(startedMs + 60_000)).toBeNull();
+      expect(internal.lifecycleShutdownReason(startedMs + 90_000)).toMatch(/idle for 90s/);
+
+      // A worker run in this process resets the idle window normally.
+      internal.workers.get('audit').lastRun = new Date(startedMs + 45_000);
+      expect(internal.lifecycleShutdownReason(startedMs + 120_000)).toBeNull();
+      expect(internal.lifecycleShutdownReason(startedMs + 135_000)).toMatch(/idle for 90s/);
     });
   });
 });
