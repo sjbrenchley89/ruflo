@@ -4,6 +4,7 @@
  */
 
 import type { InitOptions } from './types.js';
+import { ourSpec, type ReleaseChannel } from './pinning.js';
 import { generateStatuslineScript, generateStatuslineHook } from './statusline-generator.js';
 
 // ADR-127 Phase 4 — attribution is opt-in (#1670 / #2089).
@@ -67,7 +68,7 @@ const TOOL_FAILURE_EXPR =
 /**
  * Generate pre-commit hook script
  */
-export function generatePreCommitHook(): string {
+export function generatePreCommitHook(channel: ReleaseChannel = 'pinned'): string {
   return `#!/bin/bash
 # Ruflo Pre-Commit Hook
 # Validates code quality before commit
@@ -83,7 +84,7 @@ STAGED_FILES=$(git diff --cached --name-only --diff-filter=ACM)
 for FILE in $STAGED_FILES; do
   if [[ "$FILE" =~ \\.(ts|js|tsx|jsx)$ ]]; then
     echo "  Validating: $FILE"
-    npx @claude-flow/cli hooks pre-edit --file "$FILE" --validate-syntax 2>/dev/null || true
+    npx ${ourSpec('@claude-flow/cli', channel)} hooks pre-edit --file "$FILE" --validate-syntax 2>/dev/null || true
   fi
 done
 
@@ -100,7 +101,7 @@ echo "✅ Pre-commit checks complete"
 /**
  * Generate post-commit hook script
  */
-export function generatePostCommitHook(): string {
+export function generatePostCommitHook(channel: ReleaseChannel = 'pinned'): string {
   return `#!/bin/bash
 # Ruflo Post-Commit Hook
 # Records commit metrics and trains patterns
@@ -111,7 +112,7 @@ COMMIT_MSG=$(git log -1 --pretty=%B)
 echo "📊 Recording commit metrics..."
 
 # Notify ruflo of commit
-npx ruflo@latest hooks notify \\
+npx ${ourSpec('ruflo', channel)} hooks notify \\
   --message "Commit: $COMMIT_MSG" \\
   --level info \\
   --metadata '{"hash": "'$COMMIT_HASH'"}' 2>/dev/null || true
@@ -1376,7 +1377,8 @@ export function generateIntelligenceStub(): string {
  * This ESM script handles import/sync/status commands gracefully when
  * @claude-flow/memory is not installed. Gets overwritten when source copy succeeds.
  */
-export function generateAutoMemoryHook(): string {
+export function generateAutoMemoryHook(channel: ReleaseChannel = 'pinned'): string {
+  const ruflo = `npx ${ourSpec('ruflo', channel)}`;
   return `#!/usr/bin/env node
 /**
  * Auto Memory Bridge Hook (ADR-048/049) — Minimal Fallback
@@ -1412,7 +1414,7 @@ const dim = (msg) => console.log(\`  \${DIM}\${msg}\${RESET}\`);
 // unresolvable — self-learning imports are a no-op and the user must be told.
 function warnMemoryUnavailable() {
   const l1 = \`[AutoMemory] @claude-flow/memory not resolvable from \${MODULE_ROOT} — self-learning imports are DISABLED.\`;
-  const l2 = '             Fix: npm i -D @claude-flow/memory   (or re-run: npx ruflo@latest init, then npx ruflo@latest doctor --fix)';
+  const l2 = '             Fix: npm i -D @claude-flow/memory   (or re-run: ${ruflo} init, then ${ruflo} doctor --fix)';
   console.log(\`\${YELLOW}\${l1}\${RESET}\`);
   console.log(\`\${YELLOW}\${l2}\${RESET}\`);
   process.stderr.write(\`\${l1}\\n\${l2}\\n\`);
@@ -1502,6 +1504,38 @@ process.on('unhandledRejection', () => {});
 // subcommand in argv[1] (#4058); accept that shape as well as script import.
 const COMMANDS = ['import', 'sync', 'status'];
 const command = process.argv[2] || (COMMANDS.includes(process.argv[1]) ? process.argv[1] : 'status');
+// #3163: Codex parses a Stop hook's stdout as hook JSON and fails on status
+// prose, which Claude Code shows as ordinary hook feedback. A Codex hook
+// payload carries a turn_id that Claude Code's does not, so under Codex the
+// status lines go to stderr and stdout stays empty (exit 0 with no output is
+// success there). Claude Code and terminal runs are unchanged.
+function readHookPayload() {
+  if (process.stdin.isTTY) return Promise.resolve(null);
+  return new Promise((done) => {
+    let buf = '';
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      process.stdin.removeAllListeners('data');
+      process.stdin.removeAllListeners('end');
+      try { process.stdin.destroy(); } catch (_) {}
+      try { done(JSON.parse(buf)); } catch (_) { done(null); }
+    };
+    const timer = setTimeout(finish, 500);
+    process.stdin.setEncoding('utf8');
+    process.stdin.on('data', (chunk) => { buf += chunk; if (buf.length > 1048576) finish(); });
+    process.stdin.on('end', finish);
+    process.stdin.on('error', finish);
+  });
+}
+if (command === 'import' || command === 'sync') {
+  const hookPayload = await readHookPayload();
+  if (hookPayload && typeof hookPayload === 'object' && typeof hookPayload.turn_id === 'string') {
+    console.log = (...args) => console.error(...args);
+  }
+}
 
 let exitCode = 0;
 try {
@@ -1815,8 +1849,8 @@ export function generateHelpers(options: InitOptions): Record<string, string> {
 
   if (options.components.helpers) {
     // Unix/macOS shell scripts
-    helpers['pre-commit'] = generatePreCommitHook();
-    helpers['post-commit'] = generatePostCommitHook();
+    helpers['pre-commit'] = generatePreCommitHook(options.channel);
+    helpers['post-commit'] = generatePostCommitHook(options.channel);
 
     // Cross-platform Node.js scripts
     helpers['session.cjs'] = generateCrossPlatformSessionManager();
@@ -1853,7 +1887,7 @@ export function generateHelpers(options: InitOptions): Record<string, string> {
  *   - Mac/Linux: plugin hooks.json still uses .sh (faster, battle-tested)
  *   - Both: .claude/helpers/ruflo-hook.cjs available as a canonical cross-platform shim
  */
-export function generateRufloHookCjs(): string {
+export function generateRufloHookCjs(channel: ReleaseChannel = 'pinned'): string {
   return `#!/usr/bin/env node
 /**
  * ruflo-hook.cjs — cross-platform Node.js port of ruflo-hook.sh (#2132)
@@ -2073,7 +2107,7 @@ function main() {
   if (resolveCommandPath('claude-flow')) { invokeHook('claude-flow', [], hookArgs, stdinData); done(); }
   // --prefix: npx resolves ruflo from this helper's install root, never from
   // the cwd (the opened project); the CLI still runs in the project.
-  invokeHook('npx', ['--prefer-offline', '--yes', '--prefix', path.resolve(__dirname, '..', '..'), 'ruflo@latest'], hookArgs, stdinData);
+  invokeHook('npx', ['--prefer-offline', '--yes', '--prefix', path.resolve(__dirname, '..', '..'), '${ourSpec('ruflo', channel)}'], hookArgs, stdinData);
   done();
 }
 
