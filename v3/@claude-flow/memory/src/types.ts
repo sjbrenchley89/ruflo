@@ -437,6 +437,18 @@ export interface CacheConfig {
 
   /** Enable write-through caching */
   writeThrough: boolean;
+
+  /**
+   * Blend factor (0-1) for frequency-aware eviction. 0 (default) preserves
+   * pure-LRU tail eviction exactly. Above 0, eviction scores a bounded
+   * window of least-recently-used entries by recency + normalized
+   * accessCount, so a high-frequency entry can survive an eviction pure
+   * recency would otherwise apply to it.
+   */
+  frequencyWeight?: number;
+
+  /** Window size (entries scanned from the tail) for frequency-aware eviction. Default 32. Only consulted when frequencyWeight > 0. */
+  evictionScanWindow?: number;
 }
 
 /**
@@ -522,6 +534,13 @@ export interface MigrationConfig {
 
   /** Type mapping */
   typeMapping?: Record<string, MemoryType>;
+
+  /**
+   * Max concurrent single-entry embedding calls per migration batch when
+   * no batch embedding generator is available (default: 8). Set to 1 to
+   * restore fully sequential embedding.
+   */
+  embeddingConcurrency?: number;
 }
 
 /**
@@ -668,6 +687,18 @@ export interface LearningPattern {
  * Embedding generator function type
  */
 export type EmbeddingGenerator = (content: string) => Promise<Float32Array>;
+
+/**
+ * Batch embedding generator function type.
+ *
+ * Implementations that can run a single padded forward pass over many
+ * texts (e.g. transformers.js `tokenizer(texts[])` + one model call)
+ * should be exposed through this type — it is dramatically cheaper than
+ * N sequential single-text inferences in import/migration hot paths.
+ *
+ * Contract: MUST return one embedding per input text, in input order.
+ */
+export type BatchEmbeddingGenerator = (contents: string[]) => Promise<Float32Array[]>;
 
 /**
  * Generates a unique memory ID

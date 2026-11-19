@@ -10,7 +10,7 @@ This plugin requires a **Cognitum Seed** device. Get one at **https://cognitum.o
 
 Treats every Cognitum Seed device as a Ruflo agent with hardware capabilities. Devices progress through a 5-tier trust model, emit telemetry vectors for anomaly detection, participate in mesh networks, and maintain Ed25519 witness chains for provenance.
 
-Backed by `@claude-flow/plugin-iot-cognitum` (239 tests, 32 source files).
+Backed by `@claude-flow/plugin-iot-cognitum` (239 tests, 39 source files).
 
 ## Installation
 
@@ -153,6 +153,23 @@ This plugin owns five AgentDB namespaces, all compliant with the [ruflo-agentdb 
 | `iot-audit` | Witness-chain gap records |
 
 Reserved namespaces (`pattern`, `claude-memories`, `default`) MUST NOT be shadowed.
+
+## As a mod (0.3.2)
+
+A function-hook mod ships beside the skills (ADR-445 pattern). Needs a Claude Code with mods (2.1.287+); older builds ignore it. No network, no process spawning: it only tightens calls to this plugin's own tools and reads through tools already connected.
+
+| Piece | Default | What it does |
+|---|---|---|
+| **Write guard** | on | Refuses a secret in an `iot-*` memory record, or on a `cognitum-iot` command line. |
+| **Destructive confirm** | on | Refuses `cognitum-iot fleet delete` and `device delete/remove/revoke/decommission/deregister` unless the command has `--confirm`/`--yes` or the `COGNITUM_IOT_CONFIRM=1` prefix (rollbacks and lists are untouched). |
+| **`/iot-mod`** | — | `status`, `scan <text>`, `devices` (reads the `iot-devices` namespace through the connected memory tool); answered locally, no model call. |
+| **Status file** | — | `.claude-flow/iot-mod/status.json` (`version`, `updatedMs`, mode flags and counters); written at session start and when a counter changes. |
+
+Options (`userConfig`): `guard` on\|off, `confirmDestructive` on\|off. Refusals never echo the value they matched.
+
+```bash
+claude plugin test plugins/ruflo-iot-cognitum   # 10 tests
+```
 
 ## Trust model parallel with federation
 

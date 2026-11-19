@@ -2,7 +2,7 @@
 name: intelligence-route
 description: Route tasks via the 3-tier model selector and learned patterns; emits a routing rationale via hooks_explain
 argument-hint: "<task-description> [--why]"
-allowed-tools: mcp__claude-flow__hooks_route mcp__claude-flow__hooks_explain mcp__claude-flow__hooks_model-route mcp__claude-flow__hooks_model-stats mcp__claude-flow__hooks_model-outcome mcp__claude-flow__hooks_intelligence_pattern-search mcp__claude-flow__hooks_intelligence_attention mcp__claude-flow__hooks_intelligence_stats mcp__claude-flow__neural_predict mcp__claude-flow__hooks_pre-task Bash
+allowed-tools: mcp__plugin_ruflo-core_ruflo__hooks_route mcp__plugin_ruflo-core_ruflo__hooks_explain mcp__plugin_ruflo-core_ruflo__hooks_model-route mcp__plugin_ruflo-core_ruflo__hooks_model-stats mcp__plugin_ruflo-core_ruflo__hooks_model-outcome mcp__plugin_ruflo-core_ruflo__hooks_intelligence_pattern-search mcp__plugin_ruflo-core_ruflo__hooks_intelligence_attention mcp__plugin_ruflo-core_ruflo__hooks_intelligence_stats mcp__plugin_ruflo-core_ruflo__neural_predict mcp__plugin_ruflo-core_ruflo__hooks_pre-task Bash
 ---
 
 # Intelligence Routing
@@ -15,34 +15,35 @@ Before starting any non-trivial task. Replaces manual agent selection with data-
 
 ## Steps
 
-1. **Get an agent recommendation** — `mcp__claude-flow__hooks_route` with the task description. Returns `{ recommended, confidence, reasoning }`.
-2. **Get a model tier recommendation** — `mcp__claude-flow__hooks_model-route` for Haiku/Sonnet/Opus selection.
-3. **Search for similar past patterns** — `mcp__claude-flow__hooks_intelligence_pattern-search` to find prior successes.
-4. **Predict outcome** — `mcp__claude-flow__neural_predict` with the task description for a confidence-scored prediction.
+1. **Get an agent recommendation** — `mcp__plugin_ruflo-core_ruflo__hooks_route` with the task description. Returns `{ recommended, confidence, reasoning }`.
+2. **Get a model tier recommendation** — `mcp__plugin_ruflo-core_ruflo__hooks_model-route` for Haiku/Sonnet/Opus selection.
+3. **Search for similar past patterns** — `mcp__plugin_ruflo-core_ruflo__hooks_intelligence_pattern-search` to find prior successes.
+4. **Predict outcome** — `mcp__plugin_ruflo-core_ruflo__neural_predict` with the task description for a confidence-scored prediction.
 5. **Spawn the recommended agent** at the recommended model tier.
-6. **(If `--why` was passed)** — call `mcp__claude-flow__hooks_explain` to surface the routing rationale to the user.
-7. **After task completes** — call `mcp__claude-flow__hooks_model-outcome` with `success: true|false` to train the router.
+6. **(If `--why` was passed)** — call `mcp__plugin_ruflo-core_ruflo__hooks_explain` to surface the routing rationale to the user.
+7. **(If the centroid router is on, `CLAUDE_FLOW_ROUTER_CENTROID=1`)** — after replacing its artifact (`CLAUDE_FLOW_ROUTER_CENTROID_PATH`), run `npx @claude-flow/cli@latest neural wsp check` via Bash. Exit 1 lists labels that no longer win on their own centroid (near-duplicates or a corrupt file); exit 2 means the optional ruv-FANN WSP packages are not installed.
+8. **After task completes** — call `mcp__plugin_ruflo-core_ruflo__hooks_model-outcome` with `{ task, model, outcome: "success"|"failure"|"escalated" }` to train the router.
 
 ## 3-Tier Model Routing
 
 | Tier | Handler | Latency | Cost | When |
 |------|---------|---------|------|------|
-| 1 | Agent Booster (WASM) | <1ms | $0 | Simple transforms (var→const, add types, remove console) — skip LLM entirely |
+| 1 | Deterministic codemod (TS compiler) | ~1ms | $0 | Structural transforms with no LLM: `var-to-const`, `remove-console`, `add-logging` |
 | 2 | Haiku | ~500ms | ~$0.0002 | Low complexity (<30%), bug fixes, quick patches |
 | 3 | Sonnet/Opus | 2–5s | $0.003–$0.015 | Complex reasoning, architecture, security, multi-file refactors |
 
-When `hooks_route` returns `[AGENT_BOOSTER_AVAILABLE]` for an intent type (`var-to-const`, `add-types`, `add-error-handling`, `async-await`, `add-logging`, `remove-console`), skip the LLM and use the Edit tool directly.
+When `hooks_route` returns `[CODEMOD_AVAILABLE]` for a deterministic intent (`var-to-const`, `remove-console`, `add-logging`), call `mcp__plugin_ruflo-core_ruflo__hooks_codemod` with the intent + file — it applies the transform via the TypeScript compiler at $0, no LLM. Note: `add-types`, `add-error-handling`, `async-await` require judgement and route to a model (Tier 2/3) per ADR-143; they are NOT $0 codemods. Agent Booster is a fast-apply merge engine for LLM-produced edits, not the Tier-1 path.
 
 ## Recording outcomes
 
 Closing the routing loop is mandatory:
 
 ```bash
-# Success
-mcp tool call hooks_model-outcome --json -- '{"taskId": "T123", "success": true, "model": "haiku"}'
+# Success (task, model and outcome are all required; model is haiku|sonnet|opus)
+npx @claude-flow/cli@latest mcp exec -t hooks_model-outcome -p '{"task": "fix the flaky retry test", "model": "haiku", "outcome": "success"}'
 
-# Failure with reason
-mcp tool call hooks_model-outcome --json -- '{"taskId": "T123", "success": false, "model": "haiku", "reason": "complexity-misjudged"}'
+# The model was too small and the work moved up a tier: use "escalated"; use "failure" if it did not work out
+npx @claude-flow/cli@latest mcp exec -t hooks_model-outcome -p '{"task": "fix the flaky retry test", "model": "haiku", "outcome": "escalated"}'
 ```
 
 The router learns from these calls. Skipping them = no learning.
@@ -52,5 +53,5 @@ The router learns from these calls. Skipping them = no learning.
 ```bash
 npx @claude-flow/cli@latest hooks route --task "description"
 npx @claude-flow/cli@latest hooks pre-task --description "description"
-npx @claude-flow/cli@latest hooks explain --topic "routing decision"
+npx @claude-flow/cli@latest hooks explain --task "description" --verbose
 ```
