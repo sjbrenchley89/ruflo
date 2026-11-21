@@ -67,18 +67,18 @@ DROP INDEX CONCURRENTLY IF EXISTS idx_table_column;
 
 ### Tools
 
-- `mcp__claude-flow__agentdb_hierarchical-store` -- store migration metadata and history
-- `mcp__claude-flow__agentdb_hierarchical-recall` -- recall migration status and history
-- `mcp__claude-flow__agentdb_pattern-store` -- store successful migration patterns
-- `mcp__claude-flow__agentdb_pattern-search` -- search for similar migration patterns
-- `mcp__claude-flow__agentdb_semantic-route` -- route queries to relevant schema documentation
+- `mcp__plugin_ruflo-core_ruflo__agentdb_hierarchical-store` -- store migration metadata and history
+- `mcp__plugin_ruflo-core_ruflo__agentdb_hierarchical-recall` -- recall migration status and history
+- `mcp__plugin_ruflo-core_ruflo__agentdb_pattern-store` -- store successful migration patterns
+- `mcp__plugin_ruflo-core_ruflo__agentdb_pattern-search` -- search for similar migration patterns
+- `mcp__plugin_ruflo-core_ruflo__agentdb_semantic-route` -- route queries to relevant schema documentation
 
 ### Neural Learning
 
 After successful migration creation or validation, train patterns:
 ```bash
-npx @claude-flow/cli@latest hooks post-task --task-id "TASK_ID" --success true --train-neural true
-npx @claude-flow/cli@latest neural train --pattern-type migrations --epochs 10
+npx @claude-flow/cli@latest hooks post-task --task-id "TASK_ID" --success true --quality 0.9 --task "TASK_DESCRIPTION" --agent migration-engineer
+npx @claude-flow/cli@latest neural train --pattern coordination --epochs 10
 ```
 
 ### Memory Learning
