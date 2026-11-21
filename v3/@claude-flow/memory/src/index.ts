@@ -93,6 +93,7 @@ export type {
 
   // Utility Types
   EmbeddingGenerator,
+  BatchEmbeddingGenerator,
 } from './types.js';
 
 // Utility Functions and Constants (runtime values)
@@ -177,11 +178,58 @@ export type {
   RuntimeConfig,
 } from './controller-registry.js';
 
+// ===== Tiered Memory with Temporal Validity (Zep/Graphiti-style) =====
+export { TieredMemoryStore, isTemporallyValid } from './tiered-memory.js';
+export type {
+  TemporalStoreOptions,
+  TieredRecallOptions,
+  TieredMemoryEntry,
+  TieredStoreResult,
+} from './tiered-memory.js';
+// #4712: persisted inventory + exact-ID reads
+export {
+  TieredMemoryInventoryError,
+  TieredMemoryUnsupportedError,
+  TieredMemoryCursorError,
+  TIERED_STATUS_FILTERS,
+  TIERED_LIST_MAX_LIMIT,
+} from './tiered-memory-inventory.js';
+export type {
+  TieredEntryStatus,
+  TieredStatusFilter,
+  TieredListOptions,
+  TieredListResult,
+  TieredGetOptions,
+  TieredInventoryEntry,
+  TieredInventoryErrorCode,
+} from './tiered-memory-inventory.js';
+
 // ===== Core Components =====
 export { AgentDBAdapter } from './agentdb-adapter.js';
 export type { AgentDBAdapterConfig } from './agentdb-adapter.js';
+export {
+  AgentdbLockError,
+  clearStaleAgentdbLock,
+  closeWithAgentdbLockRecovery,
+  inspectAgentdbLock,
+  isConcurrentModificationError,
+  withAgentdbLockRecovery,
+} from './agentdb-lock-guard.js';
+export type { LockInspection, LockState, LockGuardOptions } from './agentdb-lock-guard.js';
 export { AgentDBBackend } from './agentdb-backend.js';
 export type { AgentDBBackendConfig } from './agentdb-backend.js';
+export { getHostSqliteDriver, useHostSqliteDriver } from './agentdb-native-driver.js';
+export {
+  AgentDbRetrievalGuard,
+  createAgentDbRetrievalGuard,
+  isRetrievalGuardEnabled,
+  isRetrievalGuardStrict,
+} from './agentdb-retrieval-guard.js';
+export type {
+  RetrievalGuardConfig,
+  GuardedSearchResult,
+  FilteredSearchResults,
+} from './agentdb-retrieval-guard.js';
 export { SQLiteBackend } from './sqlite-backend.js';
 export type { SQLiteBackendConfig } from './sqlite-backend.js';
 export { SqlJsBackend } from './sqljs-backend.js';

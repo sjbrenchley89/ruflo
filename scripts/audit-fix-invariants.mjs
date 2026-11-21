@@ -67,18 +67,19 @@ const INVARIANTS = [
     why: 'Per-namespace vector_indexes provisioning in storeEntry (sql.js fallback) — same root cause as the bridge path; one needs both branches.',
   },
 
-  // #1943 — settings-generator project-local OR $HOME probe
+  // #1943 — project-level settings: project-local OR $HOME probe (user-level
+  // settings are pinned to $HOME instead; see helper-commands.ts)
   {
     issue: '#1943',
-    file: 'v3/@claude-flow/cli/src/init/settings-generator.ts',
+    file: 'v3/@claude-flow/cli/src/init/helper-commands.ts',
     substring: '[ -f "$D/',
-    why: 'POSIX sh probe in hookCmd() — without it, global-install hook paths anchor at `${CLAUDE_PROJECT_DIR}` only and every Bash/Edit/Session hook fires MODULE_NOT_FOUND.',
+    why: 'POSIX sh probe in helperHookCommand() — without it, global-install hook paths anchor at `${CLAUDE_PROJECT_DIR}` only and every Bash/Edit/Session hook fires MODULE_NOT_FOUND.',
   },
   {
     issue: '#1943',
-    file: 'v3/@claude-flow/cli/src/init/settings-generator.ts',
-    substring: 'IF EXIST',
-    why: 'Windows `cmd /c IF EXIST … ELSE …` fallback — Win32 equivalent of the sh probe.',
+    file: 'v3/@claude-flow/cli/src/init/helper-commands.ts',
+    substring: 'if(!fs.existsSync(f))f=p.join(',
+    why: 'Windows node -e fallback (#4045: no `cmd /c`) — Win32 equivalent of the sh probe.',
   },
 
   // #1945 / #1946 — memory bridge + doctor honor CLAUDE_FLOW_MEMORY_PATH
@@ -105,21 +106,26 @@ const INVARIANTS = [
   {
     issue: '#1951',
     file: 'v3/@claude-flow/cli/.claude/helpers/statusline.cjs',
-    substring: '.claude/plugins/marketplaces/ruflo',
+    // Regex matches the path.join(home, '.claude', 'plugins', 'marketplaces', 'ruflo', …) form.
+    // The original substring form happened to hit because of a comment in the v3 snapshot,
+    // not the actual code path; switch to a regex that catches the real call site.
+    regex: /['"]marketplaces['"]\s*,\s*['"]ruflo['"]/,
     why: 'Plugin-install candidate path probed first — without it, plugin users always fall through to the hardcoded default.',
   },
   {
     issue: '#1951',
     file: '.claude/helpers/statusline.cjs',
-    substring: '.claude/plugins/marketplaces/ruflo',
+    regex: /['"]marketplaces['"]\s*,\s*['"]ruflo['"]/,
     why: 'Same plugin-install candidate in the root statusline copy.',
   },
-  {
-    issue: '#1951',
-    file: 'v3/@claude-flow/cli/src/init/statusline-generator.ts',
-    substring: '.claude/plugins/marketplaces/ruflo',
-    why: 'Same plugin-install candidate in the init template that generates project-local statuslines.',
-  },
+  // #2679 sync: the init template no longer inlines the statusline —
+  // it reads .claude/helpers/statusline.cjs and substitutes. The
+  // marketplaces/ruflo candidate path therefore lives in the helper
+  // file (already covered by the two invariants above). Dropping this
+  // entry since the invariant is now enforced by the paired
+  // .claude/helpers/statusline.cjs + v3/@claude-flow/cli/.claude/helpers/
+  // statusline.cjs invariants; the generator can't ship a copy without
+  // that candidate because it doesn't ship a copy at all — it reads one.
 
   // #1953 — hooks_pretrain code-file budget + code-dir-first traversal
   {
@@ -143,20 +149,37 @@ const INVARIANTS = [
     why: 'Daemon launcher forwards --headless — same family as the --workers gap.',
   },
 
-  // #1989 — statusline guards SQLite header read against RFE1-encrypted
-  // memory.db (the bug rendered 3.3B `patterns` and cascaded into fake
-  // DDD 5/5 / 100% / 🧠 100%).
+  // #1989 — statusline previously guarded raw SQLite header reads against
+  // RFE1-encrypted memory.db (the bug rendered 3.3B `patterns` and cascaded
+  // into fake DDD 5/5 / 100% / 🧠 100%). Superseded by #2196's delegation
+  // refactor: statusline-generator.ts no longer reads .swarm/memory.db
+  // bytes directly — it delegates to `hooks-statusline --json`, which
+  // queries AgentDB via the typed SDK and never touches raw SQLite pages.
+  // The regression vector is closed by ARCHITECTURE: if a future refactor
+  // reintroduces raw-bytes reading from a memory.db path, the #2196 guard
+  // (presence of the delegation pattern) catches it before the SQLite
+  // magic-check would ever be relevant. See ruvnet/ruflo#2216 for the
+  // user-deployed (pre-#2196) statusline still having the bug.
+  // #2679 sync: statusline-generator no longer inlines the delegation
+  // template as a big string — it now READS
+  // .claude/helpers/statusline.cjs at generation time and interpolates
+  // maxAgents + bakedVersion. The delegation contract therefore lives
+  // in the HELPER file, not the generator. Two paired invariants:
+  //   1. the helper must contain the delegation pattern (unchanged intent)
+  //   2. the generator must still be reading the helper (so the pattern
+  //      actually reaches init output)
+  // Splitting the check catches drift on either side of the sync.
   {
-    issue: '#1989',
-    file: 'v3/@claude-flow/cli/src/init/statusline-generator.ts',
-    substring: "Buffer.from('SQLite format 3",
-    why: 'Magic-bytes check before reading SQLite page count. Without it, encrypted RFE1 memory.db files produce bogus uint32 pattern counts.',
+    issue: '#2196',
+    file: 'v3/@claude-flow/cli/.claude/helpers/statusline.cjs',
+    regex: /hooks[- ]statusline|hooksStatusline/,
+    why: 'Statusline helper must delegate to hooks-statusline rather than re-implementing memory.db readers (#2195/#1989 supersession). Without delegation, the shipped statusline.cjs goes back to raw-bytes reading which broke for encrypted RFE1 DBs. (Was previously checked in statusline-generator.ts; moved here per #2679 read-and-substitute refactor.)',
   },
   {
-    issue: '#1989',
+    issue: '#2679',
     file: 'v3/@claude-flow/cli/src/init/statusline-generator.ts',
-    regex: /pageCount > 1_000_000/,
-    why: 'Sanity clamp rejecting >1M-page DBs (~4GB). Defense-in-depth even on plaintext SQLite.',
+    regex: /statusline\.cjs/,
+    why: 'Generator must READ .claude/helpers/statusline.cjs as its single source of truth (see #2679). Removing this reference would silently regress the generator to whatever inline template shape existed at the time — the pre-#2195 non-delegation build in the prior history.',
   },
 
   // #1987 — memory stats uses persistent HNSW count from MCP tool, not
@@ -171,7 +194,7 @@ const INVARIANTS = [
   // #1948 — Windows-specific statusLine command (no `sh` required)
   {
     issue: '#1948',
-    file: 'v3/@claude-flow/cli/src/init/settings-generator.ts',
+    file: 'v3/@claude-flow/cli/src/init/helper-commands.ts',
     regex: /process\.platform === ['"]win32['"]/,
     why: 'Platform-aware statusLine emission. On native Windows we emit `node -e "…"` instead of `sh -c …` so missing/mangled-quoting `sh` no longer produces stray repo-root files.',
   },
@@ -184,12 +207,12 @@ const INVARIANTS = [
     why: 'memory_import_claude accepts excludeFilePatterns (glob) for voice-fidelity / persona-restricted operators. Per-file granularity beyond the coarse allProjects:true/false.',
   },
 
-  // #1921 — pin @opentelemetry/core to dodge arborist Invalid Version
+  // #1921 — override @opentelemetry/core to dodge arborist Invalid Version
   {
     issue: '#1921',
     file: 'package.json',
-    substring: '"@opentelemetry/core": "1.25.1"',
-    why: 'overrides pin for @opentelemetry/core@1.25.1. Eliminates the npm 10.8.x arborist `Invalid Version: ` placeholder that fails every `npx claude-flow@alpha …` install (including all 5 hook fires).',
+    substring: '"@opentelemetry/core": ">=2.8.0"',
+    why: 'overrides entry for @opentelemetry/core (originally an exact 1.25.1 pin, raised to a >=2.8.0 floor in #2547 for the OTel 2.x audit fix). Keeping a single resolvable @opentelemetry/core in overrides eliminates the npm 10.8.x arborist `Invalid Version: ` placeholder that fails every `npx claude-flow@alpha …` install (including all 5 hook fires). Do not delete the override — retune the range instead.',
   },
 
   // #1910 — MCP stdio mode protects stdout from stray console.log

@@ -81,6 +81,19 @@ export interface RuvllmStatus {
   available: boolean;
   initialized: boolean;
   version: string | null;
+  /** Present when unavailable: how to install the missing package. */
+  hint?: string;
+}
+
+/** #4149: the wasm package is an optional add-on, not bundled with the CLI. */
+export const RUVLLM_WASM_INSTALL_HINT =
+  '@ruvector/ruvllm-wasm is not installed. Install it next to the CLI: ' +
+  '"npm i -g @ruvector/ruvllm-wasm" for a global install, or ' +
+  '"npm i @ruvector/ruvllm-wasm" in your project.';
+
+function isModuleNotFound(err: unknown): boolean {
+  const code = (err as { code?: string } | null)?.code;
+  return code === 'ERR_MODULE_NOT_FOUND' || code === 'MODULE_NOT_FOUND';
 }
 
 // ── WASM Module Detection & Init ─────────────────────────────
@@ -114,6 +127,9 @@ export async function initRuvllmWasm(): Promise<void> {
     mod.initSync({ module: wasmBytes });
     _wasmReady = true;
   } catch (err) {
+    if (isModuleNotFound(err)) {
+      throw new Error(`Failed to initialize @ruvector/ruvllm-wasm: ${RUVLLM_WASM_INSTALL_HINT}`);
+    }
     throw new Error(`Failed to initialize @ruvector/ruvllm-wasm: ${err}`);
   }
 }
@@ -124,7 +140,7 @@ export async function initRuvllmWasm(): Promise<void> {
 export async function getRuvllmStatus(): Promise<RuvllmStatus> {
   const available = await isRuvllmWasmAvailable();
   if (!available) {
-    return { available: false, initialized: false, version: null };
+    return { available: false, initialized: false, version: null, hint: RUVLLM_WASM_INSTALL_HINT };
   }
   try {
     const mod = await import('@ruvector/ruvllm-wasm');
@@ -259,7 +275,7 @@ export async function createSonaInstant(config: SonaConfig = {}): Promise<{
 export async function createMicroLora(config: MicroLoraConfig): Promise<{
   apply: (input: Float32Array) => Float32Array;
   adapt: (quality: number, learningRate?: number, success?: boolean) => void;
-  applyUpdates: (gradients: Float32Array) => void;
+  applyUpdates: (learningRate?: number) => void;
   stats: () => string;
   reset: () => void;
   toJson: () => string;
@@ -287,9 +303,21 @@ export async function createMicroLora(config: MicroLoraConfig): Promise<{
       try { (feedback as any).success = success; } catch { /* v2.0.2 quirk */ }
       const input = new Float32Array(Math.max(config.inputDim, MICROLORA_WASM_MIN_DIM));
       lora.adapt(input, feedback);
+      // Flush accumulated gradients. HONEST CAVEAT (audit
+      // docs/reviews/intelligence-system-audit-2026-05-29.md): even WITH this
+      // flush, the shipped @ruvector/ruvllm-wasm@2.0.2 MicroLoraWasm.apply()
+      // output is empirically UNCHANGED (measured maxAbsDelta = 0 after 200
+      // adapts). MicroLoRA adaptation is therefore effectively a no-op on
+      // inference with this WASM backend. We do NOT synthesize a fake gradient
+      // from the scalar quality to make output "move" — that would be a
+      // fabricated signal. Real adaptation needs the WASM backend to flush B,
+      // or a caller supplying real gradients.
+      lora.applyUpdates(learningRate as unknown as Float32Array);
     },
-    applyUpdates(gradients: Float32Array): void {
-      lora.applyUpdates(gradients);
+    applyUpdates(learningRate = 0.01): void {
+      // WASM runtime signature is applyUpdates(learning_rate: number); the
+      // shipped .d.ts mistypes it as Float32Array, hence the cast.
+      lora.applyUpdates(learningRate as unknown as Float32Array);
     },
     stats(): string {
       return lora.toJson();

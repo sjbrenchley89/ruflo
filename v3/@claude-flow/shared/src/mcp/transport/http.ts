@@ -14,8 +14,10 @@
 
 import { EventEmitter } from 'events';
 import express, { Express, Request, Response, NextFunction } from 'express';
-import { createServer, Server } from 'http';
+import { createServer, Server, type IncomingMessage } from 'http';
+import { assertSafeBind, refuseOpenRequest } from './guard.js';
 import { WebSocketServer, WebSocket } from 'ws';
+import { createHash, timingSafeEqual } from 'crypto';
 import cors from 'cors';
 import helmet from 'helmet';
 import {
@@ -43,9 +45,15 @@ export interface HttpTransportConfig {
   corsEnabled?: boolean;
   corsOrigins?: string[];
   auth?: AuthConfig;
+  /** Accept a non-loopback bind with no token (the operator's own risk). */
+  allowUnauthenticated?: boolean;
   maxRequestSize?: string;
+  /** Largest WebSocket frame accepted on /ws, in bytes (default 10 MiB). */
+  maxMessageSize?: number;
   requestTimeout?: number;
 }
+
+const DEFAULT_MAX_WS_PAYLOAD = 10 * 1024 * 1024;
 
 /**
  * HTTP Transport Implementation
@@ -91,13 +99,25 @@ export class HttpTransport extends EventEmitter implements ITransport {
       port: this.config.port,
     });
 
+    assertSafeBind(this.config.host, this.config.auth?.enabled === true, this.config.allowUnauthenticated);
+
     // Create HTTP server
     this.server = createServer(this.app);
 
-    // Create WebSocket server
+    // Create WebSocket server. With auth enabled the token is checked before the upgrade
+    // (Authorization: Bearer, or ?token= for browsers); CORS does not apply to upgrades,
+    // so a token-less server checks Host and Origin itself.
     this.wss = new WebSocketServer({
       server: this.server,
       path: '/ws',
+      maxPayload:
+        typeof this.config.maxMessageSize === 'number' && this.config.maxMessageSize > 0
+          ? this.config.maxMessageSize
+          : DEFAULT_MAX_WS_PAYLOAD,
+      verifyClient: (info: { req: IncomingMessage }) =>
+        this.config.auth?.enabled === true
+          ? this.validateUpgradeAuth(info.req)
+          : refuseOpenRequest(info.req, this.config.host, this.config.corsOrigins) === undefined,
     });
 
     this.setupWebSocketHandlers();
@@ -208,6 +228,18 @@ export class HttpTransport extends EventEmitter implements ITransport {
    * Setup Express middleware
    */
   private setupMiddleware(): void {
+    // A server with no token must not answer a web page or a rebound hostname.
+    if (this.config.auth?.enabled !== true) {
+      this.app.use((req: Request, res: Response, next: NextFunction) => {
+        const why = refuseOpenRequest(req, this.config.host, this.config.corsOrigins);
+        if (why === undefined) {
+          next();
+          return;
+        }
+        res.status(403).json({ jsonrpc: '2.0', id: null, error: { code: -32000, message: `Forbidden: ${why}` } });
+      });
+    }
+
     // Security headers
     this.app.use(helmet({
       contentSecurityPolicy: false, // Allow for flexibility
@@ -330,6 +362,15 @@ export class HttpTransport extends EventEmitter implements ITransport {
 
     // Error handler
     this.app.use((err: Error, req: Request, res: Response, next: NextFunction) => {
+      // body-parser marks a malformed JSON body: that is the client's JSON-RPC parse error, not ours.
+      if ((err as { type?: string }).type === 'entity.parse.failed') {
+        res.status(400).json({
+          jsonrpc: '2.0',
+          id: null,
+          error: { code: -32700, message: 'Parse error' },
+        });
+        return;
+      }
       this.logger.error('Express error', { error: err });
       this.errors++;
       res.status(500).json({
@@ -402,7 +443,8 @@ export class HttpTransport extends EventEmitter implements ITransport {
       this.logger.warn('No authentication configured - running in development mode');
     }
 
-    const message = req.body;
+    // Express 5 leaves req.body undefined when no JSON body was parsed (Express 4 gave {}).
+    const message = req.body ?? {};
 
     // Validate JSON-RPC format
     if (message.jsonrpc !== '2.0') {
@@ -536,13 +578,41 @@ export class HttpTransport extends EventEmitter implements ITransport {
 
     const token = tokenMatch[1];
 
-    if (this.config.auth?.tokens?.length) {
-      if (!this.config.auth.tokens.includes(token)) {
-        return { valid: false, error: 'Invalid token' };
-      }
+    if (!this.matchesConfiguredToken(token)) {
+      return { valid: false, error: 'Invalid token' };
     }
 
     return { valid: true };
+  }
+
+  /** /ws upgrade: token from `Authorization: Bearer`, else from `?token=`. Never throws. */
+  private validateUpgradeAuth(req: IncomingMessage): boolean {
+    try {
+      const header = req.headers.authorization;
+      const match = typeof header === 'string' ? header.match(/^Bearer\s+(.+)$/i) : null;
+      const fromQuery = new URL(req.url ?? '', 'http://localhost').searchParams.get('token') ?? undefined;
+      return this.matchesConfiguredToken(match?.[1] ?? fromQuery);
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Fail closed: auth enabled with no configured token accepts nothing. Unset or
+   * empty entries match nothing. Comparison is constant-time over SHA-256 digests,
+   * with no early exit.
+   */
+  private matchesConfiguredToken(given: string | undefined): boolean {
+    if (!given) return false;
+    const digest = createHash('sha256').update(given, 'utf8').digest();
+    let valid = false;
+    for (const candidate of this.config.auth?.tokens ?? []) {
+      if (typeof candidate !== 'string' || candidate.length === 0) continue;
+      if (timingSafeEqual(digest, createHash('sha256').update(candidate, 'utf8').digest())) {
+        valid = true;
+      }
+    }
+    return valid;
   }
 }
 

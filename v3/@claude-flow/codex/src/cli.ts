@@ -85,12 +85,19 @@ program
   .option('-s, --skills <skills>', 'Comma-separated list of skills to include')
   .option('-f, --force', 'Overwrite existing files', false)
   .option('--dual', 'Generate both Codex and Claude Code configurations', false)
+  .option('--codex-trust <level>', 'Trust level of the generated .codex/config.toml: standard (default: workspace-write sandbox, on-request approvals) or full (danger-full-access, no approvals)')
   .option('-p, --path <path>', 'Project path', process.cwd())
   .option('-q, --quiet', 'Suppress verbose output', false)
   .action(async (options) => {
     try {
       if (!options.quiet) {
         printBanner();
+      }
+
+      if (options.codexTrust !== undefined && !['standard', 'full'].includes(options.codexTrust)) {
+        console.error(chalk.red(`Invalid --codex-trust: ${options.codexTrust}`));
+        console.log(chalk.gray('Valid levels: standard, full'));
+        process.exit(1);
       }
 
       // Validate template
@@ -136,6 +143,7 @@ program
         skills,
         force: options.force,
         dual: options.dual,
+        codexTrust: options.codexTrust,
       });
 
       if (result.success) {
@@ -695,6 +703,42 @@ program.addCommand(createDualModeCommand());
 // Codex /loop-compatible runner
 import { createLoopCommand } from './loop/cli.js';
 program.addCommand(createLoopCommand());
+
+// Read-only activity from an already-running Codex session.
+import { createActivityCommand } from './activity/cli.js';
+program.addCommand(createActivityCommand());
+
+// Policy-governed worktree isolation for concurrent Codex writers (ADR-324)
+import { CodexWorktreeCoordinator } from './worktrees/index.js';
+const worktree = program.command('worktree').description('Prepare, inspect, integrate, or clean registry-owned Codex swarm worktrees');
+worktree.command('prepare <run-id>')
+  .requiredOption('--agents <ids>', 'Comma-separated writing-agent IDs')
+  .option('--read-only <ids>', 'Comma-separated read-only agent IDs')
+  .option('--base <ref>', 'Git base ref', 'HEAD')
+  .option('--allow-dirty', 'Allow creating worktrees from a dirty coordinator checkout', false)
+  .option('-p, --path <path>', 'Repository root', process.cwd())
+  .action((runId, options) => {
+    const writers = String(options.agents).split(',').map((id) => id.trim()).filter(Boolean).map((id) => ({ id }));
+    const readers = String(options.readOnly ?? '').split(',').map((id) => id.trim()).filter(Boolean).map((id) => ({ id, readOnly: true }));
+    const result = new CodexWorktreeCoordinator(options.path).prepare(runId, [...writers, ...readers], {
+      allowDirty: options.allowDirty,
+      baseRef: options.base,
+    });
+    console.log(JSON.stringify(result, null, 2));
+  });
+worktree.command('status <run-id>')
+  .option('-p, --path <path>', 'Repository root', process.cwd())
+  .action((runId, options) => console.log(JSON.stringify(new CodexWorktreeCoordinator(options.path).status(runId), null, 2)));
+worktree.command('integrate <run-id>')
+  .option('--agents <ids>', 'Comma-separated agent IDs; defaults to all writers')
+  .option('-p, --path <path>', 'Repository root', process.cwd())
+  .action((runId, options) => {
+    const ids = options.agents ? String(options.agents).split(',').map((id) => id.trim()).filter(Boolean) : undefined;
+    console.log(JSON.stringify(new CodexWorktreeCoordinator(options.path).integrate(runId, ids), null, 2));
+  });
+worktree.command('cleanup <run-id>')
+  .option('-p, --path <path>', 'Repository root', process.cwd())
+  .action((runId, options) => console.log(JSON.stringify(new CodexWorktreeCoordinator(options.path).cleanup(runId), null, 2)));
 
 // Error handling for unknown commands
 program.on('command:*', () => {

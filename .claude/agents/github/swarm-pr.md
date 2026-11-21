@@ -51,14 +51,17 @@ jobs:
   swarm-handler:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - name: Handle Swarm Command
         run: |
-          if [[ "${{ github.event.comment.body }}" == /swarm* ]]; then
+          COMMENT_BODY_FILE=$(mktemp)
+          printf '%s' "${{ github.event.comment.body }}" > "$COMMENT_BODY_FILE"
+          if grep -q '^/swarm' "$COMMENT_BODY_FILE"; then
             npx ruv-swarm github handle-comment \
               --pr ${{ github.event.pull_request.number }} \
-              --comment "${{ github.event.comment.body }}"
+              --comment-file "$COMMENT_BODY_FILE"
           fi
+          rm -f "$COMMENT_BODY_FILE"
 ```
 
 ## PR Label Integration
@@ -295,11 +298,11 @@ When using with Claude Code:
 ```bash
 # Initialize PR-specific swarm with intelligent topology selection
 mcp__claude-flow__swarm_init { topology: "mesh", maxAgents: 8 }
-mcp__claude-flow__agent_spawn { type: "coordinator", name: "PR Coordinator" }
-mcp__claude-flow__agent_spawn { type: "reviewer", name: "Code Reviewer" }
-mcp__claude-flow__agent_spawn { type: "tester", name: "Test Engineer" }
-mcp__claude-flow__agent_spawn { type: "analyst", name: "Impact Analyzer" }
-mcp__claude-flow__agent_spawn { type: "optimizer", name: "Performance Optimizer" }
+mcp__claude-flow__agent_spawn { agentType: "coordinator", name: "PR Coordinator" }
+mcp__claude-flow__agent_spawn { agentType: "reviewer", name: "Code Reviewer" }
+mcp__claude-flow__agent_spawn { agentType: "tester", name: "Test Engineer" }
+mcp__claude-flow__agent_spawn { agentType: "analyst", name: "Impact Analyzer" }
+mcp__claude-flow__agent_spawn { agentType: "optimizer", name: "Performance Optimizer" }
 
 # Store PR context for swarm coordination
 mcp__claude-flow__memory_usage {

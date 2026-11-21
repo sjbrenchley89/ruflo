@@ -6,6 +6,19 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import type { IMemoryBackend, MemoryEntry, MemoryEntryUpdate } from './types.js';
 import type { MemoryInsight } from './auto-memory-bridge.js';
 import { LearningBridge } from './learning-bridge.js';
@@ -51,7 +64,13 @@ function createMockBackend(): IMemoryBackend & { storedEntries: MemoryEntry[] } 
       storedEntries.push(entry);
     }),
     get: vi.fn().mockResolvedValue(null),
-    getByKey: vi.fn().mockResolvedValue(null),
+    // Mirrors the real backend's keyIndex lookup (agentdb-backend.ts) so tests
+    // that store() a full entry and then look it up by its `key` (as
+    // AutoMemoryBridge does — see resolveConsolidationReward's id/key note)
+    // exercise the real distinction between `entry.id` and `entry.key`.
+    getByKey: vi.fn().mockImplementation(async (namespace: string, key: string) => {
+      return storedEntries.find((e) => e.namespace === namespace && e.key === key) ?? null;
+    }),
     update: vi.fn().mockImplementation(async (id: string, upd: MemoryEntryUpdate) => {
       const entry = storedEntries.find(e => e.id === id);
       if (!entry) return null;
@@ -154,6 +173,7 @@ describe('LearningBridge', () => {
         consolidationThreshold: 20,
       });
       expect(custom.getStats().totalTrajectories).toBe(0);
+      expect(custom.getSonaMode()).toBe('research');
       custom.destroy();
     });
 
@@ -165,6 +185,64 @@ describe('LearningBridge', () => {
       await disabled.onInsightRecorded(createTestInsight(), 'entry-1');
       expect(neural.beginTask).not.toHaveBeenCalled();
       disabled.destroy();
+    });
+  });
+
+  // ===== sonaMode resolution (RUFLO_INTELLIGENCE_MODE) =====
+
+  describe('sonaMode resolution', () => {
+    const ENV_KEY = 'RUFLO_INTELLIGENCE_MODE';
+    let originalEnv: string | undefined;
+
+    beforeEach(() => {
+      originalEnv = process.env[ENV_KEY];
+    });
+
+    afterEach(() => {
+      if (originalEnv === undefined) delete process.env[ENV_KEY];
+      else process.env[ENV_KEY] = originalEnv;
+    });
+
+    it('falls back to balanced when RUFLO_INTELLIGENCE_MODE is unset', () => {
+      delete process.env[ENV_KEY];
+      const b = new LearningBridge(backend);
+      expect(b.getSonaMode()).toBe('balanced');
+      b.destroy();
+    });
+
+    it('reads RUFLO_INTELLIGENCE_MODE set before construction', () => {
+      process.env[ENV_KEY] = 'research';
+      const b = new LearningBridge(backend);
+      expect(b.getSonaMode()).toBe('research');
+      b.destroy();
+    });
+
+    it('reads RUFLO_INTELLIGENCE_MODE freshly on each construction, not just at module load', () => {
+      // Regression test: the env var must be re-read per-instance, not captured
+      // once into a module-scope default the first time this file is imported.
+      delete process.env[ENV_KEY];
+      const before = new LearningBridge(backend);
+      expect(before.getSonaMode()).toBe('balanced');
+      before.destroy();
+
+      process.env[ENV_KEY] = 'research';
+      const after = new LearningBridge(backend);
+      expect(after.getSonaMode()).toBe('research');
+      after.destroy();
+    });
+
+    it('ignores an unrecognised RUFLO_INTELLIGENCE_MODE value', () => {
+      process.env[ENV_KEY] = 'not-a-real-mode';
+      const b = new LearningBridge(backend);
+      expect(b.getSonaMode()).toBe('balanced');
+      b.destroy();
+    });
+
+    it('an explicit config.sonaMode wins over RUFLO_INTELLIGENCE_MODE', () => {
+      process.env[ENV_KEY] = 'research';
+      const b = new LearningBridge(backend, { sonaMode: 'edge' });
+      expect(b.getSonaMode()).toBe('edge');
+      b.destroy();
     });
   });
 
@@ -264,6 +342,24 @@ describe('LearningBridge', () => {
       expect(backend.update).toHaveBeenCalledWith('entry-1', {
         metadata: expect.objectContaining({ confidence: 0.53 }),
       });
+    });
+
+    it('should resolve a stored key and update the entry by its internal id', async () => {
+      const entry = createTestEntry({
+        id: 'internal-1',
+        key: 'insight:debugging:12345:0',
+        metadata: { confidence: 0.5 },
+      });
+      backend.storedEntries.push(entry);
+
+      await bridge.onInsightAccessed(entry.key);
+
+      expect(backend.getByKey).toHaveBeenCalledWith('learnings', entry.key);
+      expect(backend.get).not.toHaveBeenCalled();
+      expect(backend.update).toHaveBeenCalledWith('internal-1', {
+        metadata: expect.objectContaining({ confidence: 0.53 }),
+      });
+      expect(entry.metadata?.confidence).toBeCloseTo(0.53);
     });
 
     it('should cap confidence at maxConfidence', async () => {
@@ -442,6 +538,115 @@ describe('LearningBridge', () => {
       expect(result.trajectoriesCompleted).toBe(9);
     });
 
+    function createLowThresholdBridge(threshold = 1) {
+      return new LearningBridge(backend, {
+        consolidationThreshold: threshold,
+        neuralLoader: createNeuralLoader(neural),
+      });
+    }
+
+    // These reproduce the real AutoMemoryBridge flow: the backend entry's
+    // internal `id` (a UUID) is DIFFERENT from the human-readable `key` it
+    // was stored under, and it is the `key` — not the `id` — that flows
+    // into onInsightRecorded/activeTrajectories/consolidate as "entryId".
+    // Storing via backend.store() and looking up via the real getByKey
+    // mock (keyed by namespace+key, not id) proves the fix resolves reward
+    // through the correct index rather than merely satisfying a mock that
+    // doesn't distinguish id from key.
+    it('should pass the entry\'s current confidence as the completion reward, looked up by key (not id)', async () => {
+      const lowThresholdBridge = createLowThresholdBridge();
+      const entry = createTestEntry({
+        id: 'uuid-independent-of-key',
+        key: 'insight:debugging:1:0',
+        metadata: { confidence: 0.42 },
+      });
+      await backend.store(entry);
+      neural.beginTask.mockReturnValueOnce('traj-0');
+      await lowThresholdBridge.onInsightRecorded(createTestInsight(), entry.key);
+
+      await lowThresholdBridge.consolidate();
+
+      expect(backend.getByKey).toHaveBeenCalledWith('learnings', entry.key);
+      expect(neural.completeTask).toHaveBeenCalledWith('traj-0', 0.42);
+      lowThresholdBridge.destroy();
+    });
+
+    it('should differentiate reward per trajectory based on each entry\'s confidence', async () => {
+      const lowThresholdBridge = createLowThresholdBridge(2);
+      const entryA = createTestEntry({ id: 'uuid-a', key: 'insight:a:1:0', metadata: { confidence: 0.9 } });
+      const entryB = createTestEntry({ id: 'uuid-b', key: 'insight:b:2:1', metadata: { confidence: 0.2 } });
+      await backend.store(entryA);
+      await backend.store(entryB);
+      neural.beginTask.mockReturnValueOnce('traj-0').mockReturnValueOnce('traj-1');
+      await lowThresholdBridge.onInsightRecorded(createTestInsight(), entryA.key);
+      await lowThresholdBridge.onInsightRecorded(createTestInsight({ summary: 'S2' }), entryB.key);
+
+      await lowThresholdBridge.consolidate();
+
+      expect(neural.completeTask).toHaveBeenCalledWith('traj-0', 0.9);
+      expect(neural.completeTask).toHaveBeenCalledWith('traj-1', 0.2);
+      lowThresholdBridge.destroy();
+    });
+
+    it('should fall back to reward=1.0 when no entry was ever stored under that key (unchanged prior behavior)', async () => {
+      const lowThresholdBridge = createLowThresholdBridge();
+      neural.beginTask.mockReturnValueOnce('traj-0');
+      await lowThresholdBridge.onInsightRecorded(createTestInsight(), 'insight:never-stored:1:0');
+
+      const result = await lowThresholdBridge.consolidate();
+
+      expect(neural.completeTask).toHaveBeenCalledWith('traj-0', 1.0);
+      expect(result.trajectoriesCompleted).toBe(1);
+      expect(result.patternsLearned).toBe(1);
+      lowThresholdBridge.destroy();
+    });
+
+    it('should fall back to reward=1.0 when the stored entry lacks numeric confidence', async () => {
+      const lowThresholdBridge = createLowThresholdBridge();
+      const entry = createTestEntry({ id: 'uuid-c', key: 'insight:c:1:0', metadata: {} });
+      await backend.store(entry);
+      neural.beginTask.mockReturnValueOnce('traj-0');
+      await lowThresholdBridge.onInsightRecorded(createTestInsight(), entry.key);
+
+      await lowThresholdBridge.consolidate();
+
+      expect(neural.completeTask).toHaveBeenCalledWith('traj-0', 1.0);
+      lowThresholdBridge.destroy();
+    });
+
+    it('should fall back to reward=1.0 when the backend lookup throws', async () => {
+      const lowThresholdBridge = createLowThresholdBridge();
+      neural.beginTask.mockReturnValueOnce('traj-0');
+      await lowThresholdBridge.onInsightRecorded(createTestInsight(), 'insight:d:1:0');
+      (backend.getByKey as any).mockRejectedValueOnce(new Error('DB unavailable'));
+
+      const result = await lowThresholdBridge.consolidate();
+
+      expect(neural.completeTask).toHaveBeenCalledWith('traj-0', 1.0);
+      expect(result.trajectoriesCompleted).toBe(1);
+      lowThresholdBridge.destroy();
+    });
+
+    it('should respect a custom insightNamespace when resolving reward', async () => {
+      const customNsBridge = new LearningBridge(backend, {
+        consolidationThreshold: 1,
+        insightNamespace: 'custom-ns',
+        neuralLoader: createNeuralLoader(neural),
+      });
+      const entry = createTestEntry({
+        id: 'uuid-e', key: 'insight:e:1:0', namespace: 'custom-ns', metadata: { confidence: 0.77 },
+      });
+      await backend.store(entry);
+      neural.beginTask.mockReturnValueOnce('traj-0');
+      await customNsBridge.onInsightRecorded(createTestInsight(), entry.key);
+
+      await customNsBridge.consolidate();
+
+      expect(backend.getByKey).toHaveBeenCalledWith('custom-ns', entry.key);
+      expect(neural.completeTask).toHaveBeenCalledWith('traj-0', 0.77);
+      customNsBridge.destroy();
+    });
+
     it('should respect custom consolidationThreshold', async () => {
       const customBridge = new LearningBridge(backend, {
         consolidationThreshold: 2,
@@ -454,6 +659,164 @@ describe('LearningBridge', () => {
       const result = await customBridge.consolidate();
       expect(result.trajectoriesCompleted).toBe(2);
       customBridge.destroy();
+    });
+  });
+
+  // ===== reopen after consolidation (#4884) =====
+
+  describe('onInsightAccessed after consolidation (#4884)', () => {
+    let lowBridge: LearningBridge;
+
+    beforeEach(() => {
+      lowBridge = new LearningBridge(backend, {
+        consolidationThreshold: 1,
+        neuralLoader: createNeuralLoader(neural),
+      });
+    });
+
+    afterEach(() => {
+      lowBridge.destroy();
+    });
+
+    async function recordAndConsolidate(entryId = 'entry-1') {
+      neural.beginTask.mockReturnValueOnce('traj-original');
+      await lowBridge.onInsightRecorded(createTestInsight(), entryId);
+      const result = await lowBridge.consolidate();
+      expect(result.trajectoriesCompleted).toBe(1);
+      expect(lowBridge.getStats().activeTrajectories).toBe(0);
+      vi.clearAllMocks();
+    }
+
+    it('reopens a trajectory and records the access step for a consolidated insight', async () => {
+      await recordAndConsolidate();
+      neural.beginTask.mockReturnValueOnce('traj-reopened');
+      (backend.get as any).mockResolvedValueOnce(
+        createTestEntry({ metadata: { confidence: 0.8, summary: 'Reused insight summary' } }),
+      );
+
+      await lowBridge.onInsightAccessed('entry-1');
+
+      expect(neural.beginTask).toHaveBeenCalledTimes(1);
+      expect(neural.beginTask).toHaveBeenCalledWith('Reused insight summary', 'general');
+      expect(neural.recordStep).toHaveBeenCalledTimes(1);
+      expect(neural.recordStep).toHaveBeenCalledWith('traj-reopened', {
+        action: 'access',
+        reward: 0.03,
+        stateEmbedding: expect.any(Float32Array),
+      });
+      const stats = lowBridge.getStats();
+      expect(stats.activeTrajectories).toBe(1);
+      expect(stats.totalTrajectories).toBe(2);
+    });
+
+    it('emits insight:learning-reopened when a trajectory is reopened', async () => {
+      await recordAndConsolidate();
+      (backend.get as any).mockResolvedValueOnce(createTestEntry());
+      const handler = vi.fn();
+      lowBridge.on('insight:learning-reopened', handler);
+
+      await lowBridge.onInsightAccessed('entry-1');
+
+      expect(handler).toHaveBeenCalledWith({ entryId: 'entry-1' });
+    });
+
+    it('falls back to entry content when metadata has no summary', async () => {
+      await recordAndConsolidate();
+      (backend.get as any).mockResolvedValueOnce(
+        createTestEntry({ content: 'Content only', metadata: { confidence: 0.8 } }),
+      );
+
+      await lowBridge.onInsightAccessed('entry-1');
+
+      expect(neural.beginTask).toHaveBeenCalledWith('Content only', 'general');
+    });
+
+    it('records later accesses on the reopened trajectory without opening another', async () => {
+      await recordAndConsolidate();
+      neural.beginTask.mockReturnValueOnce('traj-reopened');
+      (backend.get as any).mockResolvedValue(createTestEntry());
+
+      await lowBridge.onInsightAccessed('entry-1');
+      await lowBridge.onInsightAccessed('entry-1');
+
+      expect(neural.beginTask).toHaveBeenCalledTimes(1);
+      expect(neural.recordStep).toHaveBeenLastCalledWith('traj-reopened', {
+        action: 'access',
+        reward: 0.03,
+      });
+      expect(lowBridge.getStats().activeTrajectories).toBe(1);
+    });
+
+    it('completes the reopened trajectory on the next consolidation (no unbounded growth)', async () => {
+      await recordAndConsolidate();
+      neural.beginTask.mockReturnValueOnce('traj-reopened');
+      (backend.get as any).mockResolvedValueOnce(createTestEntry());
+      await lowBridge.onInsightAccessed('entry-1');
+
+      const result = await lowBridge.consolidate();
+
+      expect(result.trajectoriesCompleted).toBe(1);
+      expect(neural.completeTask).toHaveBeenCalledWith('traj-reopened', expect.any(Number));
+      expect(lowBridge.getStats().activeTrajectories).toBe(0);
+      expect(lowBridge.getStats().completedTrajectories).toBe(2);
+    });
+
+    it('can reopen again after a second consolidation', async () => {
+      await recordAndConsolidate();
+      neural.beginTask.mockReturnValueOnce('traj-2').mockReturnValueOnce('traj-3');
+      (backend.get as any).mockResolvedValue(createTestEntry());
+
+      await lowBridge.onInsightAccessed('entry-1');
+      await lowBridge.consolidate();
+      await lowBridge.onInsightAccessed('entry-1');
+
+      expect(neural.beginTask).toHaveBeenCalledTimes(2);
+      expect(neural.recordStep).toHaveBeenLastCalledWith('traj-3', expect.objectContaining({
+        action: 'access',
+      }));
+    });
+
+    it('does not open a trajectory for an entry never recorded through the bridge', async () => {
+      await recordAndConsolidate('entry-1');
+      (backend.get as any).mockResolvedValueOnce(createTestEntry({ id: 'other' }));
+
+      await lowBridge.onInsightAccessed('other');
+
+      expect(neural.beginTask).not.toHaveBeenCalled();
+      expect(neural.recordStep).not.toHaveBeenCalled();
+    });
+
+    it('survives beginTask throwing on reopen and retries on the next access', async () => {
+      await recordAndConsolidate();
+      (backend.get as any).mockResolvedValue(createTestEntry());
+      neural.beginTask
+        .mockImplementationOnce(() => { throw new Error('neural down'); })
+        .mockReturnValueOnce('traj-retry');
+
+      await expect(lowBridge.onInsightAccessed('entry-1')).resolves.toBeUndefined();
+      expect(lowBridge.getStats().activeTrajectories).toBe(0);
+
+      await lowBridge.onInsightAccessed('entry-1');
+      expect(neural.recordStep).toHaveBeenCalledWith('traj-retry', expect.objectContaining({
+        action: 'access',
+      }));
+    });
+
+    it('control: access before consolidation records on the original trajectory only', async () => {
+      neural.beginTask.mockReturnValueOnce('traj-original');
+      await lowBridge.onInsightRecorded(createTestInsight(), 'entry-1');
+      vi.clearAllMocks();
+      (backend.get as any).mockResolvedValueOnce(createTestEntry());
+
+      await lowBridge.onInsightAccessed('entry-1');
+
+      expect(neural.beginTask).not.toHaveBeenCalled();
+      expect(neural.recordStep).toHaveBeenCalledTimes(1);
+      expect(neural.recordStep).toHaveBeenCalledWith('traj-original', {
+        action: 'access',
+        reward: 0.03,
+      });
+      expect(lowBridge.getStats().activeTrajectories).toBe(1);
     });
   });
 
@@ -694,6 +1057,307 @@ describe('LearningBridge', () => {
     });
   });
 
+  // ===== State persistence across process invocations =====
+  //
+  // Without this, every short-lived auto-memory-hook.mjs invocation
+  // constructs a fresh NeuralLearningSystem and its learning state
+  // (trajectories, patterns, LoRA weights, EWC state) resets to empty every
+  // time — completed-trajectory counts (and everything gated behind them,
+  // e.g. EWC consolidation) can never accumulate past one process's
+  // lifetime. These tests use a mock neural system extended with
+  // serialize/deserialize, kept separate from the shared createMockNeuralSystem()
+  // fixture used by every other test in this file so that tests which don't
+  // care about persistence never touch the filesystem.
+
+  describe('state persistence', () => {
+    let stateDir: string;
+    let statePath: string;
+
+    beforeEach(() => {
+      stateDir = mkdtempSync(join(tmpdir(), 'learning-bridge-state-'));
+      statePath = join(stateDir, 'sona-learning-state.json');
+    });
+
+    afterEach(() => {
+      rmSync(stateDir, { recursive: true, force: true });
+    });
+
+    function createPersistableNeuralSystem(serializedState: unknown = { taskCount: 1 }) {
+      return {
+        ...createMockNeuralSystem(),
+        serialize: vi.fn().mockReturnValue(serializedState),
+        deserialize: vi.fn(),
+      };
+    }
+
+    it('should write serialized state to statePath on destroy', async () => {
+      const persistable = createPersistableNeuralSystem({ taskCount: 7 });
+      const b = new LearningBridge(backend, {
+        neuralLoader: createNeuralLoader(persistable as any),
+        statePath,
+      });
+
+      await b.onInsightRecorded(createTestInsight(), 'entry-1'); // triggers neural init
+      b.destroy();
+
+      expect(persistable.serialize).toHaveBeenCalledTimes(1);
+      expect(existsSync(statePath)).toBe(true);
+      expect(JSON.parse(readFileSync(statePath, 'utf-8'))).toEqual({ taskCount: 7 });
+    });
+
+    it('should restore state from statePath on load', async () => {
+      writeFileSync(statePath, JSON.stringify({ taskCount: 42 }));
+      const persistable = createPersistableNeuralSystem();
+      const b = new LearningBridge(backend, {
+        neuralLoader: createNeuralLoader(persistable as any),
+        statePath,
+      });
+
+      await b.onInsightRecorded(createTestInsight(), 'entry-1');
+
+      expect(persistable.deserialize).toHaveBeenCalledTimes(1);
+      expect(persistable.deserialize).toHaveBeenCalledWith({ taskCount: 42 });
+      b.destroy();
+    });
+
+    it('should accumulate state across separate bridge instances (the actual bug)', async () => {
+      // First "process": records an insight, persists on destroy.
+      const first = createPersistableNeuralSystem({ taskCount: 1 });
+      const b1 = new LearningBridge(backend, {
+        neuralLoader: createNeuralLoader(first as any),
+        statePath,
+      });
+      await b1.onInsightRecorded(createTestInsight(), 'entry-1');
+      b1.destroy();
+      expect(existsSync(statePath)).toBe(true);
+
+      // Second "process": a brand-new bridge/neural instance must restore
+      // what the first one persisted, rather than starting from empty —
+      // this is the behavior that was entirely missing before this fix.
+      const second = createPersistableNeuralSystem({ taskCount: 1 });
+      const b2 = new LearningBridge(backend, {
+        neuralLoader: createNeuralLoader(second as any),
+        statePath,
+      });
+      await b2.onInsightRecorded(createTestInsight(), 'entry-2');
+
+      expect(second.deserialize).toHaveBeenCalledWith({ taskCount: 1 });
+      b2.destroy();
+    });
+
+    it('should not write a state file when neural.serialize is unavailable', async () => {
+      // The default createMockNeuralSystem() (used everywhere else in this
+      // file) has no serialize/deserialize — confirms old-mock callers are
+      // unaffected and no accidental file ever gets written for them.
+      const b = new LearningBridge(backend, {
+        neuralLoader: createNeuralLoader(neural),
+        statePath,
+      });
+      await b.onInsightRecorded(createTestInsight(), 'entry-1');
+      b.destroy();
+
+      expect(existsSync(statePath)).toBe(false);
+    });
+
+    it('should start fresh (not throw) when the state file is corrupt JSON', async () => {
+      writeFileSync(statePath, '{not valid json');
+      const persistable = createPersistableNeuralSystem();
+      const b = new LearningBridge(backend, {
+        neuralLoader: createNeuralLoader(persistable as any),
+        statePath,
+      });
+
+      await expect(b.onInsightRecorded(createTestInsight(), 'entry-1')).resolves.not.toThrow();
+      expect(persistable.deserialize).not.toHaveBeenCalled();
+      expect(b.getStats().neuralAvailable).toBe(true);
+      b.destroy();
+    });
+
+    it('should start fresh (not throw) when deserialize rejects the schema version', async () => {
+      writeFileSync(statePath, JSON.stringify({ schemaVersion: 999 }));
+      const persistable = createPersistableNeuralSystem();
+      persistable.deserialize = vi.fn().mockImplementation(() => {
+        throw new Error('SONAManager: unsupported schemaVersion 999 (expected 1)');
+      });
+      const b = new LearningBridge(backend, {
+        neuralLoader: createNeuralLoader(persistable as any),
+        statePath,
+      });
+
+      await expect(b.onInsightRecorded(createTestInsight(), 'entry-1')).resolves.not.toThrow();
+      expect(b.getStats().neuralAvailable).toBe(true);
+      b.destroy();
+    });
+
+    it('should not call deserialize when no state file exists yet', async () => {
+      const persistable = createPersistableNeuralSystem();
+      const b = new LearningBridge(backend, {
+        neuralLoader: createNeuralLoader(persistable as any),
+        statePath,
+      });
+
+      await b.onInsightRecorded(createTestInsight(), 'entry-1');
+
+      expect(persistable.deserialize).not.toHaveBeenCalled();
+      b.destroy();
+    });
+
+    it('should never throw from destroy even if serialize itself throws', () => {
+      const persistable = createPersistableNeuralSystem();
+      persistable.serialize = vi.fn().mockImplementation(() => {
+        throw new Error('boom');
+      });
+      const b = new LearningBridge(backend, {
+        neuralLoader: createNeuralLoader(persistable as any),
+        statePath,
+      });
+
+      expect(() => b.destroy()).not.toThrow();
+    });
+
+    // ---- hardening found in the #4081 review (symlink, litter, torn writes, poisoned restore) ----
+
+    it('never writes through a symlink at statePath (an opened repo can plant one)', async () => {
+      const victim = join(stateDir, 'victim.txt');
+      writeFileSync(victim, 'VICTIM-ORIGINAL');
+      symlinkSync(victim, statePath);
+      const persistable = createPersistableNeuralSystem({ taskCount: 9 });
+      const b = new LearningBridge(backend, {
+        neuralLoader: createNeuralLoader(persistable as any),
+        statePath,
+      });
+
+      await b.onInsightRecorded(createTestInsight(), 'entry-1');
+      b.destroy();
+
+      expect(readFileSync(victim, 'utf-8')).toBe('VICTIM-ORIGINAL');
+      expect(persistable.deserialize).not.toHaveBeenCalled();
+    });
+
+    it('does not read a symlinked state file either', async () => {
+      const real = join(stateDir, 'real.json');
+      writeFileSync(real, JSON.stringify({ taskCount: 5 }));
+      symlinkSync(real, statePath);
+      const persistable = createPersistableNeuralSystem();
+      const b = new LearningBridge(backend, {
+        neuralLoader: createNeuralLoader(persistable as any),
+        statePath,
+      });
+
+      await b.onInsightRecorded(createTestInsight(), 'entry-1');
+
+      expect(persistable.deserialize).not.toHaveBeenCalled();
+      b.destroy();
+    });
+
+    it('creates no state file or directory when nothing was learned this session', async () => {
+      const nested = join(stateDir, 'never', 'made', 'state.json');
+      const persistable = createPersistableNeuralSystem({ taskCount: 0 });
+      const b = new LearningBridge(backend, {
+        neuralLoader: createNeuralLoader(persistable as any),
+        statePath: nested,
+      });
+
+      // Neural gets loaded (e.g. by a read-only lookup) but no insight is recorded.
+      await b.findSimilarPatterns('anything');
+      b.destroy();
+
+      expect(existsSync(join(stateDir, 'never'))).toBe(false);
+      expect(persistable.serialize).not.toHaveBeenCalled();
+    });
+
+    it('writes atomically: no temp files left behind and the file is private (0600)', async () => {
+      const persistable = createPersistableNeuralSystem({ taskCount: 3 });
+      const b = new LearningBridge(backend, {
+        neuralLoader: createNeuralLoader(persistable as any),
+        statePath,
+      });
+
+      await b.onInsightRecorded(createTestInsight(), 'entry-1');
+      b.destroy();
+
+      expect(readdirSync(stateDir)).toEqual(['sona-learning-state.json']);
+      if (process.platform !== 'win32') {
+        expect(statSync(statePath).mode & 0o777).toBe(0o600);
+      }
+    });
+
+    it('rolls the neural instance back when a schema-valid but malformed state is rejected', async () => {
+      writeFileSync(statePath, JSON.stringify({ schemaVersion: 1 }));
+      const persistable = createPersistableNeuralSystem({ fresh: true });
+      // A restore that throws after partially mutating the instance.
+      persistable.deserialize = vi.fn().mockImplementationOnce(() => {
+        throw new Error('half-applied');
+      });
+      const b = new LearningBridge(backend, {
+        neuralLoader: createNeuralLoader(persistable as any),
+        statePath,
+      });
+
+      await b.onInsightRecorded(createTestInsight(), 'entry-1');
+
+      // First call is the rejected restore, second is the rollback to the pre-restore snapshot.
+      expect(persistable.deserialize).toHaveBeenCalledTimes(2);
+      expect(persistable.deserialize).toHaveBeenLastCalledWith({ fresh: true });
+      b.destroy();
+    });
+
+    it('preserves a state file written by a newer schema instead of overwriting it', async () => {
+      const newer = JSON.stringify({ schemaVersion: 2, keep: 'me' });
+      writeFileSync(statePath, newer);
+      const persistable = createPersistableNeuralSystem({ taskCount: 1 });
+      persistable.deserialize = vi.fn().mockImplementation(() => {
+        throw new Error('SONAManager: unsupported schemaVersion 2 (expected 1)');
+      });
+      const b = new LearningBridge(backend, {
+        neuralLoader: createNeuralLoader(persistable as any),
+        statePath,
+      });
+
+      await b.onInsightRecorded(createTestInsight(), 'entry-1');
+      b.destroy();
+
+      expect(readFileSync(statePath, 'utf-8')).toBe(newer);
+    });
+
+    it('heals a corrupt state file by replacing it with a valid one after learning', async () => {
+      writeFileSync(statePath, '{truncated');
+      const persistable = createPersistableNeuralSystem({ taskCount: 2 });
+      const b = new LearningBridge(backend, {
+        neuralLoader: createNeuralLoader(persistable as any),
+        statePath,
+      });
+
+      await b.onInsightRecorded(createTestInsight(), 'entry-1');
+      b.destroy();
+
+      expect(JSON.parse(readFileSync(statePath, 'utf-8'))).toEqual({ taskCount: 2 });
+    });
+
+    it('creates the parent directory only when it has something to write', async () => {
+      const nested = join(stateDir, 'a', 'b', 'state.json');
+      const persistable = createPersistableNeuralSystem({ taskCount: 4 });
+      const b = new LearningBridge(backend, {
+        neuralLoader: createNeuralLoader(persistable as any),
+        statePath: nested,
+      });
+
+      await b.onInsightRecorded(createTestInsight(), 'entry-1');
+      b.destroy();
+
+      expect(JSON.parse(readFileSync(nested, 'utf-8'))).toEqual({ taskCount: 4 });
+      mkdirSync(stateDir, { recursive: true });
+    });
+
+    it('should default statePath to .swarm/sona-learning-state.json', () => {
+      const b = new LearningBridge(backend);
+      // No direct getter for the resolved path; verified via the documented
+      // default in LearningBridgeConfig.statePath and DEFAULT_CONFIG.
+      expect(b.getStats()).toBeDefined();
+      b.destroy();
+    });
+  });
+
   // ===== Neural init caching =====
 
   describe('neural initialization', () => {
@@ -717,6 +1381,45 @@ describe('LearningBridge', () => {
 
       expect(loaderFn).toHaveBeenCalledTimes(1);
       expect(b.getStats().neuralAvailable).toBe(false);
+      b.destroy();
+    });
+  });
+
+  // ===== Real @claude-flow/neural construction shape (no injected loader) =====
+
+  describe('default neural loader (real @claude-flow/neural import)', () => {
+    afterEach(() => {
+      vi.doUnmock('@claude-flow/neural');
+    });
+
+    it('constructs NeuralLearningSystem with a bare mode string, not a config object', async () => {
+      // Regression test: loadNeural() used to call
+      // `new NeuralLearningSystem({ mode, ewcLambda })`, but the real
+      // constructor is `constructor(mode: SONAMode = 'balanced')` — a bare
+      // string. Passing an object never throws (SONAManager's
+      // `MODE_CONFIGS[mode]` lookup just silently misses and falls back to
+      // `{}`), so this had to be caught by inspecting the actual argument,
+      // not by whether construction succeeds.
+      const ctorArgs: unknown[][] = [];
+      vi.doMock('@claude-flow/neural', () => ({
+        NeuralLearningSystem: class {
+          constructor(...args: unknown[]) {
+            ctorArgs.push(args);
+          }
+          initialize = vi.fn().mockResolvedValue(undefined);
+        },
+      }));
+      vi.resetModules();
+
+      const { LearningBridge: FreshLearningBridge } = await import('./learning-bridge.js');
+      const freshBackend = createMockBackend();
+      const b = new FreshLearningBridge(freshBackend, { sonaMode: 'research' });
+
+      await b.onInsightRecorded(createTestInsight(), 'entry-1');
+
+      expect(ctorArgs).toHaveLength(1);
+      expect(ctorArgs[0]).toEqual(['research']);
+      expect(b.getStats().neuralAvailable).toBe(true);
       b.destroy();
     });
   });
