@@ -1,0 +1,212 @@
+/**
+ * Self-running daemon (auto-start).
+ *
+ * The self-optimizing loop's workers (distillation, backup, and the future
+ * evolve worker) are inert unless the daemon runs — but it required a manual
+ * `ruflo daemon start`. This ensures a daemon is running on CLI use, SAFELY:
+ *
+ *   - single-instance: only starts when no live daemon holds the pidfile, and
+ *     the spawned `daemon start` independently enforces single-instance via its
+ *     own lock + checkExistingDaemon() — so a race spawns at most one survivor,
+ *   - bounded lifetime: the daemon self-terminates on TTL/idle (12h hard TTL,
+ *     30m idle default; RUFLO_DAEMON_TTL_SECS / RUFLO_DAEMON_IDLE_SECS) —
+ *     auto-start never means "runs forever",
+ *   - opt-out: RUFLO_DAEMON_AUTOSTART=0|false|no disables it entirely, OR a
+ *     project-local `daemon.autostart: false` in claude-flow.config.json —
+ *     the file-based opt-out exists because the env var only reaches a
+ *     process that inherited it. A non-interactive shell (cron, CI, many
+ *     tool-invoked shells — bash skips ~/.bashrc entirely for these; see
+ *     its own `case $- in *i*) ;; *) return;; esac` guard) never re-sources
+ *     a shell rc file per invocation, so `export RUFLO_DAEMON_AUTOSTART=0`
+ *     in one such shell does NOT persist to the next one. A project config
+ *     field has no such gap — it's read fresh from disk every time,
+ *     independent of which shell (or whether any shell at all) launched
+ *     the command,
+ *   - cheap: a pidfile read + a signal-0 liveness check on the fast path,
+ *   - best-effort + silent: never blocks or fails a command.
+ *
+ * Reuses `daemon start` verbatim (all its lock/TTL/worker machinery) — this
+ * module only decides WHETHER to spawn, never reimplements the daemon.
+ */
+import * as fs from 'fs';
+import * as path from 'path';
+import { spawn } from 'child_process';
+import { isRufloProject, resolveProjectRoot } from './project-root.js';
+
+/** True if a live daemon already holds the project's pidfile. */
+export function isDaemonAlive(projectRoot: string): boolean {
+  const pidFile = path.join(projectRoot, '.claude-flow', 'daemon.pid');
+  try {
+    if (!fs.existsSync(pidFile)) return false;
+    const pid = parseInt(fs.readFileSync(pidFile, 'utf-8').trim(), 10);
+    if (Number.isNaN(pid) || pid === process.pid) return false;
+    process.kill(pid, 0); // signal 0 = existence check
+    return true;
+  } catch {
+    // Dead process → stale pidfile. Clean it so `daemon start` proceeds cleanly.
+    try { fs.unlinkSync(pidFile); } catch { /* ignore */ }
+    return false;
+  }
+}
+
+/** Project-local opt-out: `{ "daemon": { "autostart": false } }` in claude-flow.config.json. */
+function autostartDisabledByProjectConfig(projectRoot: string): boolean {
+  // #3278: read BOTH files, and both spellings.
+  //
+  // This used to consult only `claude-flow.config.json` with the key
+  // `daemon.autostart`. But `init` generates `.claude/settings.json` with
+  // `claudeFlow.daemon.autoStart` — a different file and a different capital S —
+  // and writes it `false` under the comment "Opt-in only — prevents unintended
+  // token consumption (#1427, #1330)". So the one setting a fresh project
+  // actually ships was never read, and the runtime spent tokens the generated
+  // config existed to prevent. Accept either spelling in either file: a user who
+  // wrote the word "autostart: false" anywhere sensible meant it.
+  const readsFalse = (v: unknown) => v === false;
+  for (const [file, pick] of [
+    ['claude-flow.config.json', (c: any) => c?.daemon],
+    [path.join('.claude', 'settings.json'), (c: any) => c?.claudeFlow?.daemon],
+  ] as const) {
+    try {
+      const cfg = JSON.parse(fs.readFileSync(path.join(projectRoot, file), 'utf-8'));
+      const d = pick(cfg);
+      if (readsFalse(d?.autostart) || readsFalse(d?.autoStart)) return true;
+    } catch {
+      // absent/malformed config = this file says nothing; keep checking the others
+    }
+  }
+  return false;
+}
+
+/**
+ * #4654: an explicit `daemon stop` is an opt-out that must survive the next
+ * hook. Every ruflo-core plugin hook (PreToolUse/PostToolUse, PreCompact, Stop)
+ * runs the CLI, and the CLI auto-starts a daemon whenever none is alive, so a
+ * stopped daemon came back within minutes. `daemon stop` now writes this
+ * marker, auto-start honours it, and only an explicit `daemon start` clears it.
+ */
+export const DAEMON_STOP_MARKER = 'daemon.stopped';
+
+/**
+ * Set on the daemon that auto-start spawns, so that spawned `daemon start` does
+ * not clear a stop marker written after auto-start checked it (a `daemon stop`
+ * racing a hook). Only a user-driven start clears the marker.
+ */
+export const AUTOSTART_ENV = 'RUFLO_DAEMON_AUTOSTARTED';
+
+function stopMarkerPath(projectRoot: string): string {
+  return path.join(projectRoot, '.claude-flow', DAEMON_STOP_MARKER);
+}
+
+/** True if the user explicitly stopped the daemon for this project (#4654). */
+export function isDaemonStopMarked(projectRoot: string): boolean {
+  try { return fs.existsSync(stopMarkerPath(projectRoot)); } catch { return false; }
+}
+
+/**
+ * Record an explicit `daemon stop` (#4654). Writes only into a directory that is
+ * already a Ruflo project or already has `.claude-flow/`, so `daemon stop` in an
+ * unrelated directory does not litter it. Best-effort; never throws.
+ */
+export function writeDaemonStopMarker(projectRoot: string): boolean {
+  try {
+    const dir = path.join(projectRoot, '.claude-flow');
+    if (!fs.existsSync(dir) && !isRufloProject(projectRoot)) return false;
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(
+      stopMarkerPath(projectRoot),
+      JSON.stringify({ stoppedAt: new Date().toISOString(), pid: process.pid }) + '\n',
+    );
+    return true;
+  } catch { return false; }
+}
+
+/** Clear the stop marker. Called by an explicit `daemon start` (#4654). Never throws. */
+export function clearDaemonStopMarker(projectRoot: string): void {
+  try { fs.unlinkSync(stopMarkerPath(projectRoot)); } catch { /* absent */ }
+}
+
+function autostartDisabled(projectRoot: string): boolean {
+  if (/^(0|false|no|off)$/i.test(process.env.RUFLO_DAEMON_AUTOSTART ?? '')) return true;
+  return autostartDisabledByProjectConfig(projectRoot);
+}
+
+/**
+ * Return true only when the directory contains a durable Ruflo project marker.
+ * Implementation lives in ./project-root.ts (shared with #2633 state anchoring);
+ * re-exported here for existing importers.
+ */
+export { isRufloProject };
+
+/**
+ * #2877: Normalize a working directory to the project root that owns the
+ * daemon lock/PID key.
+ *
+ * The lock (`<root>/.claude-flow/daemon.lock`) and PID file
+ * (`<root>/.claude-flow/daemon.pid`) were keyed to the raw cwd, so invoking
+ * the CLI from `/proj` and from `/proj/packages/foo` produced two different
+ * keys for one logical project — bypassing the atomic-lockfile dedup added
+ * for #2407/#2484 entirely (each cwd races against a different lock file)
+ * and leaving two daemons supervising the same tree.
+ *
+ * Resolution walks up from `startDir` and returns the NEAREST enclosing
+ * directory carrying a durable Ruflo marker (`isRufloProject`). Nearest-wins
+ * is what keeps a monorepo's independently-initialized sub-project on its own
+ * daemon: it matches its own marker before the walk ever reaches the parent.
+ *
+ * A `.git` directory is a hard stop — the repository boundary. Without it the
+ * walk could escape into an unrelated ancestor (a Ruflo project living at
+ * `$HOME`, say) and hand every repo below it the same daemon.
+ *
+ * Returns the resolved `startDir` unchanged when no marker is found, so a
+ * non-Ruflo directory still fails `isRufloProject` and declines autostart.
+ */
+export function resolveDaemonProjectRoot(startDir: string): string {
+  // #2633: the walk is shared with durable-state anchoring (./project-root.ts).
+  return resolveProjectRoot(startDir);
+}
+
+export interface EnsureResult { started: boolean; reason?: string }
+
+/** Spawn `daemon start` detached, reusing all its lock/TTL machinery. Injectable for tests. */
+export type SpawnDaemonFn = (projectRoot: string) => void;
+
+const defaultSpawn: SpawnDaemonFn = (projectRoot) => {
+  const cliBin = process.argv[1]; // the running bin/cli.js
+  const child = spawn(process.execPath, [cliBin, 'daemon', 'start', '--quiet'], {
+    cwd: projectRoot,
+    detached: true,
+    stdio: 'ignore',
+    env: { ...process.env, [AUTOSTART_ENV]: '1' },
+  });
+  child.unref();
+};
+
+/**
+ * Ensure a daemon is running for the project enclosing `startDir`. No-op when
+ * disabled or when one is already alive. Best-effort; never throws.
+ *
+ * #2877: `startDir` is normalized to the owning project root first, so a call
+ * from a subdirectory reads the same config, pidfile, and lock as a call from
+ * the root and cannot spawn a second daemon for the same project.
+ */
+export function ensureDaemonRunning(
+  startDir: string,
+  opts: { spawnFn?: SpawnDaemonFn; isAlive?: (root: string) => boolean } = {},
+): EnsureResult {
+  try {
+    const projectRoot = resolveDaemonProjectRoot(startDir);
+    if (autostartDisabled(projectRoot)) return { started: false, reason: 'disabled (RUFLO_DAEMON_AUTOSTART=0 or project config)' };
+    if (!isRufloProject(projectRoot)) {
+      return { started: false, reason: 'not a ruflo project' };
+    }
+    if (isDaemonStopMarked(projectRoot)) {
+      return { started: false, reason: 'stopped by user (daemon stop); run `daemon start` to re-enable' };
+    }
+    const alive = (opts.isAlive ?? isDaemonAlive)(projectRoot);
+    if (alive) return { started: false, reason: 'already running' };
+    (opts.spawnFn ?? defaultSpawn)(projectRoot);
+    return { started: true };
+  } catch (e) {
+    return { started: false, reason: `error: ${(e as Error)?.message ?? e}` };
+  }
+}

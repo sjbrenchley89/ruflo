@@ -5,14 +5,36 @@
  * Replaces previous stub implementations with real state tracking.
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import {
+  closeSync,
+  existsSync,
+  mkdirSync,
+  openSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { join } from 'node:path';
+import { nullPrototypeRecords, readPreservedJsonStore } from './record-store.js';
 import { type MCPTool, getProjectCwd } from './types.js';
 import { validateIdentifier } from './validate-input.js';
+import { noteFirstAgentRun } from '../funnel/activation.js';
+import {
+  createApscState,
+  isApscAgentEligible,
+  normalizeApscConfig,
+  recordApscSignal,
+  type ApscDecision,
+  type ApscSignal,
+  type ApscState,
+} from '../services/pheromone-adaptive.js';
 
 // Swarm state persistence
 const SWARM_DIR = '.claude-flow/swarm';
 const SWARM_STATE_FILE = 'swarm-state.json';
+const SWARM_STATE_LOCK = 'swarm-state.lock';
+const SWARM_LOCK_STALE_MS = 10_000;
 
 interface SwarmState {
   swarmId: string;
@@ -110,14 +132,25 @@ function reconcileOrphanSwarms(store: SwarmStore): number {
   return reconciled;
 }
 
-function loadSwarmStore(): SwarmStore {
-  let store: SwarmStore = { swarms: {}, version: '3.0.0' };
-  try {
-    const path = getSwarmStatePath();
-    if (existsSync(path)) {
-      store = JSON.parse(readFileSync(path, 'utf-8'));
-    }
-  } catch { /* fall through with default */ }
+// #2085 — exported so `agent-tools.ts agent_spawn` can push into
+// `swarm.agents` (the field `swarm_status` reads).
+export function loadSwarmStore(): SwarmStore {
+  // #4737: a parse error used to fall through to an empty store, and the next
+  // save (or orphan reconcile) overwrote swarm-state.json. Only a missing
+  // file is empty; corrupt bytes are copied aside and the error is reported.
+  const store = readPreservedJsonStore(
+    getSwarmStatePath(),
+    'swarm',
+    () => ({ swarms: {}, version: '3.0.0' }),
+    (candidate) => {
+      const swarms = candidate.swarms as unknown;
+      return swarms === undefined || (!!swarms && typeof swarms === 'object' && !Array.isArray(swarms));
+    },
+  );
+  if (!store.swarms) store.swarms = {};
+  // Record ids come from MCP input. A null prototype stops `__proto__` and
+  // `constructor` from resolving onto Object.prototype.
+  store.swarms = nullPrototypeRecords(store.swarms);
 
   // #1799 — reconcile orphans on every load and persist if anything changed.
   // Cheap (process.kill(pid, 0) is sub-millisecond) and means
@@ -129,15 +162,97 @@ function loadSwarmStore(): SwarmStore {
   return store;
 }
 
-function saveSwarmStore(store: SwarmStore): void {
+export function saveSwarmStore(store: SwarmStore): void {
   ensureSwarmDir();
-  writeFileSync(getSwarmStatePath(), JSON.stringify(store, null, 2), 'utf-8');
+  const target = getSwarmStatePath();
+  const temporary = `${target}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
+  try {
+    writeFileSync(temporary, JSON.stringify(store, null, 2), { encoding: 'utf-8', mode: 0o600 });
+    renameSync(temporary, target);
+  } catch (error) {
+    try { unlinkSync(temporary); } catch { /* already renamed or never created */ }
+    throw error;
+  }
+}
+
+function withSwarmStoreLock<T>(operation: () => T): T {
+  ensureSwarmDir();
+  const lockPath = join(getSwarmDir(), SWARM_STATE_LOCK);
+  let descriptor: number | undefined;
+  const waiter = new Int32Array(new SharedArrayBuffer(4));
+  for (let attempt = 0; attempt < 100; attempt++) {
+    try {
+      descriptor = openSync(lockPath, 'wx', 0o600);
+      break;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      try {
+        if (Date.now() - statSync(lockPath).mtimeMs > SWARM_LOCK_STALE_MS) {
+          unlinkSync(lockPath);
+          continue;
+        }
+      } catch { /* another writer released it */ }
+      Atomics.wait(waiter, 0, 0, 10);
+    }
+  }
+  if (descriptor === undefined) throw new Error('swarm state is busy; retry the outcome update');
+  try {
+    return operation();
+  } finally {
+    try { closeSync(descriptor); } catch { /* best effort */ }
+    try { unlinkSync(lockPath); } catch { /* best effort */ }
+  }
 }
 
 // Input validation
 const VALID_TOPOLOGIES = new Set([
-  'hierarchical', 'mesh', 'hierarchical-mesh', 'ring', 'star', 'hybrid', 'adaptive',
+  'hierarchical', 'mesh', 'hierarchical-mesh', 'ring', 'star', 'hybrid', 'adaptive', 'pheromone-adaptive',
 ]);
+
+function latestRunningSwarm(store: SwarmStore): SwarmState | undefined {
+  return Object.values(store.swarms)
+    .filter((swarm) => swarm.status === 'running')
+    .sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime())[0];
+}
+
+function apscStateOf(swarm: SwarmState | undefined): ApscState | undefined {
+  if (!swarm || swarm.topology !== 'pheromone-adaptive') return undefined;
+  const state = swarm.config.apscState as ApscState | undefined;
+  return state?.schemaVersion ? state : undefined;
+}
+
+/** Shared by hooks_post-task so outcome labels immediately drive APSC. */
+export function recordSwarmPheromoneSignal(
+  signal: ApscSignal,
+): { active: false; reason: string } | { active: true; swarmId: string; decision: ApscDecision } {
+  return withSwarmStoreLock(() => {
+    const store = loadSwarmStore();
+    const swarm = latestRunningSwarm(store);
+    const current = apscStateOf(swarm);
+    if (!swarm || !current) return { active: false, reason: 'no running pheromone-adaptive swarm' };
+    const result = recordApscSignal(current, signal);
+    swarm.config.apscState = result.state;
+    swarm.updatedAt = new Date().toISOString();
+    saveSwarmStore(store);
+    return { active: true, swarmId: swarm.swarmId, decision: result.decision };
+  });
+}
+
+/** Scheduling gate used by agent_execute. Dry-run topologies remain eligible. */
+export function pheromoneAgentEligibility(agentId: string): {
+  eligible: boolean;
+  active: boolean;
+  reason?: string;
+} {
+  const current = apscStateOf(latestRunningSwarm(loadSwarmStore()));
+  if (!current) return { eligible: true, active: false };
+  const eligible = isApscAgentEligible(current, agentId);
+  return {
+    eligible,
+    active: true,
+    reason: eligible ? undefined : 'agent suspended by pheromone-adaptive scheduling gate',
+  };
+}
 
 export const swarmTools: MCPTool[] = [
   {
@@ -147,7 +262,7 @@ export const swarmTools: MCPTool[] = [
     inputSchema: {
       type: 'object',
       properties: {
-        topology: { type: 'string', description: 'Swarm topology type (hierarchical, mesh, hierarchical-mesh, ring, star, hybrid, adaptive)' },
+        topology: { type: 'string', description: 'Swarm topology type (hierarchical, mesh, hierarchical-mesh, ring, star, hybrid, adaptive, pheromone-adaptive)' },
         maxAgents: { type: 'number', description: 'Maximum number of agents (1-50)' },
         strategy: { type: 'string', description: 'Agent strategy (specialized, balanced, adaptive)' },
         config: { type: 'object', description: 'Additional swarm configuration' },
@@ -175,6 +290,18 @@ export const swarmTools: MCPTool[] = [
           error: `Invalid topology: ${topology}. Valid: ${[...VALID_TOPOLOGIES].join(', ')}`,
         };
       }
+      let apscState: ApscState | undefined;
+      if (topology === 'pheromone-adaptive') {
+        try {
+          const apscConfig = normalizeApscConfig((config.apsc ?? {}) as Partial<ApscState['config']>);
+          if (apscConfig.minActiveAgents > maxAgents) {
+            return { success: false, error: 'APSC minActiveAgents cannot exceed maxAgents' };
+          }
+          apscState = createApscState(apscConfig);
+        } catch (error) {
+          return { success: false, error: `Invalid APSC config: ${(error as Error).message}` };
+        }
+      }
 
       const swarmId = `swarm-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       const now = new Date().toISOString();
@@ -193,18 +320,21 @@ export const swarmTools: MCPTool[] = [
           communicationProtocol: (config.communicationProtocol as string) || 'message-bus',
           autoScaling: (config.autoScaling as boolean) ?? true,
           consensusMechanism: (config.consensusMechanism as string) || 'majority',
+          ...(apscState ? { apscState } : {}),
         },
         createdAt: now,
         updatedAt: now,
-        // #1799 — record host PID so subsequent loads can detect orphans
-        // when this process exits without a graceful swarm_shutdown.
-        pid: process.pid,
+        // A normal CLI invocation exits immediately after creating this
+        // coordination record; its PID is therefore not the swarm lifetime.
+        // Long-lived hosts may opt into PID ownership explicitly.
+        pid: config.trackHostProcess === true ? process.pid : undefined,
       };
 
       const store = loadSwarmStore();
       store.swarms[swarmId] = swarmState;
       saveSwarmStore(store);
 
+      noteFirstAgentRun('cli'); // activation funnel (opt-in; no-op without telemetry consent)
       return {
         success: true,
         swarmId,
@@ -214,6 +344,60 @@ export const swarmTools: MCPTool[] = [
         initializedAt: now,
         config: swarmState.config,
         persisted: true,
+        apsc: apscState ? {
+          dryRun: apscState.config.dryRun,
+          minActiveAgents: apscState.config.minActiveAgents,
+          minSamples: apscState.config.minSamples,
+        } : undefined,
+      };
+    },
+  },
+  {
+    name: 'swarm_pheromone_update',
+    description: 'Record a normalized per-agent task outcome for a running pheromone-adaptive swarm. Use when a static agent pool is wrong because repeated task evidence should update role-aware EMA fitness and produce a bounded keep/suspend/reactivate decision; native Task has no persistent swarm eligibility gate.',
+    category: 'swarm',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        agentId: { type: 'string', description: 'Stable tracked agent identifier' },
+        role: { type: 'string', description: 'Agent role used for role-local normalization' },
+        taskSuccess: { type: 'number', description: 'Observed task success in [0,1]' },
+        normalizedLatency: { type: 'number', description: 'Latency divided by the configured budget, clamped to [0,1]' },
+        consensusAlignment: { type: 'number', description: 'Agreement with the accepted consensus in [0,1]' },
+      },
+      required: ['agentId', 'role', 'taskSuccess', 'normalizedLatency', 'consensusAlignment'],
+    },
+    handler: async (input) => {
+      try {
+        return recordSwarmPheromoneSignal({
+          agentId: String(input.agentId),
+          role: String(input.role),
+          taskSuccess: Number(input.taskSuccess),
+          normalizedLatency: Number(input.normalizedLatency),
+          consensusAlignment: Number(input.consensusAlignment),
+        });
+      } catch (error) {
+        return { active: false, reason: (error as Error).message };
+      }
+    },
+  },
+  {
+    name: 'swarm_pheromone_status',
+    description: 'Inspect the threshold, safety configuration, per-agent EMA scores, and scheduling eligibility of the active pheromone-adaptive swarm. Use when aggregate swarm status is wrong because calibration requires the exact APSC threshold and per-agent evidence before switching from dry-run to live suspension.',
+    category: 'swarm',
+    inputSchema: { type: 'object', properties: {} },
+    handler: async () => {
+      const store = loadSwarmStore();
+      const swarm = latestRunningSwarm(store);
+      const state = apscStateOf(swarm);
+      if (!swarm || !state) return { active: false, reason: 'no running pheromone-adaptive swarm' };
+      return {
+        active: true,
+        swarmId: swarm.swarmId,
+        threshold: state.threshold,
+        round: state.round,
+        config: state.config,
+        agents: Object.values(state.agents).sort((a, b) => a.agentId.localeCompare(b.agentId)),
       };
     },
   },
@@ -237,16 +421,22 @@ export const swarmTools: MCPTool[] = [
       const store = loadSwarmStore();
       const swarmId = input.swarmId as string;
 
-      if (swarmId && store.swarms[swarmId]) {
+      if (swarmId && !store.swarms[swarmId]) {
+        return { success: false, error: `Swarm ${swarmId} not found` };
+      }
+
+      const { getLiveAgentIds } = await import('./agent-tools.js');
+      if (swarmId) {
         const swarm = store.swarms[swarmId];
         return {
           swarmId: swarm.swarmId,
           status: swarm.status,
           topology: swarm.topology,
           maxAgents: swarm.maxAgents,
-          agentCount: swarm.agents.length,
+          agentCount: getLiveAgentIds(swarm.agents).length,
           taskCount: swarm.tasks.length,
           config: swarm.config,
+          apsc: apscStateOf(swarm),
           createdAt: swarm.createdAt,
           updatedAt: swarm.updatedAt,
         };
@@ -271,9 +461,10 @@ export const swarmTools: MCPTool[] = [
         status: latest.status,
         topology: latest.topology,
         maxAgents: latest.maxAgents,
-        agentCount: latest.agents.length,
+        agentCount: getLiveAgentIds(latest.agents).length,
         taskCount: latest.tasks.length,
         config: latest.config,
+        apsc: apscStateOf(latest),
         createdAt: latest.createdAt,
         updatedAt: latest.updatedAt,
         totalSwarms: swarmIds.length,
@@ -303,7 +494,7 @@ export const swarmTools: MCPTool[] = [
 
       // Find the swarm
       let target: SwarmState | undefined;
-      if (swarmId && store.swarms[swarmId]) {
+      if (swarmId) {
         target = store.swarms[swarmId];
       } else {
         // Shutdown most recent running swarm
@@ -328,6 +519,20 @@ export const swarmTools: MCPTool[] = [
         };
       }
 
+      const { agentTools, getLiveAgentIds } = await import('./agent-tools.js');
+      const terminateAgent = agentTools.find(tool => tool.name === 'agent_terminate')!;
+      let agentsTerminated = 0;
+      for (const agentId of getLiveAgentIds(target.agents)) {
+        const result = await terminateAgent.handler({
+          agentId,
+          force: input.graceful === false,
+        }) as { success: boolean; error?: string };
+        if (!result.success) {
+          return { success: false, swarmId: target.swarmId, agentsTerminated, error: result.error };
+        }
+        agentsTerminated++;
+      }
+
       target.status = 'terminated';
       target.updatedAt = new Date().toISOString();
       saveSwarmStore(store);
@@ -337,7 +542,7 @@ export const swarmTools: MCPTool[] = [
         swarmId: target.swarmId,
         terminated: true,
         graceful: (input.graceful as boolean) ?? true,
-        agentsTerminated: target.agents.length,
+        agentsTerminated,
         terminatedAt: target.updatedAt,
       };
     },

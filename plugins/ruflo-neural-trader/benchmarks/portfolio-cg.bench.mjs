@@ -2,13 +2,23 @@
 /**
  * Portfolio CG vs Neumann bench — ADR-126 Phase 3, ADR-123 Wedge 8.
  *
- * Compares Conjugate Gradient against the legacy Neumann (Jacobi) series
- * on synthetic SPD covariance matrices at n ∈ {16, 64, 256}. Output:
+ * Compares three solvers on synthetic SPD covariance matrices at
+ * n ∈ {16, 64, 256}. Output columns:
  *
- *   - cg_solve_avg_ms       — average wall-clock for CG
- *   - neumann_solve_avg_ms  — average wall-clock for Neumann
- *   - speedup               — neumann / cg ratio (expected: 40-60× at n=256)
- *   - parity                — ||cg − neumann||_∞ on fixed seed (expected: <1e-4)
+ *   - cg_local_avg_ms              — local JS CG kernel
+ *   - cg_sublinear_native_avg_ms   — native dispatch via mcp__ruflo-sublinear__solve
+ *                                    (only measured when the tool surface is
+ *                                    reachable in this runtime — see #55)
+ *   - neumann_solve_avg_ms         — legacy Jacobi-Neumann (the path the CLI
+ *                                    `npx neural-trader --portfolio optimize`
+ *                                    walks at ADR-126 Phase 3 write-time)
+ *   - speedup                      — neumann / cg ratio
+ *   - parity                       — ||cg − neumann||_∞ on fixed seed (<1e-4)
+ *
+ * When the native path is NOT reachable, the native column is reported as
+ * "n/a (native not available)" and the bench still ships a useful local-JS
+ * baseline. The full 40-60× headline requires the daemon to be up so the
+ * MCP tool is mounted into globalThis — CI exercises that path.
  *
  * Self-contained — no external runtime deps beyond Node 20+ stdlib.
  *
@@ -16,11 +26,10 @@
  *   node plugins/ruflo-neural-trader/benchmarks/portfolio-cg.bench.mjs
  *
  * Output is markdown so the result can be captured directly into
- * benchmarks/results/cg-baseline-<timestamp>.md (the Phase 3 commit
- * proof of the 40-60× speedup).
+ * benchmarks/results/cg-native-baseline-<timestamp>.md.
  */
 
-import { conjugateGradient, neumannSeries } from '../src/sublinear-adapter.mjs';
+import { conjugateGradient, neumannSeries, SublinearAdapter, sublinearAdapter } from '../src/sublinear-adapter.mjs';
 
 const SIZES = [16, 64, 256];
 const ITERATIONS = 100;          // bench reps per size
@@ -105,6 +114,14 @@ function benchOne(fn, A, b, opts) {
   };
 }
 
+// --- Native availability probe ------------------------------------------
+//
+// The native dispatch is reachable iff `mcp__ruflo-sublinear__solve` is
+// mounted on globalThis (or RUFLO_SUBLINEAR_NATIVE=1 forces an attempt).
+// When reachable, we run the adapter end-to-end and capture its latency.
+// When not, we still produce a useful local-JS baseline.
+const NATIVE_AVAILABLE = SublinearAdapter.detectSublinearTool();
+
 // --- Run -----------------------------------------------------------------
 console.log('# Portfolio CG vs Neumann — bench results');
 console.log('');
@@ -113,12 +130,32 @@ console.log(`Node: ${process.version}`);
 console.log(`Iterations per size: ${ITERATIONS} (warmup: ${WARMUP})`);
 console.log(`Tolerance: ${TOLERANCE}`);
 console.log(`Seed: ${SEED}`);
+console.log(`Native sublinear tool: ${NATIVE_AVAILABLE ? 'AVAILABLE' : 'NOT AVAILABLE (local JS fallback only)'}`);
 console.log('');
-console.log('| n    | CG avg (ms) | Neumann avg (ms) | Speedup | CG iters | Neumann iters | Parity (∞-norm) |');
-console.log('|------|-------------|------------------|---------|----------|---------------|-----------------|');
+console.log('| n    | CG local (ms) | CG native (ms)     | Neumann (ms) | Local speedup | Native speedup | CG iters | Neumann iters | Parity (∞-norm) |');
+console.log('|------|---------------|--------------------|--------------|---------------|----------------|----------|---------------|-----------------|');
 
 let allParityOk = true;
 const results = [];
+
+// Async benchOne for the adapter (whose solveCG is async).
+async function benchOneAsync(adapter, A, b, opts) {
+  const ms = [];
+  for (let i = 0; i < WARMUP; i++) await adapter.solveCG(A, b, opts);
+  for (let i = 0; i < ITERATIONS; i++) {
+    const t0 = performance.now();
+    await adapter.solveCG(A, b, opts);
+    ms.push(performance.now() - t0);
+  }
+  ms.sort((x, y) => x - y);
+  const sum = ms.reduce((s, x) => s + x, 0);
+  return {
+    avgMs: sum / ms.length,
+    medianMs: ms[Math.floor(ms.length / 2)],
+    minMs: ms[0],
+    maxMs: ms[ms.length - 1],
+  };
+}
 
 for (const n of SIZES) {
   const rng = mulberry32(SEED);
@@ -138,21 +175,54 @@ for (const n of SIZES) {
   // Timing — separate runs, JIT-warmed.
   const cgBench = benchOne(conjugateGradient, A, b, cgOpts);
   const nmBench = benchOne(neumannSeries, A, b, nmOpts);
-  const speedup = nmBench.avgMs / cgBench.avgMs;
+
+  // Native dispatch — only when reachable. Use a fresh adapter for hygiene.
+  // The adapter's solveCG path either dispatches to the native tool
+  // (path: 'cg-mcp') or falls through to local JS (path: 'cg-local'). We
+  // capture both the bench latency and which path was actually walked.
+  let nativeBench = null;
+  let nativeMethod = null;
+  if (NATIVE_AVAILABLE) {
+    try {
+      const adapter = sublinearAdapter;
+      const probe = await adapter.solveCG(A, b, cgOpts);
+      nativeMethod = probe.method;
+      // Only bench if we actually got the native path; if the adapter fell
+      // through to local JS for any reason, skip — the cg-local column
+      // already covers that case.
+      if (probe.method === 'cg-sublinear-native') {
+        nativeBench = await benchOneAsync(adapter, A, b, cgOpts);
+      }
+    } catch {
+      /* native attempt threw — skip native measurement */
+    }
+  }
+
+  const localSpeedup = nmBench.avgMs / cgBench.avgMs;
+  const nativeSpeedup = nativeBench ? nmBench.avgMs / nativeBench.avgMs : null;
 
   results.push({
     n,
     cgAvgMs: cgBench.avgMs,
+    cgNativeAvgMs: nativeBench ? nativeBench.avgMs : null,
+    nativeMethod,
     neumannAvgMs: nmBench.avgMs,
-    speedup,
+    localSpeedup,
+    nativeSpeedup,
     cgIters: cgResult.iterations,
     neumannIters: nmResult.iterations,
     parity,
     parityOk,
   });
 
+  const nativeCell = nativeBench
+    ? nativeBench.avgMs.toFixed(4)
+    : 'n/a (native not avail)';
+  const nativeSpeedupCell = nativeSpeedup
+    ? `${nativeSpeedup.toFixed(2)}×`
+    : 'n/a';
   console.log(
-    `| ${String(n).padEnd(4)} | ${cgBench.avgMs.toFixed(4).padEnd(11)} | ${nmBench.avgMs.toFixed(4).padEnd(16)} | ${speedup.toFixed(2).padEnd(7)}× | ${String(cgResult.iterations).padEnd(8)} | ${String(nmResult.iterations).padEnd(13)} | ${parity.toExponential(2).padEnd(15)} |`,
+    `| ${String(n).padEnd(4)} | ${cgBench.avgMs.toFixed(4).padEnd(13)} | ${String(nativeCell).padEnd(18)} | ${nmBench.avgMs.toFixed(4).padEnd(12)} | ${(localSpeedup.toFixed(2) + '×').padEnd(13)} | ${nativeSpeedupCell.padEnd(14)} | ${String(cgResult.iterations).padEnd(8)} | ${String(nmResult.iterations).padEnd(13)} | ${parity.toExponential(2).padEnd(15)} |`,
   );
 }
 
@@ -160,8 +230,15 @@ console.log('');
 console.log('## Acceptance');
 console.log('');
 const at256 = results.find((r) => r.n === 256);
-console.log(`- CG latency at n=256: **${at256.cgAvgMs.toFixed(4)} ms** (target: <1 ms — ${at256.cgAvgMs < 1 ? 'PASS' : 'FAIL'})`);
-console.log(`- Speedup at n=256: **${at256.speedup.toFixed(2)}×** (this is the JS-vs-JS gap; the upstream ADR-123 Wedge 8 40-60× number is native-CG vs native-Neumann in \`sublinear-time-solver@1.7.0\`. In pure JS both kernels converge in O(few) iterations on well-conditioned SPD inputs so the gap is dominated by per-iter constant factors. The skill picks up the full 40-60× automatically once \`mcp__ruflo-sublinear__solve\` is registered — same code path, different backend.)`);
+console.log(`- CG (local JS) latency at n=256: **${at256.cgAvgMs.toFixed(4)} ms** (target: <1 ms — ${at256.cgAvgMs < 1 ? 'PASS' : 'FAIL'})`);
+if (at256.cgNativeAvgMs != null) {
+  console.log(`- CG (native) latency at n=256: **${at256.cgNativeAvgMs.toFixed(4)} ms** (via \`mcp__ruflo-sublinear__solve\`)`);
+  console.log(`- Native speedup at n=256: **${at256.nativeSpeedup.toFixed(2)}×** vs Neumann (target: 40-60× per ADR-123 Wedge 8)`);
+} else {
+  console.log('- CG (native) latency: **n/a** — native dispatch surface not reachable from this runtime');
+  console.log('  - Reasons it can be unreachable: ruflo daemon not running, ruflo-sublinear plugin not registered, or the agent sandbox does not mount MCP tools onto globalThis. Set `RUFLO_SUBLINEAR_NATIVE=1` to force a dispatch attempt.');
+}
+console.log(`- Local JS speedup at n=256: **${at256.localSpeedup.toFixed(2)}×** vs Neumann (JS-vs-JS gap — both kernels converge in O(few) iterations on well-conditioned SPD inputs, so the gap is dominated by per-iter constant factors. The full 40-60× requires the native kernel.)`);
 console.log(`- Parity at all n: **${allParityOk ? 'PASS' : 'FAIL'}** (||cg − neumann||_∞ < 1e-4)`);
 console.log('');
 console.log('## Refs');
@@ -169,6 +246,7 @@ console.log('');
 console.log('- ADR-126 Phase 3 — `plugins/ruflo-neural-trader/src/sublinear-adapter.ts`');
 console.log('- ADR-123 §162 Row 8 — Wedge 8 portfolio CG');
 console.log('- Upstream `sublinear-time-solver@1.7.0` — production CG kernel target');
+console.log('- Task #55 — native CG dispatch wiring (this bench column)');
 
 // Exit non-zero if parity is broken — that's a correctness regression.
 if (!allParityOk) {

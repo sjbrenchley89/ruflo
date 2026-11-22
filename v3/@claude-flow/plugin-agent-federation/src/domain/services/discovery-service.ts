@@ -2,7 +2,7 @@ import { FederationNode, type FederationNodeProps } from '../entities/federation
 import { TrustLevel } from '../entities/trust-level.js';
 import type { WgManifestSection } from '../value-objects/wg-config.js';
 
-export type DiscoveryMechanism = 'static' | 'dns-sd' | 'ipfs-registry';
+export type DiscoveryMechanism = 'static' | 'dns-sd' | 'ipfs-registry' | 'a2a-card';
 
 export interface FederationManifest {
   readonly nodeId: string;
@@ -29,6 +29,12 @@ export interface FederationManifest {
 export interface DiscoveryServiceDeps {
   signManifest: (manifest: Omit<FederationManifest, 'signature'>) => Promise<string>;
   verifyManifest: (manifest: FederationManifest) => Promise<boolean>;
+  /**
+   * The Ed25519 key the operator pinned for a node id (hex). A manifest is signed with the key
+   * it carries, so on its own it only proves the sender holds that key; it earns VERIFIED trust
+   * only when the carried key is the pinned one.
+   */
+  pinnedKeyFor?: (nodeId: string) => string | undefined;
   onPeerDiscovered?: (node: FederationNode) => void;
 }
 
@@ -101,13 +107,26 @@ export class DiscoveryService {
     return discovered;
   }
 
+  /** Whether the manifest carries the key the operator pinned for its node id. */
+  isPinned(manifest: Pick<FederationManifest, 'nodeId' | 'publicKey'>): boolean {
+    return this.deps.pinnedKeyFor?.(manifest.nodeId)?.toLowerCase() === manifest.publicKey.toLowerCase();
+  }
+
   async addStaticPeer(endpoint: string, manifest?: FederationManifest): Promise<FederationNode> {
     if (manifest) {
+      if (manifest.endpoint !== endpoint) {
+        throw new Error(`Manifest endpoint mismatch: expected ${endpoint}`);
+      }
       const valid = await this.deps.verifyManifest(manifest);
       if (!valid) {
         throw new Error(`Invalid manifest signature for endpoint: ${endpoint}`);
       }
+      const pinned = this.deps.pinnedKeyFor?.(manifest.nodeId);
+      if (pinned !== undefined && pinned.toLowerCase() !== manifest.publicKey.toLowerCase()) {
+        throw new Error(`Manifest key for ${manifest.nodeId} does not match the pinned key`);
+      }
     }
+    const pinnedManifest = manifest !== undefined && this.isPinned(manifest);
 
     const nodeId = manifest?.nodeId ?? `static-${this.hashEndpoint(endpoint)}`;
     const existing = this.knownPeers.get(nodeId);
@@ -126,7 +145,8 @@ export class DiscoveryService {
         supportedProtocols: ['websocket', 'http'],
         complianceModes: [],
       },
-      trustLevel: manifest ? TrustLevel.VERIFIED : TrustLevel.UNTRUSTED,
+      // A self-signed manifest is not an identity: only a pinned key makes a peer VERIFIED.
+      trustLevel: pinnedManifest ? TrustLevel.VERIFIED : TrustLevel.UNTRUSTED,
       metadata: {
         discoveryMechanism: 'static' as DiscoveryMechanism,
         version: manifest?.version,
@@ -134,6 +154,25 @@ export class DiscoveryService {
     });
 
     this.knownPeers.set(nodeId, node);
+    this.deps.onPeerDiscovered?.(node);
+    return node;
+  }
+
+  /**
+   * Register an externally-discovered peer (e.g. mapped from an A2A Agent
+   * Card via `fromAgentCard`). Unlike `addStaticPeer` this takes a fully
+   * constructed node — the caller owns validation of the external format —
+   * and the node keeps whatever trust level it was constructed with
+   * (A2A-card peers arrive UNTRUSTED). Existing peers are refreshed, not
+   * replaced, so accumulated trust state survives re-discovery.
+   */
+  registerExternalPeer(node: FederationNode): FederationNode {
+    const existing = this.knownPeers.get(node.nodeId);
+    if (existing) {
+      existing.markSeen();
+      return existing;
+    }
+    this.knownPeers.set(node.nodeId, node);
     this.deps.onPeerDiscovered?.(node);
     return node;
   }

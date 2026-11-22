@@ -17,14 +17,102 @@
  * incremental migration.
  */
 
-import { chmodSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  closeSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readSync,
+  renameSync,
+  unlinkSync,
+  writeSync,
+} from 'node:fs';
+import { basename, dirname, join } from 'node:path';
 import {
   decryptBuffer,
   encryptBuffer,
   getKey,
   isEncryptedBlob,
   isEncryptionEnabled,
+  MAGIC,
 } from './encryption/vault.js';
+
+/**
+ * Crash-safe atomic file write (issue #2584).
+ *
+ * A plain `writeFileSync(dbPath, db.export())` of a large sql.js image is NOT
+ * crash-safe: a kill/OOM mid-write — or a second process rewriting the same
+ * path concurrently — leaves a half-written image, and reopening it yields
+ * `database disk image is malformed`. The corruption window scales with file
+ * size, so a 185 MB monolithic flush is especially exposed.
+ *
+ * This writes to a unique temp sibling, fsyncs the bytes to disk, then
+ * `rename()`s over the target. rename() is atomic on POSIX within one
+ * filesystem, so a reader/reopen sees either the old complete image or the new
+ * complete image — never a torn one. The directory entry is best-effort fsynced
+ * so the rename itself survives a crash. On any failure the temp file is
+ * removed and the original is left untouched.
+ */
+export function writeFileAtomic(
+  path: string,
+  data: Buffer,
+  opts: { mode?: number } = {},
+): void {
+  const mode = opts.mode ?? 0o600;
+  const dir = dirname(path);
+  const tmp = join(
+    dir,
+    `.${basename(path)}.tmp-${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+  );
+  let fd: number | undefined;
+  try {
+    fd = openSync(tmp, 'wx', mode);
+    // writeSync may write fewer bytes than asked (#4888). Loop until every byte
+    // is on the temp file, or rename() would publish a truncated image.
+    let written = 0;
+    while (written < data.length) {
+      const n = writeSync(fd, data, written, data.length - written, written);
+      if (n <= 0) throw new Error(`writeFileAtomic: write made no progress at byte ${written} of ${data.length}`);
+      written += n;
+    }
+    fsyncSync(fd); // durability: force bytes to disk BEFORE the rename
+    closeSync(fd);
+    fd = undefined;
+    renameSync(tmp, path); // atomic swap — readers never see a torn image
+    try {
+      chmodSync(path, mode);
+    } catch {
+      // Windows / FS without POSIX modes — silently skip.
+    }
+    // Best-effort: fsync the directory so the rename survives a power loss.
+    try {
+      const dfd = openSync(dir, 'r');
+      try {
+        fsyncSync(dfd);
+      } finally {
+        closeSync(dfd);
+      }
+    } catch {
+      // Directory fsync unsupported (e.g. Windows) — the rename is still atomic.
+    }
+  } catch (e) {
+    if (fd !== undefined) {
+      try {
+        closeSync(fd);
+      } catch {
+        /* already closed */
+      }
+    }
+    try {
+      unlinkSync(tmp);
+    } catch {
+      /* temp never created / already gone */
+    }
+    throw e;
+  }
+}
 
 /**
  * Create a directory tree with mode 0700 (owner-only). No-op if exists.
@@ -77,19 +165,60 @@ export function writeFileRestricted(
     payload = encryptBuffer(plaintext, getKey());
   }
 
-  // For encrypted payloads we always have a Buffer — pass through without an
-  // encoding so writeFileSync doesn't try to text-decode it.
-  if (Buffer.isBuffer(payload)) {
-    writeFileSync(path, payload);
-  } else {
-    writeFileSync(path, payload, encoding);
-  }
+  // Atomic write (temp → fsync → rename) so a torn/concurrent flush can never
+  // leave a half-written file — the failure mode behind issue #2584. Buffers go
+  // straight through; strings are encoded first (default utf-8).
+  const buf = Buffer.isBuffer(payload) ? payload : Buffer.from(payload, encoding);
+  writeFileAtomic(path, buf, { mode: 0o600 });
+}
 
+/**
+ * The at-rest format of an existing database file: `true` = RFE1-encrypted,
+ * `false` = plaintext, `null` = missing or unreadable (nothing to preserve).
+ * Reads four bytes only.
+ */
+export function existingFileIsEncrypted(path: string): boolean | null {
+  let fd: number | undefined;
   try {
-    chmodSync(path, 0o600);
+    fd = openSync(path, 'r');
+    const head = Buffer.alloc(4);
+    const n = readSync(fd, head, 0, 4, 0);
+    if (n < 4) return null;
+    return head.equals(MAGIC);
   } catch {
-    // Windows / FS without POSIX modes — silently skip.
+    return null;
+  } finally {
+    if (fd !== undefined) {
+      try { closeSync(fd); } catch { /* best effort */ }
+    }
   }
+}
+
+/**
+ * Write a whole-file database image back in the format it was read in (#4057).
+ *
+ * A read-modify-write of a database image (sql.js loads the file, mutates it,
+ * exports it) must not change what the file IS. With encryption at rest on, a
+ * plain `{ encrypt: true }` write turned a plaintext native SQLite store into
+ * an RFE1 blob that the native bridge and every SQLite reader then rejected,
+ * while the command reported success. And the reverse, a plain
+ * `writeFileAtomic` of a decrypted image, silently downgraded an encrypted
+ * store to plaintext.
+ *
+ *   existing file RFE1      -> RFE1 (encrypted)
+ *   existing file plaintext -> plaintext
+ *   no existing file        -> `encrypt` (default true: the env gate decides)
+ *   `encrypt: false`        -> plaintext, always (explicit caller choice)
+ */
+export function writeDbImagePreservingFormat(
+  path: string,
+  data: Uint8Array | Buffer,
+  opts: { encrypt?: boolean } = {},
+): void {
+  const requested = opts.encrypt ?? true;
+  const existing = existingFileIsEncrypted(path);
+  const encrypt = requested === false ? false : (existing ?? requested);
+  writeFileRestricted(path, Buffer.isBuffer(data) ? data : Buffer.from(data), { encrypt });
 }
 
 /**
@@ -122,7 +251,9 @@ export function readFileMaybeEncrypted(
   const raw = readFileSync(path);
   let plain: Buffer;
   if (isEncryptedBlob(raw)) {
-    plain = decryptBuffer(raw, getKey());
+    // 'decrypt': the blob on disk is RFE1-encrypted but the enable flag may
+    // be unset (e.g. store restored from another machine) — see #3212.
+    plain = decryptBuffer(raw, getKey('decrypt'));
   } else {
     plain = raw;
   }
