@@ -5,7 +5,8 @@ import type { KeyValuePair } from "$lib/types/Tool";
 import { config } from "$lib/server/config";
 import { logger } from "$lib/server/logger";
 import type { RequestHandler } from "./$types";
-import { isValidUrl } from "$lib/server/urlSafety";
+import { isAllowedMcpUrl, mcpFetchFor } from "$lib/server/mcp/serverTrust";
+import { getMcpServers } from "$lib/server/mcp/registry";
 import { isStrictHfMcpLogin, hasNonEmptyToken, isExaMcpServer } from "$lib/server/mcp/hf";
 
 interface HealthCheckRequest {
@@ -40,7 +41,7 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 
 		// URL validation handled above
 
-		if (!isValidUrl(url)) {
+		if (!isAllowedMcpUrl(url)) {
 			return new Response(
 				JSON.stringify({
 					ready: false,
@@ -68,10 +69,13 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 
 		const baseUrl = new URL(finalUrl);
 
-		// Minimal header handling
+		// Minimal header handling. With no headers in the request, an
+		// operator-configured server is checked with its configured headers
+		// (as the chat flow does in mergeMcpServers), so a bridge that requires
+		// a token still reports healthy. Those headers are never returned.
 		const headersRecord: Record<string, string> = headers?.length
 			? Object.fromEntries(headers.map((h) => [h.key, h.value]))
-			: {};
+			: { ...(getMcpServers().find((s) => s.url === url)?.headers ?? {}) };
 		if (!headersRecord["Accept"]) {
 			headersRecord["Accept"] = "application/json, text/event-stream";
 		}
@@ -111,7 +115,7 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 				version: "1.0.0",
 			});
 
-			const transport = new StreamableHTTPClientTransport(baseUrl, { requestInit });
+			const transport = new StreamableHTTPClientTransport(baseUrl, { requestInit, fetch: mcpFetchFor(url) });
 			logger.info({}, `[MCP Health] Connecting to ${url}...`);
 			await client.connect(transport);
 			logger.info({}, `[MCP Health] Connected successfully via HTTP`);
@@ -174,7 +178,7 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 					version: "1.0.0",
 				});
 
-				const sseTransport = new SSEClientTransport(baseUrl, { requestInit });
+				const sseTransport = new SSEClientTransport(baseUrl, { requestInit, fetch: mcpFetchFor(url) });
 				logger.info({}, `[MCP Health] Connecting via SSE...`);
 				await client.connect(sseTransport);
 				logger.info({}, `[MCP Health] Connected successfully via SSE`);

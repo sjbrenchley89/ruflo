@@ -5,6 +5,7 @@
 
 import * as semver from 'semver';
 import { createRequire } from 'node:module';
+import { readFileSync } from 'node:fs';
 import { shouldCheckForUpdates, recordCheck, getCachedVersions } from './rate-limiter.js';
 
 export interface UpdateCheckResult {
@@ -33,7 +34,7 @@ const DEFAULT_CONFIG: UpdateConfig = {
   enabled: true,
   checkIntervalHours: 24,
   autoUpdate: {
-    patch: true,
+    patch: false,
     minor: false,
     major: false,
   },
@@ -81,7 +82,7 @@ async function fetchPackageInfo(packageName: string): Promise<NpmPackageInfo | n
   }
 }
 
-function getUpdateType(
+export function getUpdateType(
   current: string,
   latest: string
 ): 'major' | 'minor' | 'patch' | 'none' {
@@ -89,7 +90,9 @@ function getUpdateType(
     return 'none';
   }
 
-  if (semver.eq(current, latest)) {
+  // An update is a strictly newer version. Comparing the parts one by one called 3.60.0 (running) against 3.59.17 (latest) a
+  // 'patch' update, since 17 > 0, and the startup check then auto-installed the older version: a downgrade.
+  if (!semver.gt(latest, current)) {
     return 'none';
   }
 
@@ -110,15 +113,9 @@ function getUpdateType(
 
 function shouldAutoUpdate(
   updateType: 'major' | 'minor' | 'patch' | 'none',
-  priority: 'critical' | 'high' | 'normal' | 'low',
   config: UpdateConfig
 ): boolean {
   if (updateType === 'none') return false;
-
-  // Critical security packages always auto-update patches
-  if (priority === 'critical' && updateType === 'patch') {
-    return true;
-  }
 
   // Check config
   if (updateType === 'major') return config.autoUpdate.major;
@@ -139,10 +136,14 @@ export function getInstalledVersion(packageName: string): string | null {
 
     for (const modulePath of possiblePaths) {
       try {
-        // Use createRequire for ESM-compatible package.json loading
+        // Resolve from this CLI's own install only, never the working directory, and read the
+        // file as JSON instead of require()-ing it: a package's `exports` map can point
+        // `./package.json` at a .js file, so a node_modules folder committed to a cloned
+        // repository would otherwise run inside the CLI on every startup update check.
         const esmRequire = createRequire(import.meta.url);
-        const resolved = esmRequire.resolve(modulePath, { paths: [process.cwd()] });
-        const pkg = esmRequire(resolved);
+        const resolved = esmRequire.resolve(modulePath);
+        const pkg = JSON.parse(readFileSync(resolved, 'utf8'));
+        if (typeof pkg?.version !== 'string') continue;
         return pkg.version;
       } catch {
         continue;
@@ -218,7 +219,7 @@ export async function checkForUpdates(
         latestVersion,
         updateType,
         priority,
-        shouldAutoUpdate: shouldAutoUpdate(updateType, priority, config),
+        shouldAutoUpdate: shouldAutoUpdate(updateType, config),
       });
     })
   );
@@ -260,7 +261,7 @@ export async function checkSinglePackage(
     latestVersion,
     updateType,
     priority,
-    shouldAutoUpdate: shouldAutoUpdate(updateType, priority, config),
+    shouldAutoUpdate: shouldAutoUpdate(updateType, config),
   };
 }
 

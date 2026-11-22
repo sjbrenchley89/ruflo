@@ -72,7 +72,7 @@ hooks:
     # 3. Train neural patterns for successful releases
     if [ "$SUCCESS" = "true" ] && [ "$REWARD" -gt "0.9" ]; then
       echo "🧠 Training neural pattern from successful release"
-      npx claude-flow neural train \
+      npx @claude-flow/cli@latest neural train \
         --pattern-type "coordination" \
         --training-data "$RELEASE_OUTPUT" \
         --epochs 50
@@ -292,11 +292,11 @@ console.log(`Found ${impactedAreas.length} impacted areas with +12.4% better cov
 ```javascript
 // Initialize release management swarm
 mcp__claude-flow__swarm_init { topology: "hierarchical", maxAgents: 6 }
-mcp__claude-flow__agent_spawn { type: "coordinator", name: "Release Coordinator" }
-mcp__claude-flow__agent_spawn { type: "tester", name: "QA Engineer" }
-mcp__claude-flow__agent_spawn { type: "reviewer", name: "Release Reviewer" }
-mcp__claude-flow__agent_spawn { type: "coder", name: "Version Manager" }
-mcp__claude-flow__agent_spawn { type: "analyst", name: "Deployment Analyst" }
+mcp__claude-flow__agent_spawn { agentType: "coordinator", name: "Release Coordinator" }
+mcp__claude-flow__agent_spawn { agentType: "tester", name: "QA Engineer" }
+mcp__claude-flow__agent_spawn { agentType: "reviewer", name: "Release Reviewer" }
+mcp__claude-flow__agent_spawn { agentType: "coder", name: "Version Manager" }
+mcp__claude-flow__agent_spawn { agentType: "analyst", name: "Deployment Analyst" }
 
 // Create release preparation branch
 mcp__github__create_branch {
@@ -445,12 +445,12 @@ This release is production-ready with comprehensive validation and testing.
 [Single Message - Complete Release Management]:
   // Initialize comprehensive release swarm
   mcp__claude-flow__swarm_init { topology: "star", maxAgents: 8 }
-  mcp__claude-flow__agent_spawn { type: "coordinator", name: "Release Director" }
-  mcp__claude-flow__agent_spawn { type: "tester", name: "QA Lead" }
-  mcp__claude-flow__agent_spawn { type: "reviewer", name: "Senior Reviewer" }
-  mcp__claude-flow__agent_spawn { type: "coder", name: "Version Controller" }
-  mcp__claude-flow__agent_spawn { type: "analyst", name: "Performance Analyst" }
-  mcp__claude-flow__agent_spawn { type: "researcher", name: "Compatibility Checker" }
+  mcp__claude-flow__agent_spawn { agentType: "coordinator", name: "Release Director" }
+  mcp__claude-flow__agent_spawn { agentType: "tester", name: "QA Lead" }
+  mcp__claude-flow__agent_spawn { agentType: "reviewer", name: "Senior Reviewer" }
+  mcp__claude-flow__agent_spawn { agentType: "coder", name: "Version Controller" }
+  mcp__claude-flow__agent_spawn { agentType: "analyst", name: "Performance Analyst" }
+  mcp__claude-flow__agent_spawn { agentType: "researcher", name: "Compatibility Checker" }
   
   // Create release branch and prepare files using gh CLI
   Bash("gh api repos/:owner/:repo/git/refs --method POST -f ref='refs/heads/release/v1.0.72' -f sha=$(gh api repos/:owner/:repo/git/refs/heads/main --jq '.object.sha')")
@@ -577,9 +577,9 @@ jobs:
   release-validation:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - name: Setup Node.js
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v4
         with:
           node-version: '20'
       - name: Install and Test
@@ -587,7 +587,7 @@ jobs:
           cd claude-code-flow/claude-code-flow && npm install && npm test
           cd ../../ruv-swarm/npm && npm install && npm test:all
       - name: Validate Release
-        run: npx claude-flow release validate
+        run: npx @claude-flow/cli@latest release validate
 ```
 
 ## Monitoring and Metrics

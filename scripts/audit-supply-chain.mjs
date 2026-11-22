@@ -32,7 +32,7 @@
  */
 
 import { readFileSync, existsSync } from 'node:fs';
-import { execSync } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -125,7 +125,7 @@ function runCveAudit(packageDir, accepted) {
 
   let audit;
   try {
-    const out = execSync('npm audit --json --audit-level=high', {
+    const out = execFileSync('npm', ['audit', '--json', '--audit-level=high'], {
       cwd: join(REPO_ROOT, packageDir),
       stdio: ['ignore', 'pipe', 'pipe'],
       timeout: 60_000,
@@ -170,9 +170,6 @@ function runCveAudit(packageDir, accepted) {
     }
   }
   if (directHighCritical.length > 0) {
-    for (const f of directHighCritical) {
-      log(`    UNACCEPTED: ${f.depName} (${f.severity}) — add to accepted-findings.json to suppress`);
-    }
     results.cve.push(...directHighCritical);
   }
   log(`  [cve] ${packageDir}: ${directHighCritical.length} HIGH/CRITICAL unaccepted, ${acceptedCount} accepted`);
@@ -301,7 +298,9 @@ function runPublisherTrustAudit(allowlist) {
   const critical = allowlist.publisherTrust?.criticalUpstreamPackages ?? [];
   for (const name of critical) {
     try {
-      const out = execSync(`npm view "${name}" maintainers --json`, {
+      // Use execFileSync + array args to prevent shell injection through
+      // package names sourced from the allowlist JSON (CWE-78 mitigation).
+      const out = execFileSync('npm', ['view', name, 'maintainers', '--json'], {
         stdio: ['ignore', 'pipe', 'pipe'],
         timeout: 10_000,
       });

@@ -22,6 +22,8 @@ import {
 interface LRUNode<T> {
   key: string;
   value: CachedEntry<T>;
+  /** Size charged to currentMemory when stored; refunded verbatim on removal. */
+  size: number;
   prev: LRUNode<T> | null;
   next: LRUNode<T> | null;
 }
@@ -109,22 +111,35 @@ export class CacheManager<T = MemoryEntry> extends EventEmitter {
     const now = Date.now();
     const entryTtl = ttl || this.config.ttl;
 
+    const entryMemory = this.estimateSize(data);
+    // A value larger than the entire budget cannot be cached. Invalidate an
+    // older value for this key, but preserve unrelated useful entries.
+    if (this.config.maxMemory && entryMemory > this.config.maxMemory) {
+      this.delete(key);
+      return;
+    }
+
     // Check if key already exists
     const existingNode = this.cache.get(key);
     if (existingNode) {
+      // Account for the old value before overwriting it.
+      this.currentMemory += entryMemory - existingNode.size;
       // Update existing entry
+      existingNode.size = entryMemory;
       existingNode.value.data = data;
       existingNode.value.cachedAt = now;
       existingNode.value.expiresAt = now + entryTtl;
       existingNode.value.lastAccessedAt = now;
 
       this.moveToFront(existingNode);
+      if (this.config.maxMemory) {
+        while (this.currentMemory > this.config.maxMemory && this.cache.size > 0) {
+          this.evictLRU();
+        }
+      }
       this.stats.writes++;
       return;
     }
-
-    // Calculate memory for new entry
-    const entryMemory = this.estimateSize(data);
 
     // Evict entries if needed for memory pressure
     if (this.config.maxMemory) {
@@ -153,6 +168,7 @@ export class CacheManager<T = MemoryEntry> extends EventEmitter {
     const node: LRUNode<T> = {
       key,
       value: cachedEntry,
+      size: entryMemory,
       prev: null,
       next: null,
     };
@@ -177,7 +193,7 @@ export class CacheManager<T = MemoryEntry> extends EventEmitter {
 
     this.removeNode(node);
     this.cache.delete(key);
-    this.currentMemory -= this.estimateSize(node.value.data);
+    this.currentMemory -= node.size;
 
     this.emit('cache:delete', { key });
     return true;
@@ -296,7 +312,13 @@ export class CacheManager<T = MemoryEntry> extends EventEmitter {
     let invalidated = 0;
 
     for (const key of this.cache.keys()) {
-      if (regex.test(key)) {
+      // RegExp cursors belong to a single input, not the whole key sequence.
+      const stateful = regex.global || regex.sticky;
+      const lastIndex = regex.lastIndex;
+      if (stateful) regex.lastIndex = 0;
+      const matches = regex.test(key);
+      if (stateful) regex.lastIndex = lastIndex;
+      if (matches) {
         this.delete(key);
         invalidated++;
       }
@@ -327,6 +349,8 @@ export class CacheManager<T = MemoryEntry> extends EventEmitter {
       lruEnabled: config.lruEnabled !== false,
       maxMemory: config.maxMemory,
       writeThrough: config.writeThrough || false,
+      frequencyWeight: config.frequencyWeight,
+      evictionScanWindow: config.evictionScanWindow,
     };
   }
 
@@ -381,15 +405,60 @@ export class CacheManager<T = MemoryEntry> extends EventEmitter {
   private evictLRU(): void {
     if (!this.tail) return;
 
-    const evictedKey = this.tail.key;
-    const evictedSize = this.estimateSize(this.tail.value.data);
+    const victim = this.selectEvictionVictim();
+    const evictedKey = victim.key;
+    const evictedSize = victim.size;
 
-    this.removeNode(this.tail);
+    this.removeNode(victim);
     this.cache.delete(evictedKey);
     this.currentMemory -= evictedSize;
     this.stats.evictions++;
 
     this.emit('cache:eviction', { key: evictedKey });
+  }
+
+  /**
+   * Pick the node to evict. With the default `frequencyWeight` of 0 this is
+   * always the LRU tail (identical to the original pure-LRU behavior). With
+   * `frequencyWeight` > 0, a bounded window of the least-recently-used nodes
+   * is scored by blending recency rank with normalized `accessCount`, so a
+   * historically high-frequency entry sitting near the tail can survive an
+   * eviction that pure recency would otherwise apply to it (the failure mode
+   * HTM-EAR, arXiv:2603.10032, documents for plain LRU under skewed access).
+   */
+  private selectEvictionVictim(): LRUNode<T> {
+    const weight = this.config.frequencyWeight;
+    if (!weight) {
+      return this.tail!;
+    }
+
+    const window = Math.max(1, this.config.evictionScanWindow ?? 32);
+    const candidates: Array<{ node: LRUNode<T>; distanceFromTail: number }> = [];
+    let maxAccessCount = 0;
+    let node: LRUNode<T> | null = this.tail;
+    let distanceFromTail = 0;
+    while (node && distanceFromTail < window) {
+      candidates.push({ node, distanceFromTail });
+      if (node.value.accessCount > maxAccessCount) {
+        maxAccessCount = node.value.accessCount;
+      }
+      node = node.prev;
+      distanceFromTail++;
+    }
+
+    const scaleFactor = candidates.length > 1 ? candidates.length - 1 : 1;
+    let victim = candidates[0].node;
+    let bestScore = Infinity;
+    for (const candidate of candidates) {
+      const normalizedFreq =
+        maxAccessCount > 0 ? candidate.node.value.accessCount / maxAccessCount : 0;
+      const score = (1 - weight) * candidate.distanceFromTail + weight * normalizedFreq * scaleFactor;
+      if (score < bestScore) {
+        bestScore = score;
+        victim = candidate.node;
+      }
+    }
+    return victim;
   }
 
   private startCleanupTimer(): void {

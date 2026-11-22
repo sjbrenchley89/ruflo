@@ -8,8 +8,11 @@ import { output } from '../output.js';
 import { select, confirm, input } from '../prompt.js';
 import { callMCPTool, MCPClientError } from '../mcp-client.js';
 import { wasmSubcommands } from './agent-wasm.js';
+import { agentPublishCommand } from './agntcy/publish.js';
 import * as fs from 'fs';
 import * as path from 'path';
+import { getProjectRoot } from '../services/project-root.js';
+import { noteFirstAgentRun } from '../funnel/activation.js';
 
 /**
  * Update swarm-activity.json metrics after agent count changes.
@@ -17,7 +20,7 @@ import * as path from 'path';
  */
 function updateSwarmActivityMetrics(agentCountDelta: number): void {
   try {
-    const metricsDir = path.join(process.cwd(), '.claude-flow', 'metrics');
+    const metricsDir = path.join(getProjectRoot(), '.claude-flow', 'metrics');
     const activityPath = path.join(metricsDir, 'swarm-activity.json');
 
     let data: Record<string, unknown> = {
@@ -153,6 +156,7 @@ const spawnCommand: Command = {
       }>('agent_spawn', {
         agentType,
         id: agentName,
+        name: agentName,
         config: {
           provider: ctx.flags.provider || 'anthropic',
           model: ctx.flags.model,
@@ -193,6 +197,7 @@ const spawnCommand: Command = {
         output.printJson(result);
       }
 
+      noteFirstAgentRun('cli'); // activation funnel (opt-in; no-op without telemetry consent)
       return { success: true, data: result };
     } catch (error) {
       if (error instanceof MCPClientError) {
@@ -236,15 +241,17 @@ const listCommand: Command = {
       // Call MCP tool to list agents
       const result = await callMCPTool<{
         agents: Array<{
-          id: string;
+          agentId: string;
           agentType: string;
-          status: 'active' | 'idle' | 'terminated';
+          status: 'active' | 'busy' | 'idle' | 'terminated';
           createdAt: string;
           lastActivityAt?: string;
         }>;
         total: number;
       }>('agent_list', {
-        status: ctx.flags.all ? 'all' : ctx.flags.status || undefined,
+        // agent_list has no 'all' status: --all means "don't hide terminated agents".
+        status: ctx.flags.status || undefined,
+        includeTerminated: ctx.flags.all ? true : undefined,
         agentType: ctx.flags.type || undefined,
         limit: 100,
       });
@@ -265,7 +272,7 @@ const listCommand: Command = {
 
       // Format for display
       const displayAgents = result.agents.map(agent => ({
-        id: agent.id,
+        id: agent.agentId,
         type: agent.agentType,
         status: agent.status,
         created: new Date(agent.createdAt).toLocaleTimeString(),
@@ -347,6 +354,18 @@ const statusCommand: Command = {
         includeMetrics: true,
         includeHistory: false,
       });
+
+      // The MCP tool answers an unknown id with status "not_found" and no other fields.
+      // Rendering that as a record printed "Agent: undefined", "Invalid Date" and
+      // "undefined%" and exited 0, so scripts and agents took it as success.
+      if (((status as { status?: string }).status) === 'not_found') {
+        if (ctx.flags.format === 'json') {
+          output.printJson(status);
+        } else {
+          output.printError(`Agent not found: ${agentId}`);
+        }
+        return { success: false, exitCode: 1 };
+      }
 
       if (ctx.flags.format === 'json') {
         output.printJson(status);
@@ -560,6 +579,71 @@ const metricsCommand: Command = {
       ? `${Math.round(Object.values(typeCounts).reduce((a, d) => a + d.success, 0) / tasksCompleted * 100)}%`
       : 'N/A';
 
+    // ADR-330: expose the learned scheduling signal where operators already
+    // inspect agent metrics. Old/non-APSC installs simply omit this section.
+    let pheromone: {
+      active: boolean;
+      dryRun: boolean;
+      threshold: number;
+      agents: Array<{
+        agentId: string;
+        role: string;
+        pheromoneScore: number;
+        rawScore: number;
+        samples: number;
+        eligibility: string;
+      }>;
+    } | undefined;
+    const swarmStatePath = join(process.cwd(), '.claude-flow', 'swarm', 'swarm-state.json');
+    if (existsSync(swarmStatePath)) {
+      try {
+        const store = JSON.parse(readFileSync(swarmStatePath, 'utf-8')) as {
+          swarms?: Record<string, {
+            topology?: string;
+            status?: string;
+            updatedAt?: string;
+            config?: {
+              apscState?: {
+                threshold?: number;
+                config?: { dryRun?: boolean };
+                agents?: Record<string, {
+                  agentId: string;
+                  role: string;
+                  emaScore: number;
+                  rawScore: number;
+                  samples: number;
+                  status: string;
+                }>;
+              };
+            };
+          }>;
+        };
+        const current = Object.values(store.swarms ?? {})
+          .filter((swarm) => swarm.status === 'running' && swarm.topology === 'pheromone-adaptive')
+          .sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)))[0];
+        const apsc = current?.config?.apscState;
+        if (apsc) {
+          const agents = Object.values(apsc.agents ?? {})
+            .filter((agent) => !agentId || agent.agentId === agentId)
+            .sort((a, b) => a.agentId.localeCompare(b.agentId))
+            .map((agent) => ({
+              agentId: agent.agentId,
+              role: agent.role,
+              pheromoneScore: agent.emaScore,
+              rawScore: agent.rawScore,
+              samples: agent.samples,
+              eligibility: agent.status === 'suspended' ? 'suspended' : 'eligible',
+            }));
+          pheromone = {
+            active: true,
+            dryRun: apsc.config?.dryRun !== false,
+            threshold: apsc.threshold ?? 0.5,
+            agents,
+          };
+        }
+      } catch { /* malformed/legacy swarm state — preserve existing metrics */ }
+    }
+
     const metrics = {
       period,
       summary: {
@@ -574,7 +658,8 @@ const metricsCommand: Command = {
       performance: {
         memoryVectors: `${vectorCount} vectors`,
         searchBackend: vectorCount > 0 ? 'HNSW-indexed' : 'none'
-      }
+      },
+      pheromone,
     };
 
     if (ctx.flags.format === 'json') {
@@ -623,6 +708,21 @@ const metricsCommand: Command = {
       `Vectors: ${output.success(metrics.performance.memoryVectors)}`,
       `Backend: ${output.success(metrics.performance.searchBackend)}`
     ]);
+
+    if (metrics.pheromone) {
+      output.writeln();
+      output.writeln(output.bold(`Pheromone Scheduling (${metrics.pheromone.dryRun ? 'dry run' : 'live'})`));
+      output.printTable({
+        columns: [
+          { key: 'agentId', header: 'Agent', width: 20 },
+          { key: 'role', header: 'Role', width: 18 },
+          { key: 'pheromoneScore', header: 'EMA Score', width: 12, align: 'right' },
+          { key: 'samples', header: 'Samples', width: 9, align: 'right' },
+          { key: 'eligibility', header: 'Eligibility', width: 12 },
+        ],
+        data: metrics.pheromone.agents,
+      });
+    }
 
     return { success: true, data: metrics };
   }
@@ -763,20 +863,24 @@ const healthCommand: Command = {
         agents: Array<{
           id: string;
           type: string;
-          health: 'healthy' | 'degraded' | 'unhealthy';
-          uptime: number;
+          health: 'healthy' | 'degraded' | 'unhealthy' | 'unknown';
+          uptime: number | null;
+          registryAgeMs?: number;
           memory: { used: number; limit: number };
           cpu: number;
           tasks: { active: number; queued: number; completed: number; failed: number };
-          latency: { avg: number; p99: number };
+          latency: { avg: number | null; p50?: number | null; p95?: number | null; p99: number | null };
           errors: { count: number; lastError?: string };
         }>;
         overall: {
           healthy: number;
           degraded: number;
           unhealthy: number;
-          avgCpu: number;
-          avgMemory: number;
+          unknown?: number;
+          avgCpu?: number | null;
+          avgMemory?: number | null;
+          cpu?: number | null;
+          memory?: number | null;
         };
       }>('agent_health', {
         agentId,
@@ -793,16 +897,17 @@ const healthCommand: Command = {
       output.writeln();
 
       // Overall summary with null checks
-      const overall = result.overall ?? { healthy: 0, degraded: 0, unhealthy: 0, avgCpu: 0, avgMemory: 0 };
-      const avgCpu = overall.avgCpu ?? 0;
-      const avgMemory = overall.avgMemory ?? 0;
+      const overall = result.overall ?? { healthy: 0, degraded: 0, unhealthy: 0, unknown: 0 };
+      const avgCpu = overall.avgCpu ?? overall.cpu;
+      const avgMemory = overall.avgMemory ?? overall.memory;
       output.printBox(
         [
           `Healthy: ${output.success(String(overall.healthy ?? 0))}`,
           `Degraded: ${output.warning(String(overall.degraded ?? 0))}`,
           `Unhealthy: ${output.error(String(overall.unhealthy ?? 0))}`,
-          `Avg CPU: ${avgCpu.toFixed(1)}%`,
-          `Avg Memory: ${(avgMemory * 100).toFixed(1)}%`
+          `Unknown: ${String(overall.unknown ?? 0)}`,
+          `Avg CPU: ${typeof avgCpu === 'number' ? `${avgCpu.toFixed(1)}%` : 'n/a'}`,
+          `Avg Memory: ${typeof avgMemory === 'number' ? `${(avgMemory * 100).toFixed(1)}%` : 'n/a'}`
         ].join('  |  '),
         'Overall Status'
       );
@@ -814,13 +919,13 @@ const healthCommand: Command = {
           { key: 'id', header: 'Agent ID', width: 18 },
           { key: 'type', header: 'Type', width: 12 },
           { key: 'health', header: 'Health', width: 10, format: formatHealthStatus },
-          { key: 'cpu', header: 'CPU %', width: 8, align: 'right', format: (v) => `${Number(v ?? 0).toFixed(1)}%` },
+          { key: 'cpu', header: 'CPU %', width: 8, align: 'right', format: (v) => typeof v === 'number' ? `${v.toFixed(1)}%` : 'n/a' },
           { key: 'memory', header: 'Memory', width: 10, align: 'right', format: (v: unknown) => {
             const mem = v as { used: number; limit: number } | undefined;
-            if (!mem) return '0%';
+            if (!mem || !mem.limit) return 'n/a';
             return `${(mem.used / mem.limit * 100).toFixed(0)}%`;
           }},
-          { key: 'tasks', header: 'Tasks', width: 12, align: 'right', format: (v: unknown) => {
+          { key: 'tasks', header: 'Calls', width: 12, align: 'right', format: (v: unknown) => {
             const t = v as { active: number; completed: number } | undefined;
             if (!t) return '0/0';
             return `${t.active ?? 0}/${t.completed ?? 0}`;
@@ -835,15 +940,14 @@ const healthCommand: Command = {
         for (const agent of healthAgents) {
           output.writeln();
           output.writeln(output.highlight(agent.id));
-          const uptime = agent.uptime ?? 0;
-          const latency = agent.latency ?? { avg: 0, p99: 0 };
-          const tasks = agent.tasks ?? { completed: 0, failed: 0, queued: 0 };
-          const errors = agent.errors ?? { count: 0 };
+          const latency = agent.latency;
+          const tasks = agent.tasks;
+          const errors = agent.errors;
           output.printList([
-            `Uptime: ${(uptime / 1000 / 60).toFixed(1)} min`,
-            `Latency: avg ${(latency.avg ?? 0).toFixed(1)}ms, p99 ${(latency.p99 ?? 0).toFixed(1)}ms`,
-            `Tasks: ${tasks.completed ?? 0} completed, ${tasks.failed ?? 0} failed, ${tasks.queued ?? 0} queued`,
-            `Errors: ${errors.count ?? 0}${errors.lastError ? ` (${errors.lastError})` : ''}`
+            `Registry age: ${typeof agent.registryAgeMs === 'number' ? `${(agent.registryAgeMs / 1000 / 60).toFixed(1)} min` : 'n/a'}`,
+            `Latency: p50 ${typeof latency?.p50 === 'number' ? `${latency.p50.toFixed(1)}ms` : 'n/a'}, p95 ${typeof latency?.p95 === 'number' ? `${latency.p95.toFixed(1)}ms` : 'n/a'}`,
+            `Observed provider calls (last 20): ${tasks?.completed ?? 0} API-success, ${tasks?.failed ?? 0} error`,
+            `Errors: ${errors?.count ?? 0}${errors?.lastError ? ` (${errors.lastError})` : ''}`
           ]);
         }
       }
@@ -995,7 +1099,7 @@ function formatLogLevel(level: string): string {
 export const agentCommand: Command = {
   name: 'agent',
   description: 'Agent management commands',
-  subcommands: [spawnCommand, listCommand, statusCommand, stopCommand, metricsCommand, poolCommand, healthCommand, logsCommand, ...wasmSubcommands],
+  subcommands: [spawnCommand, listCommand, statusCommand, stopCommand, metricsCommand, poolCommand, healthCommand, logsCommand, ...wasmSubcommands, agentPublishCommand],
   options: [],
   examples: [
     { command: 'claude-flow agent spawn -t coder', description: 'Spawn a coder agent' },

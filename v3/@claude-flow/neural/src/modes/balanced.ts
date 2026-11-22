@@ -5,7 +5,7 @@
  * - +25% quality improvement
  * - 18ms overhead
  * - Rank-4 LoRA
- * - Pattern caching
+ * - Exact recall over live patterns
  * - Standard learning pipeline
  */
 
@@ -26,11 +26,6 @@ import { BaseModeImplementation } from './base.js';
 export class BalancedMode extends BaseModeImplementation {
   readonly mode = 'balanced';
 
-  // Pattern cache
-  private patternCache: Map<string, PatternMatch[]> = new Map();
-  private cacheHits = 0;
-  private cacheMisses = 0;
-
   // Learning state
   private gradientAccumulator: Map<string, Float32Array> = new Map();
   private momentumBuffers: Map<string, Float32Array> = new Map();
@@ -44,20 +39,20 @@ export class BalancedMode extends BaseModeImplementation {
 
   async initialize(): Promise<void> {
     await super.initialize();
-    this.patternCache.clear();
     this.gradientAccumulator.clear();
     this.momentumBuffers.clear();
+    this.lastConsolidationSnapshot.clear();
   }
 
   async cleanup(): Promise<void> {
-    this.patternCache.clear();
     this.gradientAccumulator.clear();
     this.momentumBuffers.clear();
+    this.lastConsolidationSnapshot.clear();
     await super.cleanup();
   }
 
   /**
-   * Find patterns using similarity search with caching
+   * Find patterns using exact similarity search
    */
   async findPatterns(
     embedding: Float32Array,
@@ -66,42 +61,39 @@ export class BalancedMode extends BaseModeImplementation {
   ): Promise<PatternMatch[]> {
     const startTime = performance.now();
 
-    // Check cache
-    const cacheKey = this.computeCacheKey(embedding);
-    const cached = this.patternCache.get(cacheKey);
-
-    if (cached && cached.length >= k) {
-      this.cacheHits++;
-      this.totalPatternTime += performance.now() - startTime;
-      this.totalPatternMatches++;
-      return cached.slice(0, k);
-    }
-
-    this.cacheMisses++;
-
-    // Compute similarities for all patterns
+    // Both queries and stored vectors are mutable, including through references
+    // returned by storePattern. A cross-call ranking cannot be reused safely.
     const matches: PatternMatch[] = [];
-
+    const bounded = Number.isInteger(k) && k > 0 && k <= 8;
+    let needsFullSort = !bounded;
     for (const pattern of patterns) {
       const similarity = this.cosineSimilarity(embedding, pattern.embedding);
-      matches.push({
-        pattern,
-        similarity,
-        confidence: similarity * pattern.successRate,
-        latencyMs: 0,
-      });
+      // JS's full sort treats a NaN comparator result as a tie. Preserve its
+      // behavior for non-finite input instead of guessing an insertion rank.
+      if (bounded && Number.isNaN(similarity)) {
+        needsFullSort = true;
+        matches.length = 0;
+        for (const p of patterns) {
+          const score = this.cosineSimilarity(embedding, p.embedding);
+          matches.push({ pattern: p, similarity: score, confidence: score * p.successRate, latencyMs: 0 });
+        }
+        break;
+      }
+      if (bounded && matches.length === k && similarity <= matches[k - 1].similarity) continue;
+      const match = { pattern, similarity, confidence: similarity * pattern.successRate, latencyMs: 0 };
+      if (!bounded) {
+        matches.push(match);
+      } else {
+        // Strict comparison preserves corpus order for tied scores.
+        let i = Math.min(matches.length, k - 1);
+        while (i > 0 && similarity > matches[i - 1].similarity) {
+          matches[i] = matches[i - 1];
+          i--;
+        }
+        matches[i] = match;
+      }
     }
-
-    // Sort by similarity descending
-    matches.sort((a, b) => b.similarity - a.similarity);
-    const topK = matches.slice(0, k);
-
-    // Cache result
-    if (this.patternCache.size > 500) {
-      const firstKey = this.patternCache.keys().next().value;
-      if (firstKey) this.patternCache.delete(firstKey);
-    }
-    this.patternCache.set(cacheKey, topK);
+    const topK = needsFullSort ? matches.sort((a, b) => b.similarity - a.similarity).slice(0, k) : matches;
 
     this.totalPatternTime += performance.now() - startTime;
     this.totalPatternMatches++;
@@ -211,9 +203,7 @@ export class BalancedMode extends BaseModeImplementation {
       : 0;
 
     return {
-      cacheHitRate: this.cacheHits + this.cacheMisses > 0
-        ? this.cacheHits / (this.cacheHits + this.cacheMisses)
-        : 0,
+      cacheHitRate: 0,
       avgPatternMatchMs: this.totalPatternMatches > 0
         ? this.totalPatternTime / this.totalPatternMatches
         : 0,
@@ -221,20 +211,9 @@ export class BalancedMode extends BaseModeImplementation {
         ? this.totalLearnTime / this.learnIterations
         : 0,
       avgImprovement,
-      patternCacheSize: this.patternCache.size,
+      patternCacheSize: 0,
       learnIterations: this.learnIterations,
     };
-  }
-
-  /**
-   * Compute cache key from embedding
-   */
-  private computeCacheKey(embedding: Float32Array): string {
-    const keyParts: string[] = [];
-    for (let i = 0; i < Math.min(16, embedding.length); i++) {
-      keyParts.push(embedding[i].toFixed(2));
-    }
-    return keyParts.join(',');
   }
 
   /**
@@ -295,5 +274,72 @@ export class BalancedMode extends BaseModeImplementation {
     }
 
     return lambda * penalty * 0.5;
+  }
+
+  // Raw gradientAccumulator snapshot as of the last call to
+  // getConsolidationSnapshot(), used to compute a bounded per-cycle delta
+  // instead of exposing the ever-growing cumulative accumulator directly.
+  private lastConsolidationSnapshot: Map<string, Float32Array> = new Map();
+
+  /**
+   * Derive a Fisher-information/means snapshot from the CHANGE in this
+   * mode's accumulated gradients since the last consolidation, for EWC
+   * consolidation.
+   *
+   * `gradientAccumulator` is a lifetime-cumulative sum (it is only ever
+   * `.clear()`'d in `initialize()`/`cleanup()`), so squaring it directly
+   * would make Fisher importance grow without bound over a long-running
+   * session rather than reflecting any one task's actual contribution.
+   * Using the delta against the previous snapshot bounds each cycle's
+   * contribution to roughly that cycle's own gradient magnitude (momentum
+   * is itself an EMA, so bounded), which is what `consolidateEWC()`'s decay
+   * step is actually meant to decay against.
+   *
+   * `means` is the accumulator itself at this point (the EWC anchor), so
+   * the penalty is zero immediately after consolidation and grows as the
+   * accumulator moves away from it.
+   *
+   * Fisher uses the diagonal empirical-Fisher approximation
+   * (Fisher_i ~= delta_i^2), the same style of estimator already proven out
+   * — for this exact squared-gradient-of-reward update rule — in this
+   * monorepo's own
+   * `v3/plugins/cognitive-kernel/src/bridges/sona-bridge.ts::computeFisher()`.
+   * Non-finite components are dropped (treated as zero) so a bad sample
+   * can't poison consolidated state.
+   */
+  getConsolidationSnapshot(): {
+    fisher: Map<string, Float32Array>;
+    means: Map<string, Float32Array>;
+  } {
+    const fisher = new Map<string, Float32Array>();
+    const means = new Map<string, Float32Array>();
+
+    for (const [key, gradient] of this.gradientAccumulator) {
+      const previous = this.lastConsolidationSnapshot.get(key);
+      const delta = new Float32Array(gradient.length);
+      const snapshot = new Float32Array(gradient.length);
+
+      for (let i = 0; i < gradient.length; i++) {
+        const g = gradient[i];
+        const safe = Number.isFinite(g) ? g : 0;
+        const prevSafe = previous && Number.isFinite(previous[i]) ? previous[i] : 0;
+        delta[i] = safe - prevSafe;
+        snapshot[i] = safe;
+      }
+
+      const f = new Float32Array(delta.length);
+      for (let i = 0; i < delta.length; i++) {
+        f[i] = delta[i] * delta[i];
+      }
+
+      fisher.set(key, f);
+      // EWC anchors on the parameter values at consolidation (theta*), not on
+      // the delta: computeEWCPenalty() measures current - means, which must be
+      // zero right after consolidating.
+      means.set(key, Float32Array.from(snapshot));
+      this.lastConsolidationSnapshot.set(key, snapshot);
+    }
+
+    return { fisher, means };
   }
 }

@@ -1,0 +1,19 @@
+# Changelog: ruflo-protector
+
+Newest first. One `## <version> — <date>` heading per version, then `feat:`, `fix:`, `breaking:` and `chore:` bullets (ADR-478). Built from git history; this is the whole history.
+
+## 0.1.3 — 2026-11-19
+- feat: Project Anatole is on by default: ruflo 3.79.0 adds it to the mod bundle, so `ruflo init` and `ruflo mods install` enable it in `learn` mode (ADR-453 §14.1 amendment); an explicit `false` in `enabledPlugins` is kept
+
+## 0.1.2 — 2026-10-12
+- fix: the shared text screen now catches `.env` and e-mailed credentials, no longer flags a model's token talk (`--max-tokens`, `/oauth/token`, "token usage"), and no longer flags values that only name where a secret lives (`./service-account.json`, `--set-secrets=NAME=NAME:latest`); every rule stays linear (#4094, thanks @proffesor-for-testing)
+
+## 0.1.1 — 2026-10-07
+- feat: shared toast system with levels, dedupe, persistence and Settings (ADR-477)
+- feat: shared toast policy and its call sites (ADR-477), work in progress
+- feat: Project Anatole plugin, tests, corpus gate, bench, fleet registration
+- fix: a toast needs no engine.create (bind at session.start too), a throwing clock falls back to the wall clock; update the cost ladder expectati…
+- fix: status.json carries version 1 and the *Ms times the Mods scan needs; the console maps the plugin to Security & Doctor
+
+## 0.1.0 — 2026-10-05
+- feat: Project Anatole plugin core (WIP)
