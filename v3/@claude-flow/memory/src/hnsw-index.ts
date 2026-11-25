@@ -270,8 +270,11 @@ export class HNSWIndex extends EventEmitter {
       ? this.quantizer.encode(vector)
       : vector;
 
-    // Pre-normalize vector for O(1) cosine similarity
-    const normalizedVector = this.config.metric === 'cosine'
+    // Pre-normalize vector for O(1) cosine similarity.
+    // Skipped for product quantization: storedVector holds PQ centroid
+    // indices, not embedding coordinates, so normalizing it is meaningless
+    // (and productQuantizeDistance() below never consults normalizedVector).
+    const normalizedVector = this.config.metric === 'cosine' && !this.isProductQuantized()
       ? this.normalizeVector(storedVector)
       : null;
 
@@ -335,8 +338,9 @@ export class HNSWIndex extends EventEmitter {
       ? this.quantizer.encode(query)
       : query;
 
-    // Pre-normalize query for O(1) cosine similarity
-    const normalizedQuery = this.config.metric === 'cosine'
+    // Pre-normalize query for O(1) cosine similarity (see addPoint() for why
+    // this is skipped under product quantization).
+    const normalizedQuery = this.config.metric === 'cosine' && !this.isProductQuantized()
       ? this.normalizeVector(queryVector)
       : null;
 
@@ -543,7 +547,25 @@ export class HNSWIndex extends EventEmitter {
    * Magic header for serialized HNSW snapshots.
    * Format: "HNSW" + version byte (0x01).
    */
-  static readonly SERIALIZATION_MAGIC = Buffer.from([0x48, 0x4e, 0x53, 0x57, 0x01]);
+  static readonly SERIALIZATION_MAGIC = Buffer.from([0x48, 0x4e, 0x53, 0x57, 0x02]);
+
+  /**
+   * v1 format (no quantization section) — kept readable for backward
+   * compatibility. Dream Cycle 2026-10-03: v1 serialize()/deserialize()
+   * dropped `config.quantization` (and trained PQ codebooks) entirely, so
+   * every reload silently lost quantizer state. v1 buffers still
+   * deserialize exactly as before (no quantizer restored, same pre-existing
+   * behavior) rather than being rejected.
+   */
+  private static readonly SERIALIZATION_MAGIC_V1 = Buffer.from([0x48, 0x4e, 0x53, 0x57, 0x01]);
+
+  private static bufMatchesMagic(buf: Buffer, magic: Buffer): boolean {
+    if (buf.length < magic.length) return false;
+    for (let i = 0; i < magic.length; i++) {
+      if (buf[i] !== magic[i]) return false;
+    }
+    return true;
+  }
 
   /**
    * Serialize the index to a binary buffer.
@@ -583,6 +605,31 @@ export class HNSWIndex extends EventEmitter {
 
     chunks.push(this.encodeLengthPrefixedString(this.config.metric));
     chunks.push(this.encodeLengthPrefixedString(this.entryPoint ?? ''));
+
+    // Quantization section (v2 — Dream Cycle 2026-10-03). Persists the
+    // quantization config and, for trained product quantization, the
+    // learned codebooks, so distance dispatch (isProductQuantized()) is
+    // restored correctly on reload instead of silently falling back to
+    // generic cosine/euclidean on raw PQ centroid indices.
+    if (this.config.quantization) {
+      chunks.push(Buffer.from([1]));
+      chunks.push(this.encodeLengthPrefixedString(this.config.quantization.type));
+      const qmeta = Buffer.alloc(12);
+      qmeta.writeUInt32BE(this.config.quantization.bits ?? 0, 0);
+      qmeta.writeUInt32BE(this.config.quantization.subquantizers ?? 0, 4);
+      qmeta.writeUInt32BE(this.config.quantization.codebookSize ?? 0, 8);
+      chunks.push(qmeta);
+
+      const codebooks = this.quantizer?.exportCodebooks() ?? null;
+      if (codebooks) {
+        chunks.push(Buffer.from([1]));
+        chunks.push(this.encodeLengthPrefixedString(JSON.stringify(codebooks)));
+      } else {
+        chunks.push(Buffer.from([0]));
+      }
+    } else {
+      chunks.push(Buffer.from([0]));
+    }
 
     const nodeCountBuf = Buffer.alloc(4);
     nodeCountBuf.writeUInt32BE(this.nodes.size, 0);
@@ -632,11 +679,15 @@ export class HNSWIndex extends EventEmitter {
     if (buf.length < HNSWIndex.SERIALIZATION_MAGIC.length) {
       throw new Error('HNSWIndex.deserialize: buffer too short for magic header');
     }
-    for (let i = 0; i < HNSWIndex.SERIALIZATION_MAGIC.length; i++) {
-      if (buf[i] !== HNSWIndex.SERIALIZATION_MAGIC[i]) {
-        throw new Error(
-          `HNSWIndex.deserialize: magic header mismatch at byte ${i} (got 0x${buf[i].toString(16)}, expected 0x${HNSWIndex.SERIALIZATION_MAGIC[i].toString(16)})`
-        );
+    const isV2 = HNSWIndex.bufMatchesMagic(buf, HNSWIndex.SERIALIZATION_MAGIC);
+    const isV1 = !isV2 && HNSWIndex.bufMatchesMagic(buf, HNSWIndex.SERIALIZATION_MAGIC_V1);
+    if (!isV2 && !isV1) {
+      for (let i = 0; i < HNSWIndex.SERIALIZATION_MAGIC.length; i++) {
+        if (buf[i] !== HNSWIndex.SERIALIZATION_MAGIC[i]) {
+          throw new Error(
+            `HNSWIndex.deserialize: magic header mismatch at byte ${i} (got 0x${buf[i].toString(16)}, expected 0x${HNSWIndex.SERIALIZATION_MAGIC[i].toString(16)})`
+          );
+        }
       }
     }
 
@@ -655,6 +706,38 @@ export class HNSWIndex extends EventEmitter {
     offset = entryRead.offset;
     const entryPoint = entryRead.value === '' ? null : entryRead.value;
 
+    // Quantization section (v2 only — absent/skipped for v1 buffers, which
+    // restore with no quantizer, matching their pre-existing behavior).
+    let quantization: QuantizationConfig | undefined;
+    let restoredCodebooks: unknown = null;
+    if (isV2) {
+      const hasQuantization = buf[offset]; offset += 1;
+      if (hasQuantization) {
+        const typeRead = readLengthPrefixedString(buf, offset);
+        offset = typeRead.offset;
+        const bits = buf.readUInt32BE(offset); offset += 4;
+        const subquantizers = buf.readUInt32BE(offset); offset += 4;
+        const codebookSize = buf.readUInt32BE(offset); offset += 4;
+        quantization = {
+          type: typeRead.value as QuantizationConfig['type'],
+          ...(bits ? { bits: bits as 4 | 8 | 16 } : {}),
+          ...(subquantizers ? { subquantizers } : {}),
+          ...(codebookSize ? { codebookSize } : {}),
+        };
+
+        const hasCodebooks = buf[offset]; offset += 1;
+        if (hasCodebooks) {
+          const cbRead = readLengthPrefixedString(buf, offset);
+          offset = cbRead.offset;
+          try {
+            restoredCodebooks = JSON.parse(cbRead.value);
+          } catch {
+            restoredCodebooks = null; // corrupt JSON -> leave quantizer untrained, don't throw
+          }
+        }
+      }
+    }
+
     const nodeCount = buf.readUInt32BE(offset); offset += 4;
 
     const index = new HNSWIndex({
@@ -662,9 +745,13 @@ export class HNSWIndex extends EventEmitter {
       M,
       efConstruction,
       metric,
+      quantization,
     });
     index.maxLevel = maxLevel;
     index.entryPoint = entryPoint;
+    if (restoredCodebooks && index.quantizer) {
+      index.quantizer.importCodebooks(restoredCodebooks);
+    }
 
     for (let n = 0; n < nodeCount; n++) {
       const idRead = readLengthPrefixedString(buf, offset);
@@ -993,7 +1080,49 @@ export class HNSWIndex extends EventEmitter {
     }
   }
 
+  /**
+   * True when this index uses product quantization with trained codebooks.
+   * Stored vectors are then PQ centroid indices, not embedding coordinates —
+   * generic metric distances (cosine/euclidean/dot/manhattan) computed
+   * directly on those indices are meaningless (index 5 vs index 200 has no
+   * relation to embedding-space proximity). Falls back to false during the
+   * pre-training bootstrap window (see Quantizer.productQuantize()), where
+   * stored vectors are still sub-vector-mean floats and generic distance,
+   * while imprecise, is not nonsensical — matching prior behavior exactly.
+   */
+  private isProductQuantized(): boolean {
+    return (
+      this.quantizer !== null &&
+      this.config.quantization?.type === 'product' &&
+      this.quantizer.isPQTrained
+    );
+  }
+
   private distance(a: Float32Array, b: Float32Array): number {
+    // Pre-existing, disclosed limitation (not introduced by this fix): any
+    // vector added before PQ codebook training completes is stored under a
+    // sub-vector-mean fallback encoding (see Quantizer.productQuantize())
+    // and is never re-encoded once training finishes — the original raw
+    // vector isn't retained. isValidPQEncoding() is a *plausibility*
+    // heuristic, not a proof of provenance: it structurally guards the
+    // crash/out-of-bounds case (fallback values outside codebook range, or
+    // non-integer), but a fallback encoding whose sub-vector means
+    // coincidentally land on small non-negative integers (most concretely,
+    // an all-zero or otherwise degenerate vector added pre-training) can
+    // still pass the check and be silently mis-dispatched to
+    // productQuantizeDistance() as if it were a real centroid assignment.
+    // Closing this fully would need per-node encoding-provenance tracking
+    // (e.g. a sentinel/flag threaded through HNSWNode and its persistence
+    // format), out of scope for this patch — flagged as a known residual
+    // risk, not treated as fully solved.
+    if (
+      this.isProductQuantized() &&
+      this.quantizer!.isValidPQEncoding(a) &&
+      this.quantizer!.isValidPQEncoding(b)
+    ) {
+      return this.quantizer!.productQuantizeDistance(a, b);
+    }
+
     switch (this.config.metric) {
       case 'cosine':
         return this.cosineDistance(a, b);
@@ -1129,6 +1258,55 @@ class Quantizer {
   constructor(config: QuantizationConfig, dimensions: number) {
     this.config = config;
     this.dimensions = dimensions;
+  }
+
+  /**
+   * Export trained PQ codebooks for persistence (Dream Cycle 2026-10-03 —
+   * HNSWIndex.serialize()/deserialize() previously dropped quantization
+   * state entirely, silently re-breaking the product-quantization distance
+   * dispatch fixed in #3093/#3094 on every reload). Returns null when this
+   * isn't product quantization or training hasn't completed yet — matching
+   * the existing pre-training bootstrap fallback, not a new limitation.
+   */
+  exportCodebooks(): number[][][] | null {
+    return this.pqTrained ? this.codebooks : null;
+  }
+
+  /**
+   * Restore previously-trained PQ codebooks after deserialization.
+   *
+   * `codebooks` comes from `JSON.parse()` on persisted (possibly corrupted)
+   * data, so it is untyped input, not a trusted `number[][][]`. Validates
+   * shape (`numSubquantizers` sub-arrays, each `numCentroids` centroids of
+   * the expected per-subvector length) and that every value is a finite
+   * number before accepting it. On any mismatch, leaves the quantizer
+   * untrained (same as the pre-training bootstrap state) rather than
+   * adopting data that could produce NaN/garbage distances. Returns
+   * whether the codebooks were accepted.
+   */
+  importCodebooks(codebooks: unknown): boolean {
+    const numSubquantizers = this.config.subquantizers || 8;
+    const numCentroids = this.config.codebookSize || 256;
+    const subvectorSize = Math.ceil(this.dimensions / numSubquantizers);
+
+    if (!Array.isArray(codebooks) || codebooks.length !== numSubquantizers) return false;
+
+    for (let m = 0; m < numSubquantizers; m++) {
+      const start = m * subvectorSize;
+      const expectedLen = Math.min(subvectorSize, this.dimensions - start);
+      const sub = codebooks[m];
+      if (!Array.isArray(sub) || sub.length !== numCentroids) return false;
+      for (const centroid of sub) {
+        if (!Array.isArray(centroid) || centroid.length !== expectedLen) return false;
+        for (const value of centroid) {
+          if (typeof value !== 'number' || !Number.isFinite(value)) return false;
+        }
+      }
+    }
+
+    this.codebooks = codebooks as number[][][];
+    this.pqTrained = true;
+    return true;
   }
 
   /**
@@ -1312,14 +1490,17 @@ class Quantizer {
    * Compute approximate squared Euclidean distance between two PQ-encoded
    * vectors using their centroid indices and the shared codebooks.
    *
-   * @param encoded1 - Centroid indices for vector 1 (length = numSubquantizers)
+   * @param encoded1 - Centroid indices for vector 1 (length = numSubquantizers).
+   *   Typed Float32Array to match productQuantize()'s actual return type —
+   *   indices are small integers (0..codebookSize-1) exactly representable
+   *   in float32.
    * @param encoded2 - Centroid indices for vector 2 (length = numSubquantizers)
    * @param codebooks - Trained codebooks from trainProductQuantizer()
    * @returns Approximate squared Euclidean distance
    */
   productQuantizeDistance(
-    encoded1: Uint8Array,
-    encoded2: Uint8Array,
+    encoded1: Float32Array,
+    encoded2: Float32Array,
     codebooks?: number[][][],
   ): number {
     const cb = codebooks || this.codebooks;
@@ -1411,6 +1592,23 @@ class Quantizer {
    */
   getCodebooks(): number[][][] | null {
     return this.codebooks;
+  }
+
+  /**
+   * True when `encoded` looks like a real trained-codebook PQ encoding
+   * (length matches numSubquantizers, every value is a non-negative integer
+   * in range for its sub-quantizer's codebook). False for the pre-training
+   * sub-vector-mean fallback (see productQuantize()), which cannot be
+   * compared via productQuantizeDistance() without corrupting results or
+   * indexing out of bounds.
+   */
+  isValidPQEncoding(encoded: Float32Array): boolean {
+    if (!this.codebooks || encoded.length !== this.codebooks.length) return false;
+    for (let m = 0; m < encoded.length; m++) {
+      const idx = encoded[m];
+      if (!Number.isInteger(idx) || idx < 0 || idx >= this.codebooks[m].length) return false;
+    }
+    return true;
   }
 }
 

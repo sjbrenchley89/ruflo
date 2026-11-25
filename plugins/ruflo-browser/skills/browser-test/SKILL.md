@@ -2,7 +2,7 @@
 name: browser-test
 description: UI test recipe -- composes browser-record (capture) + browser-replay (verify) so every test produces a replayable RVF artifact, not an ephemeral run
 argument-hint: "<url> [--screenshot] [--against <prior-session-id>]"
-allowed-tools: mcp__claude-flow__browser_open mcp__claude-flow__browser_click mcp__claude-flow__browser_fill mcp__claude-flow__browser_type mcp__claude-flow__browser_press mcp__claude-flow__browser_check mcp__claude-flow__browser_uncheck mcp__claude-flow__browser_select mcp__claude-flow__browser_hover mcp__claude-flow__browser_wait mcp__claude-flow__browser_screenshot mcp__claude-flow__browser_snapshot mcp__claude-flow__browser_get-text mcp__claude-flow__browser_get-title mcp__claude-flow__browser_get-url mcp__claude-flow__browser_get-value mcp__claude-flow__browser_eval mcp__claude-flow__browser_close mcp__claude-flow__browser_session-list mcp__claude-flow__aidefence_is_safe Bash Read Write
+allowed-tools: mcp__plugin_ruflo-core_ruflo__browser_open mcp__plugin_ruflo-core_ruflo__browser_click mcp__plugin_ruflo-core_ruflo__browser_fill mcp__plugin_ruflo-core_ruflo__browser_type mcp__plugin_ruflo-core_ruflo__browser_press mcp__plugin_ruflo-core_ruflo__browser_check mcp__plugin_ruflo-core_ruflo__browser_uncheck mcp__plugin_ruflo-core_ruflo__browser_select mcp__plugin_ruflo-core_ruflo__browser_hover mcp__plugin_ruflo-core_ruflo__browser_wait mcp__plugin_ruflo-core_ruflo__browser_screenshot mcp__plugin_ruflo-core_ruflo__browser_snapshot mcp__plugin_ruflo-core_ruflo__browser_get-text mcp__plugin_ruflo-core_ruflo__browser_get-title mcp__plugin_ruflo-core_ruflo__browser_get-url mcp__plugin_ruflo-core_ruflo__browser_get-value mcp__plugin_ruflo-core_ruflo__browser_eval mcp__plugin_ruflo-core_ruflo__browser_close mcp__plugin_ruflo-core_ruflo__browser_session-list mcp__plugin_ruflo-core_ruflo__aidefence_is_safe Bash Read Write
 ---
 
 # Browser Test
@@ -25,7 +25,7 @@ Automated UI testing. **Now backed by a recorded RVF session container** instead
 4. **Validate** with `browser_get-text` / `browser_get-value` / `browser_get-title` / `browser_get-url`. Validation outcomes go into `findings.md` inside the RVF container.
 5. **Screenshot** before / after key interactions for visual regression. Filenames follow `<step-id>.png`.
 6. **Snapshot** the accessibility tree at navigation boundaries.
-7. **End** the session: `trajectory-end --verdict pass|fail`, `rvf compact`, AgentDB index in `browser-sessions`.
+7. **End** the session: `trajectory-end --quality 1 --success` (pass) or `--quality 0` (fail), `rvf compact`, AgentDB index in `browser-sessions`.
 8. **(Optional) Diff against `--against <prior-session-id>`**: invoke `browser-screenshot-diff` to compare the new run with a baseline.
 
 ## Navigation

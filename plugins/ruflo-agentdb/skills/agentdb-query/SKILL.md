@@ -2,12 +2,12 @@
 name: agentdb-query
 description: Query AgentDB through the controller bridge -- semantic routing, hierarchical recall, causal graphs, context synthesis, pattern store/search
 argument-hint: "<query>"
-allowed-tools: mcp__claude-flow__agentdb_semantic-route mcp__claude-flow__agentdb_hierarchical-recall mcp__claude-flow__agentdb_hierarchical-store mcp__claude-flow__agentdb_context-synthesize mcp__claude-flow__agentdb_causal-edge mcp__claude-flow__agentdb_pattern-search mcp__claude-flow__agentdb_pattern-store mcp__claude-flow__agentdb_controllers mcp__claude-flow__agentdb_health mcp__claude-flow__agentdb_batch mcp__claude-flow__agentdb_feedback mcp__claude-flow__agentdb_consolidate mcp__claude-flow__agentdb_session-start mcp__claude-flow__agentdb_session-end Bash
+allowed-tools: mcp__plugin_ruflo-core_ruflo__agentdb_semantic-route mcp__plugin_ruflo-core_ruflo__agentdb_hierarchical-recall mcp__plugin_ruflo-core_ruflo__agentdb_hierarchical-store mcp__plugin_ruflo-core_ruflo__agentdb_context-synthesize mcp__plugin_ruflo-core_ruflo__agentdb_causal-edge mcp__plugin_ruflo-core_ruflo__agentdb_pattern-search mcp__plugin_ruflo-core_ruflo__agentdb_pattern-store mcp__plugin_ruflo-core_ruflo__agentdb_controllers mcp__plugin_ruflo-core_ruflo__agentdb_health mcp__plugin_ruflo-core_ruflo__agentdb_batch mcp__plugin_ruflo-core_ruflo__agentdb_feedback mcp__plugin_ruflo-core_ruflo__agentdb_consolidate mcp__plugin_ruflo-core_ruflo__agentdb_session-start mcp__plugin_ruflo-core_ruflo__agentdb_session-end Bash
 ---
 
 # AgentDB Query
 
-Query and manage AgentDB through the controller bridge. AgentDB exposes 15 `agentdb_*` MCP tools; this skill enumerates the standard usage path.
+Query and manage AgentDB through the controller bridge. AgentDB exposes 20 `agentdb_*` MCP tools; this skill enumerates the standard usage path.
 
 ## When to use
 
@@ -15,17 +15,17 @@ When you need to store, retrieve, or search knowledge across agent sessions. Age
 
 ## Steps
 
-1. **Check health** — `mcp__claude-flow__agentdb_health`. Sanity-check `available: true`.
-2. **Start session** — `mcp__claude-flow__agentdb_session-start` if not already active.
-3. **Store knowledge** — `mcp__claude-flow__agentdb_hierarchical-store` for structured tier-keyed data (tiers: `working|episodic|semantic`).
-4. **Recall knowledge** — `mcp__claude-flow__agentdb_hierarchical-recall` with a query.
-5. **Search patterns** — `mcp__claude-flow__agentdb_pattern-search` for learned patterns (ReasoningBank-routed).
-6. **Synthesize context** — `mcp__claude-flow__agentdb_context-synthesize` to combine multiple memories.
-7. **Build causal graph** — `mcp__claude-flow__agentdb_causal-edge` to link related knowledge.
+1. **Check health** — `mcp__plugin_ruflo-core_ruflo__agentdb_health`. Sanity-check `available: true`.
+2. **Start session** — `mcp__plugin_ruflo-core_ruflo__agentdb_session-start` if not already active.
+3. **Store knowledge** — `mcp__plugin_ruflo-core_ruflo__agentdb_hierarchical-store` for structured tier-keyed data (tiers: `working|episodic|semantic`).
+4. **Recall knowledge** — `mcp__plugin_ruflo-core_ruflo__agentdb_hierarchical-recall` with a query.
+5. **Search patterns** — `mcp__plugin_ruflo-core_ruflo__agentdb_pattern-search` for learned patterns (ReasoningBank-routed).
+6. **Summarize past task outcomes** — `mcp__plugin_ruflo-core_ruflo__agentdb_context-synthesize` for the success rate, reward and critique patterns of earlier tasks like this one. Not for combining ordinary memories: it summarizes validated task episodes (task, reward, success) and answers `no-memories` or `no-eligible-episodes` for ordinary records, which is correct, not missing data. Combine those yourself from what recall and search return.
+7. **Build causal graph** — `mcp__plugin_ruflo-core_ruflo__agentdb_causal-edge` to link related knowledge.
 
 ## Available controller groups
 
-Call `mcp__claude-flow__agentdb_controllers` to list the runtime registry. Functional categories surfaced via the 15 MCP tools:
+Call `mcp__plugin_ruflo-core_ruflo__agentdb_controllers` to list the runtime registry. Functional categories surfaced via the 20 MCP tools:
 
 - **Hierarchical** — `agentdb_hierarchical-store`, `_recall` (tier-routed)
 - **Pattern** — `agentdb_pattern-store`, `_search` (ReasoningBank-routed)
@@ -34,6 +34,8 @@ Call `mcp__claude-flow__agentdb_controllers` to list the runtime registry. Funct
 - **Lifecycle** — `agentdb_health`, `_controllers`, `_session-start`, `_session-end`
 - **Bulk** — `agentdb_batch` (≤500 entries), `_consolidate`
 - **Quality** — `agentdb_feedback`
+- **Graph reads** — `agentdb_graph-query` (k-hop / semantic / pagerank from a domain-prefixed node id such as `entity:xyz`; SQL k-hop is bounded at 3 hops, check `appliedDepth` and `truncated`) and `agentdb_graph-pathfinder` (`personalized-pagerank` by default; `dynamic-mincut` returns the seed's side of an exact min cut with `cutValue`, `cutEdges` and `backend`; see the `graph-mincut` skill)
+- **Deletes (destructive)** — `agentdb_hierarchical-delete`, `agentdb_causal-edge-delete`, `agentdb_causal-node-delete`. Confirm the exact ids with the user before calling; they are not undoable from this plugin.
 
 ## Important: namespace handling
 

@@ -11,6 +11,7 @@
 
 import { type MCPTool, getProjectCwd } from './types.js';
 import { validateIdentifier } from './validate-input.js';
+import { loadSwarmStore } from './swarm-tools.js';
 import { existsSync, readFileSync, writeFileSync, mkdirSync, statfsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -112,7 +113,10 @@ export const systemTools: MCPTool[] = [
     },
     handler: async (input) => {
       const metrics = loadMetrics();
-      const uptime = Date.now() - new Date(metrics.startTime).getTime();
+      // #2235(B) — live process uptime, not the persisted metrics.startTime
+      // (which is the file's creation timestamp and survived across restarts,
+      // making system_status report stale ~8.8-day uptime on a fresh server).
+      const uptime = Math.floor(process.uptime() * 1000);
 
       const status = {
         status: metrics.health >= 0.8 ? 'healthy' : metrics.health >= 0.5 ? 'degraded' : 'unhealthy',
@@ -252,7 +256,7 @@ export const systemTools: MCPTool[] = [
           } catch { /* tracker not available — fall back to stored value */ }
           return store.requests;
         })(),
-        uptime: Date.now() - new Date(store.startTime).getTime(),
+        uptime: Math.floor(process.uptime() * 1000), // #2235(B) — live process uptime
         lastCheck: new Date().toISOString(),
       };
 
@@ -371,12 +375,33 @@ export const systemTools: MCPTool[] = [
         });
       }
 
-      // Swarm — cannot verify real connectivity, report unknown
-      checks.push({
-        name: 'swarm',
-        status: 'unknown',
-        message: 'Swarm connectivity not monitored — check coordination store manually',
-      });
+      // Swarm — inspect persisted swarm state
+      {
+        const t0 = performance.now();
+        try {
+          const runningSwarms = Object.values(loadSwarmStore().swarms)
+            .filter(swarm => swarm.status === 'running')
+            .sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime());
+          const elapsed = performance.now() - t0;
+          const count = runningSwarms.length;
+          checks.push({
+            name: 'swarm',
+            status: count > 0 ? 'healthy' : 'unknown',
+            latency: Math.round(elapsed * 100) / 100,
+            message: count > 0
+              ? `${count} running swarm${count === 1 ? '' : 's'} (${runningSwarms[0].swarmId})`
+              : 'No active swarm — run swarm_init',
+          });
+        } catch (error) {
+          const elapsed = performance.now() - t0;
+          checks.push({
+            name: 'swarm',
+            status: 'warning',
+            latency: Math.round(elapsed * 100) / 100,
+            message: `Swarm state check failed: ${error instanceof Error ? error.message : String(error)}`,
+          });
+        }
+      }
 
       // Neural — cannot verify, report unknown
       checks.push({
@@ -497,6 +522,17 @@ export const systemTools: MCPTool[] = [
       },
     },
     handler: async () => {
+      // #2215: flashAttention must reflect the runtime probe, not a stale literal.
+      // Same source-of-truth as hooks_intelligence / neural_status so the tools
+      // can never report contradictory state for the same daemon.
+      let flashAttentionAvailable = false;
+      try {
+        const { getFlashAttention } = await import('@claude-flow/neural');
+        flashAttentionAvailable = getFlashAttention() !== null;
+      } catch {
+        flashAttentionAvailable = false;
+      }
+
       return {
         version: PKG_VERSION,
         nodeVersion: process.version,
@@ -511,7 +547,7 @@ export const systemTools: MCPTool[] = [
           neural: true,
           hnsw: true,
           quantization: true,
-          flashAttention: false,
+          flashAttention: flashAttentionAvailable,
         },
         limits: {
           maxAgents: 100,
@@ -651,6 +687,7 @@ export const systemTools: MCPTool[] = [
         running: tasks.filter(t => t.status === 'in_progress').length,
         completed: tasks.filter(t => t.status === 'completed').length,
         failed: tasks.filter(t => t.status === 'failed').length,
+        cancelled: tasks.filter(t => t.status === 'cancelled').length,
       };
     },
   },

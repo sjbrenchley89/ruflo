@@ -272,7 +272,9 @@ export class ReasoningBank {
         candidates = results
           .map(r => {
             const entry = this.memories.get(r.id);
-            return entry ? { entry, relevance: r.similarity } : null;
+            // detectContradictions() marks the lower-quality side of a
+            // contradicting pair consolidated "to exclude from retrieval" (#5081).
+            return entry && !entry.consolidated ? { entry, relevance: r.similarity } : null;
           })
           .filter((c): c is { entry: MemoryEntry; relevance: number } => c !== null);
         if (candidates.length > 0) usedHnsw = true;
@@ -284,6 +286,7 @@ export class ReasoningBank {
     // Fallback: brute-force search
     if (candidates.length === 0) {
       for (const entry of this.memories.values()) {
+        if (entry.consolidated) continue;
         const relevance = this.cosineSimilarity(queryEmbedding, entry.memory.embedding);
         candidates.push({ entry, relevance });
       }
@@ -362,7 +365,8 @@ export class ReasoningBank {
     const results: RetrievalResult[] = [];
 
     const contentLower = content.toLowerCase();
-    const entries = Array.from(this.memories.values());
+    // Same contradiction-exclusion enforcement as retrieve() — see comment there.
+    const entries = Array.from(this.memories.values()).filter(e => !e.consolidated);
 
     // Score by content similarity
     const scored = entries.map(entry => ({
@@ -461,9 +465,18 @@ export class ReasoningBank {
       await this.judge(trajectory);
     }
 
-    // Only distill successful trajectories
-    if (!trajectory.verdict!.success ||
-        trajectory.qualityScore < this.config.distillationThreshold) {
+    // Distill both outcomes: successful trajectories become a reusable
+    // strategy to repeat, failed ones become a "pitfall" memory to avoid.
+    // A trajectory with no recorded steps carries nothing to distill either
+    // way, matching prior behavior for that one degenerate case.
+    if (trajectory.steps.length === 0) {
+      return null;
+    }
+    const memoryType: 'success' | 'pitfall' = trajectory.verdict!.success ? 'success' : 'pitfall';
+    // Keep the success path exactly as before: a success verdict supplied
+    // without judge() (which already applies this threshold) is still
+    // dropped below distillationThreshold.
+    if (memoryType === 'success' && trajectory.qualityScore < this.config.distillationThreshold) {
       return null;
     }
 
@@ -479,7 +492,8 @@ export class ReasoningBank {
     const memory: DistilledMemory = {
       memoryId: `mem_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`,
       trajectoryId: trajectory.trajectoryId,
-      strategy,
+      memoryType,
+      strategy: memoryType === 'pitfall' ? `AVOID: ${strategy}` : strategy,
       keyLearnings,
       embedding,
       quality: trajectory.qualityScore,
@@ -1177,6 +1191,14 @@ export class ReasoningBank {
 
     for (let i = 0; i < entries.length; i++) {
       for (let j = i + 1; j < entries.length; j++) {
+        // A success and a pitfall memory are never duplicates of each other
+        // regardless of embedding similarity — they encode opposite outcomes
+        // for a similar context, which is exactly the signal worth keeping.
+        // Snapshots written before memoryType existed only held successes.
+        if ((entries[i][1].memory.memoryType ?? 'success') !== (entries[j][1].memory.memoryType ?? 'success')) {
+          continue;
+        }
+
         const sim = this.cosineSimilarity(
           entries[i][1].memory.embedding,
           entries[j][1].memory.embedding

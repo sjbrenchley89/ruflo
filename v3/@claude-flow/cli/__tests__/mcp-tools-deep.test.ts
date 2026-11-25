@@ -17,32 +17,72 @@ import { describe, it, expect, vi, beforeAll, afterAll } from 'vitest';
 // Mock setup - must be before imports
 // ============================================================================
 
-// Mock fs to prevent actual file I/O during tests
-vi.mock('node:fs', () => {
+// Mock fs to prevent actual file I/O during tests (same fake for 'node:fs' and 'fs')
+const createFsFake = vi.hoisted(() => () => {
   const memStore = new Map<string, string>();
+  const descriptors = new Map<number, string>();
+  let nextDescriptor = 3;
+  // The MCP JSON stores write under the policy runtime's lock file
+  // (locked-json-store.ts): exclusive create, owner record, ownership-checked unlink.
+  const constants = { O_RDONLY: 0, O_WRONLY: 1, O_RDWR: 2, O_CREAT: 64, O_EXCL: 128, O_NOFOLLOW: 0, O_NONBLOCK: 0, O_DIRECTORY: 0 };
+  const missing = (p: string) => Object.assign(new Error(`ENOENT: no such file or directory, open '${p}'`), { code: 'ENOENT' });
+  const exclusive = (flags: unknown) => flags === 'wx' || (typeof flags === 'number' && (flags & constants.O_EXCL) !== 0);
+  const fileStat = (p: string) => ({ size: (memStore.get(p) ?? '').length, isFile: () => true, isDirectory: () => false });
   return {
+    constants,
     existsSync: vi.fn((p: string) => memStore.has(p)),
-    readFileSync: vi.fn((p: string) => memStore.get(p) || '{}'),
-    writeFileSync: vi.fn((p: string, d: string) => memStore.set(p, d)),
+    readFileSync: vi.fn((p: string) => {
+      if (!memStore.has(p)) throw missing(p);
+      return memStore.get(p)!;
+    }),
+    writeFileSync: vi.fn((target: string | number, d: string) => {
+      const path = typeof target === 'number' ? descriptors.get(target) : target;
+      if (path !== undefined) memStore.set(path, String(d));
+    }),
+    renameSync: vi.fn((from: string, to: string) => {
+      memStore.set(to, memStore.get(from) || '');
+      memStore.delete(from);
+    }),
+    openSync: vi.fn((p: string, flags?: unknown) => {
+      if (exclusive(flags) && memStore.has(p)) {
+        throw Object.assign(new Error(`EEXIST: file already exists, open '${p}'`), { code: 'EEXIST' });
+      }
+      const descriptor = nextDescriptor++;
+      descriptors.set(descriptor, p);
+      if (!memStore.has(p)) memStore.set(p, '');
+      return descriptor;
+    }),
+    writeSync: vi.fn((descriptor: number, data: Buffer) => {
+      const path = descriptors.get(descriptor);
+      if (path) memStore.set(path, data.toString());
+      return data.length;
+    }),
+    readSync: vi.fn((descriptor: number, buffer: Buffer, offset: number, length: number) => {
+      const bytes = Buffer.from(memStore.get(descriptors.get(descriptor) ?? '') ?? '');
+      return bytes.copy(buffer, offset, 0, Math.min(length, bytes.length));
+    }),
+    fstatSync: vi.fn((descriptor: number) => fileStat(descriptors.get(descriptor) ?? '')),
+    lstatSync: vi.fn((p: string) => {
+      if (!memStore.has(p)) throw missing(p);
+      return fileStat(p);
+    }),
+    fsyncSync: vi.fn(),
+    closeSync: vi.fn((descriptor: number) => descriptors.delete(descriptor)),
+    chmodSync: vi.fn(),
     mkdirSync: vi.fn(),
     readdirSync: vi.fn(() => []),
-    unlinkSync: vi.fn(),
+    unlinkSync: vi.fn((p: string) => memStore.delete(p)),
+    // acquireLock publishes its owner record with link(): EEXIST while held.
+    linkSync: vi.fn((from: string, to: string) => {
+      if (memStore.has(to)) throw Object.assign(new Error(`EEXIST: file already exists, link '${from}' -> '${to}'`), { code: 'EEXIST' });
+      memStore.set(to, memStore.get(from) ?? '');
+    }),
     statSync: vi.fn(() => ({ size: 100, isFile: () => true, isDirectory: () => false })),
   };
 });
 
-vi.mock('fs', () => {
-  const memStore = new Map<string, string>();
-  return {
-    existsSync: vi.fn((p: string) => memStore.has(p)),
-    readFileSync: vi.fn((p: string) => memStore.get(p) || '{}'),
-    writeFileSync: vi.fn((p: string, d: string) => memStore.set(p, d)),
-    mkdirSync: vi.fn(),
-    readdirSync: vi.fn(() => []),
-    unlinkSync: vi.fn(),
-    statSync: vi.fn(() => ({ size: 100, isFile: () => true, isDirectory: () => false })),
-  };
-});
+vi.mock('node:fs', () => createFsFake());
+vi.mock('fs', () => createFsFake());
 
 // Mock child_process for browser/security tools
 vi.mock('child_process', () => ({
@@ -147,6 +187,14 @@ vi.mock('../src/mcp-tools/auto-install.js', () => ({
   autoInstallPackage: vi.fn(async () => false),
 }));
 
+vi.mock('../src/mcp-tools/agent-execute-core.js', () => ({
+  executeAgentTask: vi.fn(async ({ prompt }: { prompt: string }) => ({
+    success: true,
+    output: `output:${prompt}`,
+    durationMs: 1,
+  })),
+}));
+
 // Mock security package
 vi.mock('@claude-flow/aidefence', () => {
   throw new Error('Cannot find package');
@@ -188,6 +236,7 @@ import { taskTools } from '../src/mcp-tools/task-tools.js';
 import { terminalTools } from '../src/mcp-tools/terminal-tools.js';
 import { transferTools } from '../src/mcp-tools/transfer-tools.js';
 import { workflowTools } from '../src/mcp-tools/workflow-tools.js';
+import { executeAgentTask } from '../src/mcp-tools/agent-execute-core.js';
 import { hooksTools } from '../src/mcp-tools/hooks-tools.js';
 
 import type { MCPTool } from '../src/mcp-tools/types.js';
@@ -709,6 +758,26 @@ describe('MCP Tools Deep Test Suite', () => {
       const result: any = await tool.handler({ name: 'test-wf', description: 'Test workflow' });
       expect(result.workflowId).toBeDefined();
       expect(result.name).toBe('test-wf');
+    });
+
+    it('binds the default step-1 output in the next task prompt', async () => {
+      const create = workflowTools.find(t => t.name === 'workflow_create')!;
+      const execute = workflowTools.find(t => t.name === 'workflow_execute')!;
+      const created: any = await create.handler({
+        name: 'step-output-binding',
+        variables: { defaultAgentId: 'test-agent' },
+        steps: [
+          { name: 'Produce', type: 'task', config: { prompt: 'first' } },
+          { name: 'Consume', type: 'task', config: { prompt: 'Use {{step-1.output}}' } },
+        ],
+      });
+
+      const priorCalls = vi.mocked(executeAgentTask).mock.calls.length;
+      const result: any = await execute.handler({ workflowId: created.workflowId });
+
+      expect(result.status).toBe('completed');
+      expect(vi.mocked(executeAgentTask).mock.calls.slice(priorCalls).map(([input]) => input.prompt))
+        .toEqual(['first', 'Use output:first']);
     });
   });
 
